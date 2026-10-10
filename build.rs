@@ -9,97 +9,121 @@
 //! }
 //! ```
 //!
-//! For finer control, build a [`Config`] with [`Config::from_env`] and tweak it
-//! before calling [`Config::run`].
+//! For finer control, build a [`Config`] with [`Config::from_env`], adjust it,
+//! then call [`Config::run`].
 //!
 //! # How it works
 //!
-//! 1. Discover the package's source files starting from the crate roots
+//! 1. Discover the package's source files, starting from the crate roots
 //!    (`src/lib.rs`, `src/main.rs`, `src/bin/*.rs`, `tests/*.rs`, `benches/*.rs`,
-//!    `examples/*.rs`), following `mod foo;` and `#[path = "…"]` declarations.
+//!    `examples/*.rs`) and following `mod foo;` and `#[path = "…"]`.
 //! 2. Parse them and collect every `#[subcrate]` inline module.
 //! 3. Resolve the dependencies between subcrates (`#[subcrate(other)]`,
-//!    `#[subcrate(alias = path::to::other)]`) and sort them topologically with
-//!    [`safegraph`], rejecting dependency cycles.
-//! 4. If any subcrate uses an *owner* dependency — a crate the owning package
+//!    `#[subcrate(alias = path::to::other)]`), sort them topologically with
+//!    [`safegraph`], and reject any cycle.
+//! 4. If a subcrate uses an *owner* dependency — a crate the owning package
 //!    depends on (`#[subcrate(::serde)]`) or the package's own library
-//!    (`#[subcrate(::my_package)]`) — build those with one nested Cargo build
-//!    (see [below](#owner-dependencies)).
-//! 5. Compile each module, dependencies first, with `rustc` (from `$RUSTC`),
-//!    reading the generated source from stdin — no temporary `.rs` files, no
-//!    `Cargo.toml`s. A dependency is handed to its dependent as
+//!    (`#[subcrate(::my_package)]`) — build those first with one nested Cargo
+//!    build (see [below](#owner-dependencies)).
+//! 5. Compile each module with `rustc` (from `$RUSTC`), dependencies first,
+//!    reading the generated source from stdin. There are no temporary `.rs`
+//!    files and no `Cargo.toml`s. A dependency reaches its dependent as
 //!    `--extern <internal name>=<artifact>`, plus a `use ::<internal name> as
 //!    <alias>;` at the dependent's crate root.
-//! 6. Put the artifacts on the library search path and record metadata the
-//!    procedural macro reads to confirm it ran.
+//! 6. Put the artifacts on the library search path, and record metadata the
+//!    procedural macro reads to confirm the helper ran.
 //!
-//! The search path is emitted with `cargo:rustc-link-search` (the legacy
-//! single-colon directive form, understood by every Cargo back to the 1.56
-//! MSRV; the `cargo::` form is 1.77+). Cargo applies it to every target in this
-//! package and, because it is a build-script link path, forwards it to dependent
-//! packages' compilations too — so publicly exported subcrates resolve
-//! downstream without any extra wiring (requirement 6).
+//! The search path is emitted with `cargo:rustc-link-search`. That is the
+//! single-colon directive form, which every Cargo back to the 1.56 MSRV
+//! understands; the `cargo::` form is 1.77+. Cargo applies it to every target in
+//! this package, and, since it is a build-script link path, forwards it to
+//! dependent packages' builds too. So publicly exported subcrates resolve
+//! downstream with no extra wiring (requirement 6).
 //!
 //! # Owner dependencies
 //!
-//! A subcrate is compiled by this build script, *before* Cargo builds the
-//! package's own dependencies, so none of them exist yet. To let a subcrate use
-//! one anyway, the build script asks Cargo to build the ones that are needed
-//! (`cargo build -p <dep> … [-p <this package>] --lib`) from the package's
-//! manifest directory, into a **separate target directory**. (The build script's
-//! own Cargo holds the lock on the main target directory, so sharing it would
-//! deadlock.) The directory is `subcrate-owner-deps/<package>/<compiler>` in the
-//! profile directory (`target/debug`) that `OUT_DIR` is in, so every configuration
-//! of the package — each has an `OUT_DIR` of its own — shares one, and the crates
-//! are compiled once. Only the crates a subcrate names are built, and the owner crate
-//! only if one of them does: its own build dependencies are compiled then, which is
-//! most of the work. Running from the manifest directory makes Cargo
-//! resolve versions and features exactly as the outer build does, so the
-//! artifacts have the same crate identity as the copies the package itself is
-//! compiled against: a type from `serde` means the same thing in the subcrate and
-//! in the owner.
+//! This build script compiles a subcrate *before* Cargo builds the package's own
+//! dependencies, so none of them exist yet. To let a subcrate use one, the build
+//! script asks Cargo to build the ones it needs (`cargo build -p <dep> … [-p
+//! <this package>] --lib`), run from the package's manifest directory, into a
+//! **separate target directory**. A separate one is required: this build's Cargo
+//! holds the lock on the main target directory, so sharing it would deadlock.
 //!
-//! The separate target directory would otherwise store the owner's dependency
-//! chain twice — once there, once in the main target. But Cargo names an artifact
-//! by a hash of its content and configuration, so the two copies are byte for byte
-//! the same file under the same name. After the nested build the build script
+//! The directory is `subcrate-owner-deps/<package>/<compiler>`, inside the
+//! profile directory (`target/debug`) that `OUT_DIR` sits in. Every configuration
+//! of the package has its own `OUT_DIR` but shares this one directory, so the
+//! crates are compiled once. Only the crates a subcrate names are built, and the
+//! owner crate only if one names it; building the owner compiles its own build
+//! dependencies, which is most of the work. Running from the manifest directory
+//! makes Cargo resolve versions and features exactly as the outer build does, so
+//! the artifacts have the same crate identity as the copies the package itself is
+//! built against: a type from `serde` means the same thing in the subcrate and in
+//! the owner.
+//!
+//! The separate directory would otherwise hold the owner's dependency chain
+//! twice, once there and once in the main target. But Cargo names an artifact by
+//! a hash of its content and configuration, so the two copies are the same file,
+//! byte for byte, under the same name. After the nested build, the build script
 //! replaces each duplicate in the separate directory with a hard link to the main
-//! copy (both are in one `target/` tree, hence on one filesystem; a shared hash
-//! name can never mean two contents, so the shared inode is safe), reclaiming that
-//! disk. It is best effort — a failure just keeps the extra copy.
+//! copy, reclaiming that disk. This is safe: both are in one `target/` tree, so on
+//! one filesystem, and a shared hash name can never mean two contents, so the
+//! shared inode is fine. It is best effort — a failure just keeps the extra copy.
 //!
-//! `::name` is the name the package's own code uses for the crate, which
-//! `Cargo.toml` says is the dependency's key. For a renamed dependency
-//! (`myleaf = { package = "leaf", … }`) the package to build is the `package`, and
-//! the subcrate sees its crate under `myleaf`, as the package does. Where the
-//! dependency graph holds several versions of a package (so `-p leaf` is
-//! ambiguous), the package is selected by the version `Cargo.lock` has this package
-//! resolve it to, as `-p leaf:1.2.3`. (That is the spec form every Cargo accepts:
-//! `leaf@1.2.3` is newer, and Cargo 1.56 rejects it.) If the owner itself depends on
-//! two versions of one package under two names, the `version` (or the `path`) it
-//! declares for each name picks the locked version. The artifacts of each version
-//! are kept apart, and the crate's own rlib (`deps/lib<name>-<hash>.rlib`) is
-//! linked rather than the bare `lib<name>.rlib` Cargo also links it to, which two
-//! versions would share.
+//! `::name` is the name the package's own code uses for the crate, which is the
+//! dependency's key in `Cargo.toml`. For a renamed dependency (`myleaf = {
+//! package = "leaf", … }`), the package to build is the `package`, and the
+//! subcrate sees its crate under `myleaf`, as the package does. When the graph
+//! holds several versions of a package, `-p leaf` is ambiguous, so the build
+//! script picks the version `Cargo.lock` resolves it to, as `-p leaf:1.2.3`.
+//! (Every Cargo accepts that spec form; `leaf@1.2.3` is newer and Cargo 1.56
+//! rejects it.) If the owner itself depends on two versions of one package under
+//! two names, the `version` (or the `path`) it declares for each name picks the
+//! locked version. Each version's artifacts are kept apart, and the crate's own
+//! rlib (`deps/lib<name>-<hash>.rlib`) is linked, not the bare `lib<name>.rlib`
+//! Cargo also links it to, which two versions would share.
 //!
 //! The artifacts are read from Cargo's JSON output and passed to the subcrates
-//! that use them as `--extern <name>=<rlib>` *and* `--extern <name>=<rmeta>`
-//! (Cargo pipelines compilation, so an rlib alone carries only a metadata stub),
-//! with every directory holding an artifact added as a `-L` search path for the
+//! that use them as `--extern <name>=<rlib>` *and* `--extern <name>=<rmeta>`.
+//! (Cargo pipelines compilation, so an rlib alone carries only a metadata stub.)
+//! Every directory holding an artifact is added as a `-L` search path, for the
 //! dependencies' own dependencies. The same directories become search paths for
-//! compiling the package itself, since a subcrate records the exact copy of each
-//! crate it was built against and whatever loads the subcrate has to find that
-//! copy. (They are the very crates the package is built with under `cargo build`
-//! and `cargo test`. Under `cargo check` and clippy Cargo builds other copies, so a
-//! *type* from such a crate is a different type there from the subcrate's.)
+//! compiling the package itself, because a subcrate records the exact copy of
+//! each crate it was built against, and whatever loads the subcrate has to find
+//! that copy. These are the crates the package is built with under `cargo build`
+//! and `cargo test`. Under `cargo check` and clippy, Cargo builds other copies,
+//! so a *type* from such a crate is a different type there than in the subcrate.
 //!
-//! Using the owner crate itself builds the package's library a second time
-//! (running this very build script again inside it, with the environment variable
-//! `SUBCRATE_NESTED` set). In such a nested build only the library is being built,
-//! so the build script compiles just the subcrates the library uses and never
-//! starts another owner build. A subcrate in the library cannot use the owner
-//! crate — the library would depend on itself — but subcrates in `tests/`,
-//! `src/main.rs`, `src/bin/`, `examples/` and `benches/` can.
+//! Using the owner crate itself builds the package's library a second time, by
+//! running this build script again inside that build with `SUBCRATE_NESTED` set.
+//! That nested build only builds the library, so the build script compiles just
+//! the subcrates the library uses and never starts another owner build. A
+//! subcrate in the library cannot use the owner crate, since the library would
+//! depend on itself; subcrates in `tests/`, `src/main.rs`, `src/bin/`,
+//! `examples/` and `benches/` can.
+//!
+//! # Limitations of `::name`
+//!
+//! - The crate must be an ordinary library, not a proc-macro.
+//! - `::name` names the crate itself, not a path into it (`::serde::de` is an
+//!   error).
+//! - A dev-dependency is built as `cargo build` would build it, so its features
+//!   can differ from the test build's if (under resolver 2) only a dev-dependency
+//!   edge turns them on.
+//! - A custom profile is built as `dev` or `release` (a build script is only told
+//!   `debug` or `release`), so Cargo and the build script agree on the build.
+//! - When cross-compiling, a proc-macro subcrate cannot use these crates: they are
+//!   built for the target, but a proc-macro runs on the host.
+//! - The nested build runs `--offline` from the package's own directory, so it
+//!   expects a workspace with its `Cargo.lock` and sources in place. (A package
+//!   built as someone else's dependency resolves its own versions instead.)
+//! - Under `cargo check` and clippy, Cargo builds different copies of the
+//!   dependencies than `cargo build` does, so a type from one is not the same type
+//!   as the subcrate's there: a value passed across the boundary compiles under
+//!   `cargo build`/`test` but not under `cargo check`.
+//! - If the package depends on two versions of one crate with nothing to tell them
+//!   apart, or on two crates of the same name and version from different sources,
+//!   the lock file cannot say which `::name` means, and the build stops with an
+//!   error.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsString;
@@ -310,16 +334,17 @@ impl Config {
         prune_stale(&subcrates_dir, &internal_names);
 
         // Make the subcrate artifacts resolvable while compiling this package.
-        // A kindless search path becomes `-L PATH` (`all` kind), which rustc
+        // A kindless search path becomes `-L PATH` (the `all` kind), which rustc
         // searches for directly-named `extern crate`s.
         println!("cargo:rustc-link-search={}", subcrates_dir.display());
-        // A subcrate built on an owner dependency records the exact copy of it it
-        // was built against, and a crate loading the subcrate (a test, a binary)
-        // looks that copy up by name and hash on the search path. Cargo's own search
-        // path may not hold it: the package's own library is only handed over with
-        // `--extern`, and `cargo check` builds different copies than the
-        // `cargo build` ones used here. So point to the copies built here (which are
-        // the same crates as the ones the package is built with, otherwise).
+        // A subcrate built on an owner dependency records the exact copy of that
+        // crate it was built against. Whatever loads the subcrate (a test, a
+        // binary) looks that copy up by name and hash on the search path, and
+        // Cargo's own search path may not hold it: the package's own library is
+        // only handed over with `--extern`, and `cargo check` builds different
+        // copies than the `cargo build` ones used here. So point to the copies
+        // built here, which otherwise are the same crates the package is built
+        // with.
         for dir in &self.owner_deps.lib_dirs {
             println!("cargo:rustc-link-search=dependency={}", dir.display());
         }
@@ -615,11 +640,11 @@ impl Config {
         Ok(deps)
     }
 
-    /// What the manifest says a dependency `dep` it declares is: the real package —
-    /// its `package = "…"` if it is renamed, whatever the workspace declares if it is
-    /// inherited (`workspace = true`), else its key — and what picks the version,
-    /// should there be several: the version of the package at its `path`, else its
-    /// `version` requirement.
+    /// What the manifest says a declared dependency `dep` is. The real package is
+    /// its `package = "…"` if it is renamed, whatever the workspace declares if it
+    /// is inherited (`workspace = true`), else its key. The version, when there are
+    /// several, is the version of the package at its `path`, else its `version`
+    /// requirement.
     fn declared(&self, dep: &DeclaredDep) -> Declared {
         let inherited = if dep.workspace {
             workspace_dependency(&self.manifest_dir, &dep.key)
@@ -646,25 +671,27 @@ impl Config {
 
     /// The target directory of the nested Cargo build.
     ///
-    /// It has to be one of its own (the build in progress holds the lock on the main
-    /// one), but not one per `OUT_DIR`: Cargo gives each configuration of the package
-    /// (`cargo build` and `cargo test`, `cargo check`, …) an `OUT_DIR` of its own, and
-    /// a nested build into each would compile the same crates over again — the
-    /// owner's build-dependencies among them, for the owner crate. The nested build
-    /// does not depend on the configuration (it does not see the features or cfgs
-    /// of this one, and resolves from the package's `Cargo.toml`), so all of them
-    /// share `<profile directory>/subcrate-owner-deps/<package>/<compiler>`: per
-    /// package, per profile and target (the profile directory — `target/debug`,
-    /// `target/<triple>/release` — is the one `OUT_DIR` sits in) and per compiler.
-    /// The last is because Cargo links the crates it builds for the packages asked
-    /// for to one name (`libleaf.rlib`, which is what the subcrates are compiled
-    /// against), whichever compiler built them, so two compilers sharing a
-    /// directory would swap them under each other. Two builds that meet there wait
-    /// for each other on that directory's lock, which is not the main target
-    /// directory's, so they cannot deadlock.
+    /// It must be its own directory: the build in progress holds the lock on the
+    /// main one. But it is not one per `OUT_DIR`. Cargo gives each configuration of
+    /// the package (`cargo build`, `cargo test`, `cargo check`, …) its own
+    /// `OUT_DIR`, and a nested build into each would compile the same crates again
+    /// and again — the owner's build-dependencies among them, when building the
+    /// owner. The nested build does not depend on the configuration: it does not
+    /// see this one's features or cfgs, and resolves from the package's
+    /// `Cargo.toml`. So they all share
+    /// `<profile directory>/subcrate-owner-deps/<package>/<compiler>`.
     ///
-    /// Without a `build` directory above `OUT_DIR` to find it by, the nested build
-    /// gets a directory in `OUT_DIR` itself.
+    /// That is per package, per profile and target (the profile directory is the
+    /// one `OUT_DIR` sits in — `target/debug`, `target/<triple>/release`), and per
+    /// compiler. Per compiler because Cargo links the crates it builds for the
+    /// packages asked for to one name (`libleaf.rlib`, which the subcrates are
+    /// compiled against), whichever compiler built them; two compilers sharing a
+    /// directory would swap them under each other. Two builds that meet here wait on
+    /// this directory's lock, which is not the main target directory's, so they
+    /// cannot deadlock.
+    ///
+    /// Without a `build` directory above `OUT_DIR` to locate it by, the nested build
+    /// gets a directory inside `OUT_DIR` itself.
     fn owner_deps_target_dir(&self) -> PathBuf {
         shared_target_dir(
             &self.out_dir,
@@ -736,25 +763,25 @@ impl Config {
         let args = self.rustc_args(sub, deps, out_dir);
         let source = render_source(&sub.inner_attrs, deps, self.edition_of(sub), &sub.items);
 
-        // Reuse decision: the crate *name* already captures the body as written
-        // (a content hash), and the stamp additionally records the exact `rustc`
-        // configuration *and the fully rendered source* — the latter so that
-        // editing a file inlined via `mod foo;` (whose content is not in the
-        // name) still forces a rebuild. We rebuild unless all of it matches. The
-        // name itself stays config-independent so the proc macro can recompute it.
+        // Reuse decision. The crate *name* is already a hash of the body as
+        // written. The stamp records more: the exact `rustc` configuration, and
+        // the fully rendered source. The rendered source is in there so that
+        // editing a file inlined via `mod foo;` — whose content is not in the name
+        // — still forces a rebuild. We rebuild unless all of it matches. The name
+        // itself stays config-independent, so the proc macro can recompute it.
         //
-        // The configuration includes each `--extern <internal name>=<artifact>`,
-        // and a dependency's name embeds that dependency's own content hash, so a
-        // changed dependency changes this subcrate's fingerprint and forces it to
-        // be recompiled too, even though its own name is unchanged. (The injected
+        // The configuration includes each `--extern <internal name>=<artifact>`.
+        // A dependency's name embeds that dependency's own content hash, so a
+        // changed dependency changes this subcrate's fingerprint and recompiles it
+        // too, even though this subcrate's own name is unchanged. (The injected
         // `use` of each dependency is part of the rendered source, so it is in the
-        // fingerprint but, being a build-time detail, not in the name.)
+        // fingerprint, but it is a build-time detail and not in the name.)
         //
-        // An owner dependency's file name is *not* content-addressed — Cargo's
-        // hash covers its package and features, not its source — so the files'
-        // sizes and modification times are folded in instead; a rebuilt dependency
-        // then recompiles the subcrates linked against it. (The same goes for a
-        // sibling subcrate built on one: its name does not cover that either.)
+        // An owner dependency's file name is *not* content-addressed: Cargo's hash
+        // covers its package and features, not its source. So its files' sizes and
+        // modification times are folded in instead, and a rebuilt dependency then
+        // recompiles the subcrates linked against it. The same goes for a sibling
+        // subcrate built on one, whose name does not cover that either.
         let mut fingerprint = format!("{}\u{1f}{}", args.join("\u{1f}"), source);
         for path in deps
             .iter()
@@ -1419,9 +1446,10 @@ fn resolve_links(subcrates: &[Subcrate], owner: &Owner) -> Result<Vec<Vec<Link>>
     Ok(all)
 }
 
-/// Resolves a `::name` dependency of `sub`: a crate the package depends on, or —
-/// if `name` is the package's own library — the owner crate, which the library's
-/// own subcrates cannot use (the library would depend on itself).
+/// Resolves a `::name` dependency of `sub`. It is a crate the package depends on,
+/// or, when `name` is the package's own library, the owner crate. The library's
+/// own subcrates cannot use the owner crate, since the library would depend on
+/// itself.
 fn resolve_external(sub: &Subcrate, dep: &Dependency, owner: &Owner) -> Result<LinkTarget, Error> {
     let name = match dep.path.as_slice() {
         [name] => name,
@@ -1809,11 +1837,11 @@ fn path_attr_value(attr: &Attribute) -> Option<String> {
 /// attributes first (they must lead the crate root), then the import of each
 /// linked dependency under its alias, then the items.
 ///
-/// The import is `use ::<internal name> as <alias>;`, or — in edition 2015, where
-/// `::name` means something else — the equivalent `extern crate <internal name>
-/// as <alias>;`. It is an injected render-time detail: it is not part of the
-/// subcrate's content-addressed name (the dependency *list* in the arguments is).
-/// It sits at the crate root, so nested modules reach the alias as
+/// The import is `use ::<internal name> as <alias>;`. On edition 2015, where
+/// `::name` means something else, it is instead the equivalent `extern crate
+/// <internal name> as <alias>;`. It is an injected render-time detail and is not
+/// part of the subcrate's content-addressed name (the dependency *list* in the
+/// arguments is). It sits at the crate root, so nested modules reach the alias as
 /// `crate::<alias>` or `super::<alias>`.
 fn render_source(
     inner_attrs: &[Attribute],
@@ -2118,9 +2146,10 @@ fn dependency_section(header: &str) -> Section {
     }
 }
 
-/// The dependencies a `Cargo.toml` declares (in `[dependencies]`,
-/// `[dev-dependencies]`, `[build-dependencies]` — also under `[target.…]` — and
-/// `[workspace.dependencies]`), with whether each is renamed or inherited.
+/// The dependencies a `Cargo.toml` declares, with whether each is renamed or
+/// inherited. It reads `[dependencies]`, `[dev-dependencies]` and
+/// `[build-dependencies]` (including under `[target.…]`), and
+/// `[workspace.dependencies]`.
 ///
 /// This is a line-by-line reading, like [`find_edition`]: a dependency is
 /// `name = "1"`, `name = { package = "real", … }` on one line, `name.package =
@@ -4385,6 +4414,10 @@ other = "1"
         for file in ["libdup-aa.rlib", "libdup-aa.rmeta", "libdup-bb.rmeta"] {
             std::fs::write(deps_dir.join(file), "").unwrap();
         }
+        // Cargo's JSON escapes backslashes, so a Windows path round-trips; mirror
+        // that here (an unescaped `\` would be an invalid JSON escape, and the
+        // parser would drop it).
+        let dir_json = dir.display().to_string().replace('\\', "\\\\");
         // Two versions of `dup`, both linked to `libdup.rlib`; the second of them
         // has no rlib of its own on disk.
         let message = |version: &str, hash: &str| {
@@ -4396,7 +4429,7 @@ other = "1"
                 ),
                 version = version,
                 hash = hash,
-                dir = dir.display()
+                dir = dir_json
             )
         };
         let deps = parse_artifacts(&format!(

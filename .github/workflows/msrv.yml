@@ -34,11 +34,19 @@ jobs:
           rustup default ${{ steps.msrv.outputs.version }}
           rustc --version
 
-      # `--locked` uses the committed Cargo.lock, which pins transitive
-      # dependencies to versions that still build on the MSRV (Cargo 1.56 is not
-      # MSRV-aware and would otherwise resolve newer, incompatible releases).
+      # The lock file is not committed, so generate one and pin the MSRV-fragile
+      # crates here. Newer releases of these raise their own MSRV above 1.56, and
+      # Cargo 1.56 is not MSRV-aware, so it would otherwise resolve them. Add to
+      # this list if another dependency starts failing on 1.56.
+      - name: Generate a lock file and pin for 1.56
+        run: |
+          cargo generate-lockfile
+          cargo update -p proc-macro2 --precise 1.0.79
+          cargo update -p quote --precise 1.0.35
+          cargo update -p unicode-ident --precise 1.0.12
+
       # `check`, never `test`: dev-dependencies and doctest tooling can carry
-      # higher MSRVs.
+      # higher MSRVs. `--locked` makes it use exactly the pinned lock above.
       - name: Check (default features)
         run: cargo check --workspace --locked
       - name: Check (no default features)

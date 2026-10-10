@@ -80,18 +80,18 @@ fn expand(args: Args, item_mod: ItemMod) -> syn::Result<proc_macro2::TokenStream
     let internal_ident = Ident::new(&internal, Span::call_site());
 
     // Build (`cfg(not(doc))`): bind the name to the real, separately compiled
-    // crate. This is the authoritative expansion.
+    // crate. This is the real expansion.
     //
-    // Doc (`cfg(doc)`): rustdoc does not receive the build helper's library
-    // search path, so the `extern crate` cannot be resolved while documenting
-    // *this* package. We instead emit a same-named, same-visibility module that
-    // reproduces enough of the subcrate's public surface for `cargo doc` to
-    // succeed. (Downstream packages documenting their own code still go through
-    // the real crate, since dependencies are not compiled with `cfg(doc)`.)
+    // Doc (`cfg(doc)`): rustdoc is not given the build helper's library search
+    // path, so it cannot resolve the `extern crate` while documenting this
+    // package. Instead we emit a module with the same name and visibility that
+    // reproduces enough of the subcrate's public surface for `cargo doc` to work.
+    // (A downstream package documenting its own code still goes through the real
+    // crate, since dependencies are not compiled with `cfg(doc)`.)
     //
-    // A library subcrate's body may name its dependencies (which the real build
-    // links with `--extern`), so the stand-in imports the sibling ones from their
-    // own stand-ins, and the external ones from the owner's, under the same names.
+    // A library subcrate's body may name its dependencies (the real build links
+    // them with `--extern`), so the stand-in imports the sibling ones from their
+    // own stand-ins and the external ones from the owner's, under the same names.
     let doc_surface = if args.proc_macro {
         proc_macro_doc_surface(items, &internal)
     } else {
@@ -152,18 +152,17 @@ fn doc_dependency_imports(
 
 /// Produces a documentation-only stand-in for a `proc-macro` subcrate.
 ///
-/// A `proc-macro` crate's body cannot be inlined into an ordinary crate (the
-/// `#[proc_macro]` attribute is rejected outside a proc-macro crate), so for
-/// each function-like `#[proc_macro]` we emit a `macro_rules!` stub that expands
-/// to `unimplemented!()`. That resolves `name::mac!(..)` call sites in any code
-/// rustdoc analyses, whatever type is expected, without running real codegen.
+/// A `proc-macro` crate's body cannot be inlined into an ordinary crate: the
+/// `#[proc_macro]` attribute is rejected outside a proc-macro crate. So for each
+/// `#[proc_macro]` function we emit a `macro_rules!` stub that expands to
+/// `unimplemented!()`. That lets `name::mac!(..)` call sites in any code rustdoc
+/// reads resolve, whatever type is expected, without real codegen.
 ///
-/// The stub is defined with `#[macro_export]` under a mangled, crate-unique name
-/// and then aliased to its real name inside the module. `#[macro_export]` is the
-/// only way on stable Rust to make a `macro_rules!` macro *publicly*
-/// re-exportable by path — which a user needs in order to lift the macro to
-/// their crate root with `pub use foo::the_macro;`. The mangled export name
-/// keeps that root re-export from colliding with the user's own.
+/// The stub uses `#[macro_export]` under a mangled, crate-unique name, then
+/// aliases it to its real name inside the module. On stable Rust, `#[macro_export]`
+/// is the only way to make a `macro_rules!` macro re-exportable by path — which a
+/// user needs to lift the macro to their crate root (`pub use foo::the_macro;`).
+/// The mangled name keeps that re-export from clashing with the user's own.
 fn proc_macro_doc_surface(items: &[syn::Item], internal: &str) -> proc_macro2::TokenStream {
     let mut out = proc_macro2::TokenStream::new();
     for item in items {

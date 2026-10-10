@@ -1,13 +1,12 @@
 //! Shared logic between the `subcrate` build helper and the `subcrate-macros`
 //! procedural macro.
 //!
-//! The two sides never talk to each other directly. Instead they must,
-//! independently, agree on a single thing: the **internal crate name** that a
-//! given `#[subcrate]` module compiles to. The build helper uses it to name the
-//! `rustc` output; the procedural macro uses it to emit the `extern crate`
-//! binding that loads that output. Because both derive the name purely from the
-//! module's identifier and body, they always arrive at the same answer without
-//! any coordination.
+//! The two sides never talk to each other. They only have to agree, on their own,
+//! about one thing: the **internal crate name** a given `#[subcrate]` module
+//! compiles to. The build helper uses it to name the `rustc` output; the
+//! procedural macro uses it in the `extern crate` binding that loads that output.
+//! Both derive the name from the module's identifier and body alone, so they
+//! always reach the same answer with no coordination.
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use syn::parse::{Parse, ParseStream};
@@ -307,19 +306,17 @@ pub fn manifest_lookup(manifest: &str, internal: &str) -> Option<Vec<ResolvedDep
     })
 }
 
-/// Produces the canonical textual form of a module body.
+/// Produces a canonical text form of a module body.
 ///
-/// Both the macro and the build helper obtain the same `Vec<Item>` (one from the
-/// token stream handed to the attribute macro, the other from re-parsing the
-/// source file) and render it through the same [`template_quote::quote!`]
-/// pipeline.
+/// The macro and the build helper each start from the same `Vec<Item>` — one from
+/// the tokens handed to the attribute macro, the other from re-parsing the source
+/// file — and render it the same way.
 ///
-/// Crucially, we do **not** hash `TokenStream::to_string()`: that rendering
-/// differs between the real proc-macro backend (used inside the macro) and
-/// `proc_macro2`'s fallback backend (used inside the build script), mostly in
-/// whitespace. Instead we walk the token tree and emit a representation that
-/// depends only on token *structure and text*, never on spacing, so the two
-/// backends agree byte-for-byte.
+/// We do **not** hash `TokenStream::to_string()`. That text differs between the
+/// real proc-macro backend (used in the macro) and `proc_macro2`'s fallback
+/// backend (used in the build script), mostly in whitespace. Instead we walk the
+/// token tree and write a form that depends only on each token's kind and text,
+/// not its spacing, so both backends produce the same bytes.
 pub fn canonical_body(attrs: &[Attribute], items: &[Item]) -> String {
     let tokens: TokenStream = quote! { #(#attrs)* #(#items)* };
     let mut out = String::new();
