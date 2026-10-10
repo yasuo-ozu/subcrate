@@ -49,6 +49,8 @@ jobs:
           cargo update -p quote --precise 1.0.35
           cargo update -p proc-macro2 --precise 1.0.79
           cargo update -p unicode-ident --precise 1.0.12
+          cargo update -p unicode-width --precise 0.1.12
+          cargo update -p num-traits --precise 0.2.18
 
       # `check`, never `test`: dev-dependencies and doctest tooling can carry
       # higher MSRVs. `--locked` makes it use exactly the pinned lock above.
