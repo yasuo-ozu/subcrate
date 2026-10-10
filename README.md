@@ -38,7 +38,7 @@ pub mod my_crate {
     pub fn calc() -> usize { 32 }
 }
 
-// `#[subcrate]` works in nested modules too, and the path stays the same.
+// `#[subcrate]` works in nested modules too.
 pub mod nested {
     use subcrate::subcrate;
     #[subcrate]
