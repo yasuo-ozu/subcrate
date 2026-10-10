@@ -35,14 +35,19 @@ jobs:
           rustc --version
 
       # The lock file is not committed, so generate one and pin the MSRV-fragile
-      # crates here. Newer releases of these raise their own MSRV above 1.56, and
-      # Cargo 1.56 is not MSRV-aware, so it would otherwise resolve them. Add to
-      # this list if another dependency starts failing on 1.56.
+      # crates down to releases that still build on 1.56 (Cargo 1.56 is not
+      # MSRV-aware and resolves the latest otherwise). Order matters: a recent
+      # syn 2.x requires a proc-macro2 newer than 1.56 allows, so pin syn first,
+      # then quote, then proc-macro2. syn has two majors in the graph (a 1.x via
+      # proc-macro-error), so pin the 2.x line by whatever version resolved. Add
+      # to this list if another dependency starts failing on 1.56.
       - name: Generate a lock file and pin for 1.56
         run: |
           cargo generate-lockfile
-          cargo update -p proc-macro2 --precise 1.0.79
+          syn2=$(awk '/^name = "syn"/{getline; if ($3 ~ /"2\./) print $3}' Cargo.lock | tr -d '"')
+          cargo update -p "syn:$syn2" --precise 2.0.56
           cargo update -p quote --precise 1.0.35
+          cargo update -p proc-macro2 --precise 1.0.79
           cargo update -p unicode-ident --precise 1.0.12
 
       # `check`, never `test`: dev-dependencies and doctest tooling can carry
