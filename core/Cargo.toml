@@ -1,0 +1,16 @@
+[package]
+name = "subcrate-core"
+description = "Shared logic for the `subcrate` crate: subcrate identity/naming and attribute parsing."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.56"
+license = "MIT"
+repository = "https://github.com/yasuo-ozu/subcrate"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+syn = { version = "2", features = ["full", "parsing", "printing"] }
+proc-macro2 = "1"
+template-quote = "0.3"

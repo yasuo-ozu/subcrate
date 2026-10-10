@@ -1,0 +1,45 @@
+name: MSRV
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  msrv:
+    name: Build on the declared MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve rust-version
+        id: msrv
+        run: |
+          root=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          core=$(grep -m1 '^rust-version' core/Cargo.toml | cut -d'"' -f2)
+          mac=$(grep -m1 '^rust-version' macro/Cargo.toml | cut -d'"' -f2)
+          if [ "$root" != "$core" ] || [ "$root" != "$mac" ]; then
+            echo "::error::rust-version differs: root=$root core=$core macro=$mac"
+            exit 1
+          fi
+          echo "version=$root" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        run: |
+          rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal --no-self-update
+          rustup default ${{ steps.msrv.outputs.version }}
+          rustc --version
+
+      # `--locked` uses the committed Cargo.lock, which pins transitive
+      # dependencies to versions that still build on the MSRV (Cargo 1.56 is not
+      # MSRV-aware and would otherwise resolve newer, incompatible releases).
+      # `check`, never `test`: dev-dependencies and doctest tooling can carry
+      # higher MSRVs.
+      - name: Check (default features)
+        run: cargo check --workspace --locked
+      - name: Check (no default features)
+        run: cargo check -p subcrate --no-default-features --locked

@@ -1,0 +1,46 @@
+[package]
+name = "subcrate"
+description = "Define real, independently compiled Rust crates with inline `#[subcrate]` module syntax."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.56"
+license = "MIT"
+repository = "https://github.com/yasuo-ozu/subcrate"
+readme = "README.md"
+# `build.rs` here is the build-helper *module* (`subcrate::build`), not a build
+# script, so auto-detection of a package build script is disabled.
+build = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+# Always available: the `#[subcrate]` attribute (re-exported in lib.rs). This is
+# a tiny proc-macro dependency with no further transitive cost for plain users.
+subcrate-macros = { path = "macro", version = "0.1.0" }
+
+# Everything needed by `subcrate::build::compile()`. These are pulled in only
+# when the (default) `build` feature is on, so a crate that depends on
+# `subcrate` purely for the attribute can set `default-features = false` and
+# avoid compiling them for the target.
+subcrate-core = { path = "core", version = "0.1.0", optional = true }
+syn = { version = "2", features = ["full", "parsing", "printing"], optional = true }
+proc-macro2 = { version = "1", optional = true }
+template-quote = { version = "0.3", optional = true }
+
+[features]
+default = ["build"]
+# Enables `subcrate::build`, the helper called from `build.rs`. The entries name
+# the optional dependencies directly (rather than `dep:`, which is 1.60+) to keep
+# the manifest parseable at the 1.56 MSRV.
+build = ["subcrate-core", "syn", "proc-macro2", "template-quote"]
+
+# Plain `[workspace]` member lists predate workspace inheritance, so this stays
+# compatible with the 1.56 MSRV. Each member manifest is self-contained.
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "macro",
+    "examples/example",
+]

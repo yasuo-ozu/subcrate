@@ -1,0 +1,18 @@
+[package]
+name = "subcrate-macros"
+description = "Procedural macro implementation for the `subcrate` crate. Use `subcrate` instead."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.56"
+license = "MIT"
+repository = "https://github.com/yasuo-ozu/subcrate"
+
+[lib]
+proc-macro = true
+path = "lib.rs"
+
+[dependencies]
+subcrate-core = { path = "../core", version = "0.1.0" }
+syn = { version = "2", features = ["full", "parsing", "printing"] }
+proc-macro2 = "1"
+template-quote = "0.3"

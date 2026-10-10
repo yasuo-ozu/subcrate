@@ -1,0 +1,23 @@
+//! Consumer-side tests: a `tests/` file is its own crate that links `example`,
+//! so these exercise `example`'s *publicly exported* subcrates from outside the
+//! defining module — the role previously held by the separate `downstream`
+//! package.
+//!
+//! This covers the public API and transitive resolution of the subcrate
+//! artifacts across a crate boundary. It does not re-assert Cargo's forwarding
+//! of a dependency's build-script search path to a separate *package*, which is
+//! Cargo's own behavior.
+
+#[test]
+fn library_subcrates_usable_by_a_consumer() {
+    assert_eq!(example::calculate(), 74);
+    assert_eq!(example::my_crate::calc(), 32);
+    assert_eq!(example::nested::inner::answer(), 42);
+}
+
+#[test]
+fn proc_macro_subcrate_usable_by_a_consumer() {
+    // Both the module path and the crate-root re-export resolve.
+    assert_eq!(example::my_macro::mac!(), 42);
+    assert_eq!(example::mac!(), 42);
+}
