@@ -11,3 +11,9 @@ subcrate = { path = "../.." }
 
 [build-dependencies]
 subcrate = { path = "../.." }
+
+[features]
+# Gates tests that use `mod foo;` inside a subcrate — a nightly-only capability
+# (non-inline modules in proc-macro input are unstable, E0658, on stable). The
+# nightly CI job enables it; stable jobs leave those test crates empty.
+nightly = []

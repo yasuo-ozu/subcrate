@@ -23,6 +23,15 @@ pub mod my_crate {
     }
 }
 
+// A subcrate can depend on another: `my_crate` is linked into `doubled` (under
+// that name), so `doubled` is compiled after it and can call into it.
+#[subcrate(my_crate)]
+pub mod doubled {
+    pub fn calc() -> usize {
+        my_crate::calc() * 2
+    }
+}
+
 pub mod nested {
     use subcrate::subcrate;
 

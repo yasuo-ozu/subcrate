@@ -2,7 +2,10 @@
 //! another: the root imports `a` and `b`, and `b` uses `a` through a
 //! `crate::`-relative path — all resolved inside the subcrate's own crate.
 //!
-//! Like the other `mod foo;` tests, this needs a Rust newer than the 1.56 MSRV.
+//! `mod foo;` inside a subcrate needs nightly Rust (non-inline modules in
+//! proc-macro input are unstable, `E0658`, on stable), so this file is gated
+//! behind the `nightly` feature and run by the nightly CI job.
+#![cfg(feature = "nightly")]
 
 use subcrate::subcrate;
 

@@ -18,6 +18,11 @@ use template_quote::quote;
 /// `pub extern crate __subcrate__foo__<hash> as foo;`, preserving the module's
 /// name, visibility and attributes while giving `foo` a genuinely separate
 /// crate identity.
+///
+/// The attribute takes a comma-separated list of arguments: `proc_macro`
+/// (compile as a proc-macro crate), `edition = "2018"`, and dependencies on
+/// sibling subcrates, `path::to::other` or `alias = path::to::other`, which the
+/// build helper links in and compiles first.
 #[proc_macro_attribute]
 pub fn subcrate(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as Args);
@@ -58,14 +63,17 @@ fn expand(args: Args, item_mod: ItemMod) -> syn::Result<proc_macro2::TokenStream
     // Confirm the build helper actually ran for this package and compiled this
     // module. If it did not, produce a clear, actionable error instead of a
     // cryptic "can't find crate" from the linker.
-    if let Err(message) = verify_built(&internal) {
-        return Ok(quote! {
-            #(#outer_attrs)*
-            #vis mod #ident {
-                ::core::compile_error!(#message);
-            }
-        });
-    }
+    let doc_deps = match verify_built(&internal) {
+        Ok(deps) => deps,
+        Err(message) => {
+            return Ok(quote! {
+                #(#outer_attrs)*
+                #vis mod #ident {
+                    ::core::compile_error!(#message);
+                }
+            });
+        }
+    };
 
     let internal_ident = Ident::new(&internal, Span::call_site());
 
@@ -78,10 +86,15 @@ fn expand(args: Args, item_mod: ItemMod) -> syn::Result<proc_macro2::TokenStream
     // reproduces enough of the subcrate's public surface for `cargo doc` to
     // succeed. (Downstream packages documenting their own code still go through
     // the real crate, since dependencies are not compiled with `cfg(doc)`.)
+    //
+    // A library subcrate's body may name its sibling dependencies (which the real
+    // build links with `--extern`), so the stand-in imports them from their own
+    // stand-ins under the same names.
     let doc_surface = if args.proc_macro {
         proc_macro_doc_surface(items, &internal)
     } else {
-        quote! { #(#items)* }
+        let imports = doc_dependency_imports(&doc_deps);
+        quote! { #imports #(#items)* }
     };
 
     Ok(quote! {
@@ -95,6 +108,30 @@ fn expand(args: Args, item_mod: ItemMod) -> syn::Result<proc_macro2::TokenStream
             #doc_surface
         }
     })
+}
+
+/// Produces the `use` items that bring a library subcrate's dependencies into
+/// scope in its `cfg(doc)` stand-in, mirroring the `--extern` names of the real
+/// crate.
+///
+/// Each dependency's stand-in lives at its module path from the crate root, so
+/// `crate::<path>` reaches it. Like the real crate-root import, the names are in
+/// scope at the top of the stand-in only. Only dependencies under the same crate
+/// root are listed in the manifest, so a dependency declared in another root has
+/// no import here.
+fn doc_dependency_imports(deps: &[subcrate_core::ResolvedDep]) -> proc_macro2::TokenStream {
+    let mut out = proc_macro2::TokenStream::new();
+    for (alias, path) in deps {
+        let alias = syn::parse_str::<Ident>(alias);
+        let path = syn::parse_str::<syn::Path>(&format!("crate::{}", path.join("::")));
+        if let (Ok(alias), Ok(path)) = (alias, path) {
+            out.extend(quote! {
+                #[allow(unused_imports)]
+                use #path as #alias;
+            });
+        }
+    }
+    out
 }
 
 /// Produces a documentation-only stand-in for a `proc-macro` subcrate.
@@ -143,11 +180,11 @@ fn proc_macro_doc_surface(items: &[syn::Item], internal: &str) -> proc_macro2::T
 }
 
 /// Checks the metadata written by `subcrate::build::compile()` to confirm that
-/// this subcrate was compiled.
+/// this subcrate was compiled, and returns the dependencies recorded for it.
 ///
 /// Returns `Err(message)` describing the problem when the build helper was not
 /// invoked or did not pick up this module.
-fn verify_built(internal: &str) -> Result<(), String> {
+fn verify_built(internal: &str) -> Result<Vec<subcrate_core::ResolvedDep>, String> {
     let dir = match manifest_dir() {
         Some(dir) => dir,
         None => return Err(MISSING_BUILD.to_string()),
@@ -159,17 +196,16 @@ fn verify_built(internal: &str) -> Result<(), String> {
         Err(_) => return Err(MISSING_BUILD.to_string()),
     };
 
-    if contents.lines().any(|line| line.trim() == internal) {
-        Ok(())
-    } else {
-        Err(format!(
+    match subcrate_core::manifest_lookup(&contents, internal) {
+        Some(deps) => Ok(deps),
+        None => Err(format!(
             "this `#[subcrate]` module was not discovered by `subcrate::build::compile()`.\n\
              The build helper scans `src/lib.rs`, `src/main.rs`, `src/bin/*.rs`, `tests/*.rs`, \
              `benches/*.rs`, `examples/*.rs` and the modules they reach. If this module lives \
              somewhere else, or the build script is stale, run `cargo clean` and rebuild. \
              (internal name: `{}`)",
             internal
-        ))
+        )),
     }
 }
 

@@ -1,11 +1,12 @@
 //! A nested module pulled in from an outer file (`mod inner;`) inside a
 //! `#[subcrate]`. The build helper inlines the file before compiling.
 //!
-//! This exercises the `mod foo;` form, which needs a Rust newer than the 1.56
-//! MSRV (a non-inline module in proc-macro input was `E0658` on 1.56), so it is
-//! covered by the stable CI jobs. The committed MSRV job only `cargo check`s
-//! (no `--all-targets`), which runs the build script but does not compile this
-//! test crate, so it stays green.
+//! The `mod foo;` form needs nightly Rust (non-inline modules in proc-macro
+//! input are unstable, `E0658`, on stable), so this file is gated behind the
+//! `nightly` feature and run by the nightly CI job. The build helper itself
+//! compiles the subcrate fine everywhere (it inlines the file before `rustc`);
+//! only the attribute-macro input in this test crate needs nightly.
+#![cfg(feature = "nightly")]
 
 use subcrate::subcrate;
 

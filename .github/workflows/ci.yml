@@ -24,6 +24,19 @@ jobs:
       - name: Build the attribute-only path (no default features)
         run: cargo check -p subcrate --no-default-features
 
+  nightly:
+    name: Nightly-only tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup default nightly
+          rustc --version
+      # Exercises the `mod foo;`-inside-a-subcrate tests, which require nightly
+      # (non-inline modules in proc-macro input are unstable on stable).
+      - run: cargo test -p example --features nightly
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

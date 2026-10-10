@@ -18,10 +18,15 @@
 //!    (`src/lib.rs`, `src/main.rs`, `src/bin/*.rs`, `tests/*.rs`, `benches/*.rs`,
 //!    `examples/*.rs`), following `mod foo;` and `#[path = "…"]` declarations.
 //! 2. Parse them and collect every `#[subcrate]` inline module.
-//! 3. Compile each module with `rustc` (from `$RUSTC`), reading the generated
-//!    source from stdin — no temporary `.rs` files, no `Cargo.toml`s, no nested
-//!    Cargo.
-//! 4. Put the artifacts on the library search path and record metadata the
+//! 3. Resolve the dependencies between subcrates (`#[subcrate(other)]`,
+//!    `#[subcrate(alias = path::to::other)]`) and sort them topologically with
+//!    [`safegraph`], rejecting dependency cycles.
+//! 4. Compile each module, dependencies first, with `rustc` (from `$RUSTC`),
+//!    reading the generated source from stdin — no temporary `.rs` files, no
+//!    `Cargo.toml`s, no nested Cargo. A dependency is handed to its dependent as
+//!    `--extern <internal name>=<artifact>`, plus a `use ::<internal name> as
+//!    <alias>;` at the dependent's crate root.
+//! 5. Put the artifacts on the library search path and record metadata the
 //!    procedural macro reads to confirm it ran.
 //!
 //! The search path is emitted with `cargo:rustc-link-search` (the legacy
@@ -31,12 +36,17 @@
 //! packages' compilations too — so publicly exported subcrates resolve
 //! downstream without any extra wiring (requirement 6).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use subcrate_core::{internal_crate_name, is_subcrate_attr, parse_attr_args};
+use safegraph::algo::toposort::toposort;
+use safegraph::graph::Graph;
+use safegraph::BTreeGraph;
+use subcrate_core::{
+    internal_crate_name, is_subcrate_attr, manifest_line, parse_attr_args, Dependency, ResolvedDep,
+};
 use syn::{Attribute, Item, Meta};
 use template_quote::quote;
 
@@ -172,11 +182,16 @@ impl Config {
         }
         println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
 
-        let mut internal_names = Vec::new();
-        for sub in &discovered.subcrates {
-            self.compile_subcrate(sub, &subcrates_dir)?;
-            internal_names.push(sub.internal.clone());
+        // Resolve who depends on whom, then compile in dependency order so every
+        // dependency's artifact exists before its dependents are compiled.
+        let subcrates = &discovered.subcrates;
+        let links = resolve_links(subcrates)?;
+        let order = compile_order(subcrates, &links)?;
+        for ix in order {
+            let deps = self.extern_deps(subcrates, ix, &links[ix], &subcrates_dir)?;
+            self.compile_subcrate(&subcrates[ix], &deps, &subcrates_dir)?;
         }
+        let internal_names: Vec<String> = subcrates.iter().map(|s| s.internal.clone()).collect();
 
         prune_stale(&subcrates_dir, &internal_names);
 
@@ -187,8 +202,14 @@ impl Config {
 
         // Metadata the procedural macro reads to confirm the helper ran.
         let manifest = self.out_dir.join(MANIFEST_FILE);
-        let mut body = internal_names.join("\n");
-        body.push('\n');
+        let mut body = String::new();
+        for (ix, sub) in subcrates.iter().enumerate() {
+            body.push_str(&manifest_line(
+                &sub.internal,
+                &doc_deps(subcrates, ix, &links[ix]),
+            ));
+            body.push('\n');
+        }
         std::fs::write(&manifest, body)?;
         println!(
             "cargo:rustc-env=SUBCRATE_MANIFEST_DIR={}",
@@ -198,9 +219,52 @@ impl Config {
         Ok(())
     }
 
-    fn compile_subcrate(&self, sub: &Subcrate, out_dir: &Path) -> Result<(), Error> {
-        let args = self.rustc_args(sub);
-        let source = render_source(&sub.inner_attrs, &sub.items);
+    /// The linked dependencies of `subcrates[ix]` (from its resolved `links`),
+    /// with the artifact paths found in `dir`, in a stable order.
+    fn extern_deps(
+        &self,
+        subcrates: &[Subcrate],
+        ix: usize,
+        links: &[Link],
+        dir: &Path,
+    ) -> Result<Vec<ExternDep>, Error> {
+        let sub = &subcrates[ix];
+        let mut deps = Vec::new();
+        for link in links {
+            let dep = &subcrates[link.target];
+            // A proc-macro crate runs on the host, but a library subcrate is built
+            // for the target; when those differ the host cannot load it.
+            if sub.proc_macro && !dep.proc_macro && self.target.is_some() {
+                return Err(Error::new(format!(
+                    "proc-macro subcrate `{}` cannot depend on library subcrate `{}` \
+                     when cross-compiling: the library is built for the target, \
+                     but a proc-macro runs on the host",
+                    sub.display_name(),
+                    dep.display_name()
+                )));
+            }
+            deps.push(ExternDep {
+                internal: dep.internal.clone(),
+                alias: link.alias.clone(),
+                path: dir.join(dep.artifact_file()),
+            });
+        }
+        Ok(deps)
+    }
+
+    /// The edition `sub` is compiled with: its own override, else the package's.
+    fn edition_of<'a>(&'a self, sub: &'a Subcrate) -> &'a str {
+        sub.edition.as_deref().unwrap_or(&self.edition)
+    }
+
+    fn compile_subcrate(
+        &self,
+        sub: &Subcrate,
+        deps: &[ExternDep],
+        out_dir: &Path,
+    ) -> Result<(), Error> {
+        let args = self.rustc_args(sub, deps, out_dir);
+        let source = render_source(&sub.inner_attrs, deps, self.edition_of(sub), &sub.items);
 
         // Reuse decision: the crate *name* already captures the body as written
         // (a content hash), and the stamp additionally records the exact `rustc`
@@ -208,6 +272,13 @@ impl Config {
         // editing a file inlined via `mod foo;` (whose content is not in the
         // name) still forces a rebuild. We rebuild unless all of it matches. The
         // name itself stays config-independent so the proc macro can recompute it.
+        //
+        // The configuration includes each `--extern <internal name>=<artifact>`,
+        // and a dependency's name embeds that dependency's own content hash, so a
+        // changed dependency changes this subcrate's fingerprint and forces it to
+        // be recompiled too, even though its own name is unchanged. (The injected
+        // `use` of each dependency is part of the rendered source, so it is in the
+        // fingerprint but, being a build-time detail, not in the name.)
         let fingerprint = format!("{}\u{1f}{}", args.join("\u{1f}"), source);
         let stamp = out_dir.join(format!("{}.stamp", sub.internal));
         if let Ok(previous) = std::fs::read_to_string(&stamp) {
@@ -245,7 +316,7 @@ impl Config {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::new(format!(
                 "failed to compile subcrate `{}`{}:\n{}",
-                sub.ident,
+                sub.display_name(),
                 if sub.proc_macro { " (proc-macro)" } else { "" },
                 indent(stderr.trim_end())
             )));
@@ -256,13 +327,14 @@ impl Config {
     }
 
     /// Builds the `rustc` argument list (everything except the `-` input and
-    /// `--out-dir`) used to compile `sub`. This is also hashed into the reuse
+    /// `--out-dir`) used to compile `sub`, linking the dependency artifacts
+    /// `deps` found in `subcrates_dir`. This is also hashed into the reuse
     /// stamp, so it must deterministically reflect the full configuration.
-    fn rustc_args(&self, sub: &Subcrate) -> Vec<String> {
+    fn rustc_args(&self, sub: &Subcrate, deps: &[ExternDep], subcrates_dir: &Path) -> Vec<String> {
         let mut args: Vec<String> = Vec::new();
         args.push("--edition".into());
         // A `#[subcrate(edition = "…")]` override wins over the package edition.
-        args.push(sub.edition.clone().unwrap_or_else(|| self.edition.clone()));
+        args.push(self.edition_of(sub).to_string());
         args.push("--crate-name".into());
         args.push(sub.internal.clone());
         args.push("-C".into());
@@ -310,6 +382,24 @@ impl Config {
             args.extend(self.rustflags.iter().cloned());
         }
 
+        // Link the sibling subcrates this one depends on, each as
+        // `--extern <its internal crate name>=<artifact>`; `render_source` then
+        // makes it visible under its alias. The directory is also a search path so
+        // rustc can find a dependency's *own* dependencies (they are recorded in
+        // its metadata by crate name).
+        if !deps.is_empty() {
+            args.push("-L".into());
+            args.push(format!("dependency={}", subcrates_dir.display()));
+        }
+        let mut linked: HashSet<&str> = HashSet::new();
+        for dep in deps {
+            // One crate under two aliases is still linked once.
+            if linked.insert(&dep.internal) {
+                args.push("--extern".into());
+                args.push(format!("{}={}", dep.internal, dep.path.display()));
+            }
+        }
+
         args.extend(self.extra_rustc_args.iter().cloned());
         args
     }
@@ -317,8 +407,14 @@ impl Config {
 
 /// A discovered `#[subcrate]` module.
 struct Subcrate {
-    /// The module's identifier, e.g. `my_crate`.
-    ident: String,
+    /// The module's path from its crate root, ending in its own identifier
+    /// (e.g. `["nested", "inner"]`).
+    module_path: Vec<String>,
+    /// The crate-root file the module was discovered from, which scopes
+    /// dependency resolution (see [`resolve_dependency`]).
+    root: PathBuf,
+    /// The crates this subcrate links against, as written in its arguments.
+    deps: Vec<Dependency>,
     /// The generated, content-addressed crate name.
     internal: String,
     /// Whether to compile as a `proc-macro` crate.
@@ -329,6 +425,28 @@ struct Subcrate {
     inner_attrs: Vec<Attribute>,
     /// The module body (its items), used as the crate root source.
     items: Vec<Item>,
+}
+
+impl Subcrate {
+    /// The module path as written in source, e.g. `nested::inner`.
+    fn display_name(&self) -> String {
+        self.module_path.join("::")
+    }
+
+    /// File name `rustc` gives this subcrate's artifact in the output directory:
+    /// an `rlib` for a library, or a dynamic library (named for the *host*, where
+    /// proc-macros run) for a proc-macro.
+    fn artifact_file(&self) -> String {
+        if !self.proc_macro {
+            format!("lib{}.rlib", self.internal)
+        } else if cfg!(windows) {
+            format!("{}.dll", self.internal)
+        } else if cfg!(target_os = "macos") {
+            format!("lib{}.dylib", self.internal)
+        } else {
+            format!("lib{}.so", self.internal)
+        }
+    }
 }
 
 /// Result of scanning the package for subcrates.
@@ -343,6 +461,7 @@ struct Discovered {
 fn discover(manifest_dir: &Path) -> Discovered {
     let mut walker = Walker::default();
     for (file, mod_dir) in crate_roots(manifest_dir) {
+        walker.root = file.clone();
         walker.walk_file(&file, &mod_dir);
     }
     walker.out
@@ -398,6 +517,10 @@ struct Walker {
     out: Discovered,
     visited: HashSet<PathBuf>,
     seen_internal: HashSet<String>,
+    /// The crate-root file currently being walked.
+    root: PathBuf,
+    /// Module path (from `root`) of the items currently being walked.
+    mod_path: Vec<String>,
 }
 
 impl Walker {
@@ -442,6 +565,8 @@ impl Walker {
             }
 
             let path_attr = module.attrs.iter().find_map(path_attr_value);
+            // The module path follows the `mod` nesting, not `#[path]`.
+            self.mod_path.push(module.ident.to_string());
             match &module.content {
                 Some((_, inner)) => {
                     // Inline module: children live under `<mod_dir>/<ident>`
@@ -463,6 +588,7 @@ impl Walker {
                     }
                 }
             }
+            self.mod_path.pop();
         }
     }
 
@@ -491,6 +617,8 @@ impl Walker {
         };
 
         let ident = module.ident.to_string();
+        let mut module_path = self.mod_path.clone();
+        module_path.push(ident.clone());
         let inner = subcrate_core::inner_attrs(&module.attrs);
         // The name is computed from the *original* body (as written, with any
         // `mod foo;` left as a declaration) so it matches what the macro — which
@@ -511,7 +639,9 @@ impl Walker {
 
         if self.seen_internal.insert(internal.clone()) {
             self.out.subcrates.push(Subcrate {
-                ident,
+                module_path,
+                root: self.root.clone(),
+                deps: args.deps,
                 internal,
                 proc_macro: args.proc_macro,
                 edition: args.edition,
@@ -520,6 +650,219 @@ impl Walker {
             });
         }
     }
+}
+
+/// A dependency linked into a subcrate being compiled.
+struct ExternDep {
+    /// The dependency's internal crate name (what `--extern` names it).
+    internal: String,
+    /// The name the dependent's source sees it under.
+    alias: String,
+    /// The dependency's compiled artifact.
+    path: PathBuf,
+}
+
+/// A resolved dependency: `target` (an index into the discovered subcrates) is
+/// linked under the name `alias`.
+struct Link {
+    alias: String,
+    target: usize,
+}
+
+/// Resolves every subcrate's declared dependencies to discovered subcrates,
+/// returning, for each subcrate (by index), its links sorted by alias.
+fn resolve_links(subcrates: &[Subcrate]) -> Result<Vec<Vec<Link>>, Error> {
+    let mut all = Vec::with_capacity(subcrates.len());
+    for (ix, sub) in subcrates.iter().enumerate() {
+        let mut links: Vec<Link> = Vec::new();
+        for dep in &sub.deps {
+            if dep.external {
+                return Err(Error::new(format!(
+                    "subcrate `{}`: the dependency `{}` names an external (build-dependency) \
+                     crate, which is not implemented yet; the `::name` syntax is reserved for \
+                     it. A subcrate can currently only depend on sibling `#[subcrate]` modules",
+                    sub.display_name(),
+                    dep.path_display()
+                )));
+            }
+            if links.iter().any(|link| link.alias == dep.alias) {
+                return Err(Error::new(format!(
+                    "subcrate `{}` has more than one dependency named `{}`; \
+                     rename one with `alias = path::to::subcrate`",
+                    sub.display_name(),
+                    dep.alias
+                )));
+            }
+            links.push(Link {
+                alias: dep.alias.clone(),
+                target: resolve_dependency(subcrates, ix, dep)?,
+            });
+        }
+        links.sort_by(|a, b| a.alias.cmp(&b.alias));
+        all.push(links);
+    }
+    Ok(all)
+}
+
+/// Finds the subcrate that `dep`, declared by `subcrates[from]`, refers to.
+///
+/// A dependency names a module path from a crate root. A subcrate whose full
+/// module path equals it wins; failing that, one whose path merely *ends* with it
+/// matches, so a lone ident `a` finds a subcrate named `a` wherever it is nested.
+/// If that is still ambiguous, a subcrate under the same crate root as the
+/// dependent wins — otherwise two `tests/*.rs` files could never each depend on
+/// their own `helper`. Anything left over is an error.
+fn resolve_dependency(
+    subcrates: &[Subcrate],
+    from: usize,
+    dep: &Dependency,
+) -> Result<usize, Error> {
+    let path = &dep.path;
+    let suffix: Vec<usize> = (0..subcrates.len())
+        .filter(|&i| subcrates[i].module_path.ends_with(path))
+        .collect();
+    let exact: Vec<usize> = suffix
+        .iter()
+        .copied()
+        .filter(|&i| subcrates[i].module_path == *path)
+        .collect();
+    let mut candidates = if exact.is_empty() { suffix } else { exact };
+
+    if candidates.len() > 1 {
+        let same_root: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&i| subcrates[i].root == subcrates[from].root)
+            .collect();
+        if same_root.len() == 1 {
+            candidates = same_root;
+        }
+    }
+
+    match candidates.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(Error::new(format!(
+            "subcrate `{}` depends on `{}`, but no `#[subcrate]` module with that path was found \
+             in this package. (Depending on an external, build-dependency crate this way is \
+             reserved syntax and not implemented yet.)",
+            subcrates[from].display_name(),
+            dep.path_display()
+        ))),
+        many => {
+            // Say which file each candidate is in only when that tells them apart.
+            let one_root = many
+                .iter()
+                .all(|&i| subcrates[i].root == subcrates[many[0]].root);
+            let listed: Vec<String> = many
+                .iter()
+                .map(|&i| {
+                    if one_root {
+                        format!("`{}`", subcrates[i].display_name())
+                    } else {
+                        format!(
+                            "`{}` (in `{}`)",
+                            subcrates[i].display_name(),
+                            subcrates[i].root.display()
+                        )
+                    }
+                })
+                .collect();
+            Err(Error::new(format!(
+                "subcrate `{}` depends on `{}`, which is ambiguous; it matches {}. \
+                 Use a longer module path to pick one, or rename a module",
+                subcrates[from].display_name(),
+                dep.path_display(),
+                listed.join(", ")
+            )))
+        }
+    }
+}
+
+/// The dependencies of `subcrates[ix]` the macro can name in the `cfg(doc)`
+/// stand-in: those under the same crate root, where `crate::<module path>` is
+/// valid. (A dependency from another crate root has no such path.)
+fn doc_deps(subcrates: &[Subcrate], ix: usize, links: &[Link]) -> Vec<ResolvedDep> {
+    links
+        .iter()
+        .filter(|link| subcrates[link.target].root == subcrates[ix].root)
+        .map(|link| {
+            (
+                link.alias.clone(),
+                subcrates[link.target].module_path.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Orders the subcrates (by index) so that each one comes after everything it
+/// depends on, using [`safegraph`]'s topological sort. A dependency cycle is an
+/// error naming the cycle.
+fn compile_order(subcrates: &[Subcrate], links: &[Vec<Link>]) -> Result<Vec<usize>, Error> {
+    // One node per subcrate and one edge per dependency, pointing from the
+    // dependency to its dependent ("compile this first"). A dependency declared
+    // under two aliases is still a single edge.
+    let mut graph = BTreeGraph::<usize, usize>::default();
+    let graph_error = |what: &str, err: &dyn std::fmt::Debug| {
+        Error::new(format!(
+            "internal error building the subcrate dependency graph ({}): {:?}",
+            what, err
+        ))
+    };
+    for ix in 0..subcrates.len() {
+        graph.insert_node(ix).map_err(|e| graph_error("node", &e))?;
+    }
+    let edges: BTreeSet<(usize, usize)> = links
+        .iter()
+        .enumerate()
+        .flat_map(|(ix, links)| links.iter().map(move |link| (link.target, ix)))
+        .collect();
+    for (edge, (dependency, dependent)) in edges.into_iter().enumerate() {
+        graph
+            .insert_edge(edge, [dependency, dependent])
+            .map_err(|e| graph_error("edge", &e))?;
+    }
+
+    toposort(&graph).map_err(|cycle| {
+        let path: Vec<String> = find_cycle(links, cycle.node)
+            .into_iter()
+            .map(|ix| subcrates[ix].display_name())
+            .collect();
+        Error::new(format!("subcrate dependency cycle: {}", path.join(" -> ")))
+    })
+}
+
+/// Finds a path `start -> … -> start` along "depends on" links, for the error
+/// message. `start` is known to lie on a cycle, so one exists.
+fn find_cycle(links: &[Vec<Link>], start: usize) -> Vec<usize> {
+    fn visit(
+        links: &[Vec<Link>],
+        node: usize,
+        start: usize,
+        seen: &mut Vec<bool>,
+        path: &mut Vec<usize>,
+    ) -> bool {
+        path.push(node);
+        for link in &links[node] {
+            if link.target == start {
+                path.push(start);
+                return true;
+            }
+            if !seen[link.target] {
+                seen[link.target] = true;
+                if visit(links, link.target, start, seen, path) {
+                    return true;
+                }
+            }
+        }
+        path.pop();
+        false
+    }
+
+    let mut path = Vec::new();
+    let mut seen = vec![false; links.len()];
+    seen[start] = true;
+    visit(links, start, start, &mut seen, &mut path);
+    path
 }
 
 /// Recursively inlines external `mod foo;` declarations (and the modules they
@@ -656,10 +999,39 @@ fn path_attr_value(attr: &Attribute) -> Option<String> {
 }
 
 /// Renders a module body into crate-root source text: crate-level inner
-/// attributes first (they must lead the crate root), then the items.
-fn render_source(inner_attrs: &[Attribute], items: &[Item]) -> String {
-    let tokens = quote! { #(#inner_attrs)* #(#items)* };
-    tokens.to_string()
+/// attributes first (they must lead the crate root), then the import of each
+/// linked dependency under its alias, then the items.
+///
+/// The import is `use ::<internal name> as <alias>;`, or — in edition 2015, where
+/// `::name` means something else — the equivalent `extern crate <internal name>
+/// as <alias>;`. It is an injected render-time detail: it is not part of the
+/// subcrate's content-addressed name (the dependency *list* in the arguments is).
+/// It sits at the crate root, so nested modules reach the alias as
+/// `crate::<alias>` or `super::<alias>`.
+fn render_source(
+    inner_attrs: &[Attribute],
+    deps: &[ExternDep],
+    edition: &str,
+    items: &[Item],
+) -> String {
+    let attrs = quote! { #(#inner_attrs)* }.to_string();
+    let mut imports = String::new();
+    for dep in deps {
+        // `unused_imports` is allowed: a dependency need not be used.
+        if edition == "2015" {
+            imports.push_str(&format!(
+                "#[allow(unused_extern_crates)] extern crate {} as {};\n",
+                dep.internal, dep.alias
+            ));
+        } else {
+            imports.push_str(&format!(
+                "#[allow(unused_imports)] use ::{} as {};\n",
+                dep.internal, dep.alias
+            ));
+        }
+    }
+    let items = quote! { #(#items)* }.to_string();
+    format!("{}\n{}{}", attrs, imports, items)
 }
 
 /// Reads the package's edition from `Cargo.toml`, following
@@ -908,5 +1280,320 @@ impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::new(format!("subcrate build I/O error: {}", err))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for dependency resolution and ordering. Dependency *cycles* and
+    //! unresolvable dependencies are build errors, so they cannot be asserted from
+    //! an end-to-end test; they are covered here instead.
+
+    use super::*;
+
+    fn dep(alias: &str, path: &[&str]) -> Dependency {
+        Dependency {
+            alias: alias.to_string(),
+            path: path.iter().map(|s| s.to_string()).collect(),
+            external: false,
+        }
+    }
+
+    /// Shorthand: a dependency on the subcrate named `name`, under that name.
+    fn on(name: &str) -> Dependency {
+        dep(name, &[name])
+    }
+
+    fn sub(root: &str, path: &[&str], deps: Vec<Dependency>) -> Subcrate {
+        Subcrate {
+            module_path: path.iter().map(|s| s.to_string()).collect(),
+            root: PathBuf::from(root),
+            deps,
+            internal: format!("__subcrate_{}", path.join("_")),
+            proc_macro: false,
+            edition: None,
+            inner_attrs: Vec::new(),
+            items: Vec::new(),
+        }
+    }
+
+    /// A top-level subcrate in `src/lib.rs`.
+    fn top(name: &str, deps: Vec<Dependency>) -> Subcrate {
+        sub("src/lib.rs", &[name], deps)
+    }
+
+    /// The compile order as module names, or the error message.
+    fn order(subs: &[Subcrate]) -> Result<Vec<String>, String> {
+        let links = resolve_links(subs).map_err(|e| e.to_string())?;
+        let order = compile_order(subs, &links).map_err(|e| e.to_string())?;
+        Ok(order.into_iter().map(|i| subs[i].display_name()).collect())
+    }
+
+    fn position(order: &[String], name: &str) -> usize {
+        order.iter().position(|n| n == name).unwrap()
+    }
+
+    #[test]
+    fn independent_subcrates_all_compile() {
+        let order = order(&[top("a", vec![]), top("b", vec![])]).unwrap();
+        assert_eq!(order.len(), 2);
+    }
+
+    #[test]
+    fn dependencies_compile_before_their_dependents() {
+        // Declared against the grain: `c` uses `b`, which uses `a`.
+        let subs = [
+            top("c", vec![on("b")]),
+            top("b", vec![on("a")]),
+            top("a", vec![]),
+        ];
+        let order = order(&subs).unwrap();
+        assert_eq!(order, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_diamond_orders_the_shared_dependency_first() {
+        let subs = [
+            top("join", vec![on("left"), on("right")]),
+            top("left", vec![on("base")]),
+            top("right", vec![on("base")]),
+            top("base", vec![]),
+        ];
+        let order = order(&subs).unwrap();
+        assert_eq!(position(&order, "base"), 0);
+        assert_eq!(position(&order, "join"), 3);
+    }
+
+    #[test]
+    fn one_subcrate_under_two_aliases_is_a_single_edge() {
+        let subs = [
+            top("a", vec![]),
+            top("b", vec![dep("x", &["a"]), dep("y", &["a"])]),
+        ];
+        assert_eq!(order(&subs).unwrap(), ["a", "b"]);
+        let links = resolve_links(&subs).unwrap();
+        let aliases: Vec<&str> = links[1].iter().map(|l| l.alias.as_str()).collect();
+        assert_eq!(aliases, ["x", "y"]);
+    }
+
+    #[test]
+    fn a_dependency_cycle_is_an_error_naming_the_cycle() {
+        let subs = [
+            top("a", vec![on("b")]),
+            top("b", vec![on("c")]),
+            top("c", vec![on("a")]),
+            top("unrelated", vec![]),
+        ];
+        let message = order(&subs).unwrap_err();
+        let path = message
+            .strip_prefix("subcrate dependency cycle: ")
+            .unwrap_or_else(|| panic!("unexpected message: {}", message));
+        let nodes: Vec<&str> = path.split(" -> ").collect();
+        // The cycle closes on itself and visits exactly `a`, `b` and `c`.
+        assert_eq!(nodes.first(), nodes.last());
+        let mut distinct: Vec<&str> = nodes[1..].to_vec();
+        distinct.sort_unstable();
+        assert_eq!(distinct, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_subcrate_depending_on_itself_is_a_cycle() {
+        let message = order(&[top("a", vec![on("a")])]).unwrap_err();
+        assert_eq!(message, "subcrate dependency cycle: a -> a");
+    }
+
+    #[test]
+    fn an_unknown_dependency_is_an_error() {
+        let message = order(&[top("a", vec![on("missing")])]).unwrap_err();
+        assert!(message.contains("`a` depends on `missing`"), "{}", message);
+        assert!(message.contains("no `#[subcrate]` module"), "{}", message);
+        assert!(message.contains("not implemented yet"), "{}", message);
+    }
+
+    #[test]
+    fn an_ident_matches_a_nested_subcrate_by_its_last_segment() {
+        let subs = [
+            top("b", vec![on("leaf")]),
+            sub("src/lib.rs", &["nested", "leaf"], vec![]),
+        ];
+        assert_eq!(order(&subs).unwrap(), ["nested::leaf", "b"]);
+    }
+
+    #[test]
+    fn a_full_path_picks_among_same_named_subcrates() {
+        let subs = [
+            sub("src/lib.rs", &["p", "h"], vec![]),
+            sub("src/lib.rs", &["q", "h"], vec![]),
+            top("a", vec![dep("h", &["q", "h"])]),
+        ];
+        let links = resolve_links(&subs).unwrap();
+        assert_eq!(links[2][0].target, 1);
+        // The bare ident is ambiguous: two modules are called `h`.
+        let subs = [
+            sub("src/lib.rs", &["p", "h"], vec![]),
+            sub("src/lib.rs", &["q", "h"], vec![]),
+            top("a", vec![on("h")]),
+        ];
+        let message = order(&subs).unwrap_err();
+        assert!(message.contains("ambiguous"), "{}", message);
+        assert!(message.contains("`p::h`") && message.contains("`q::h`"));
+    }
+
+    #[test]
+    fn an_exact_path_beats_a_longer_path_ending_the_same_way() {
+        // `h` is both a top-level module and the tail of `p::h`; the top-level one
+        // is what the path `h` names.
+        let subs = [
+            sub("src/lib.rs", &["p", "h"], vec![]),
+            top("h", vec![]),
+            top("a", vec![on("h")]),
+        ];
+        let links = resolve_links(&subs).unwrap();
+        assert_eq!(links[2][0].target, 1);
+    }
+
+    #[test]
+    fn a_dependency_prefers_the_subcrate_under_its_own_crate_root() {
+        // Two test files each define their own `helper`; each `user` gets its own.
+        let subs = [
+            sub("tests/x.rs", &["helper"], vec![]),
+            sub("tests/y.rs", &["helper"], vec![]),
+            sub("tests/y.rs", &["user"], vec![on("helper")]),
+        ];
+        let links = resolve_links(&subs).unwrap();
+        assert_eq!(links[2][0].target, 1);
+    }
+
+    #[test]
+    fn a_dependency_may_come_from_another_crate_root() {
+        let subs = [
+            sub("src/lib.rs", &["shared"], vec![]),
+            sub("tests/t.rs", &["user"], vec![on("shared")]),
+        ];
+        assert_eq!(order(&subs).unwrap(), ["shared", "user"]);
+        // ...but `crate::<path>` only names it for the doc stand-in when the roots match.
+        let links = resolve_links(&subs).unwrap();
+        assert!(doc_deps(&subs, 1, &links[1]).is_empty());
+    }
+
+    #[test]
+    fn doc_deps_lists_same_root_dependencies_by_alias_and_full_path() {
+        let subs = [
+            sub("src/lib.rs", &["nested", "leaf"], vec![]),
+            top("b", vec![dep("l", &["nested", "leaf"])]),
+        ];
+        let links = resolve_links(&subs).unwrap();
+        assert_eq!(
+            doc_deps(&subs, 1, &links[1]),
+            [(
+                "l".to_string(),
+                vec!["nested".to_string(), "leaf".to_string()]
+            )]
+        );
+    }
+
+    fn config() -> Config {
+        Config {
+            manifest_dir: PathBuf::from("."),
+            out_dir: PathBuf::from("out"),
+            rustc: PathBuf::from("rustc"),
+            edition: "2021".to_string(),
+            target: None,
+            panic: None,
+            opt_level: "0".to_string(),
+            debug_assertions: true,
+            rustflags: Vec::new(),
+            feature_cfgs: Vec::new(),
+            extra_rustc_args: Vec::new(),
+        }
+    }
+
+    fn linked(internal: &str, alias: &str) -> ExternDep {
+        ExternDep {
+            internal: internal.to_string(),
+            alias: alias.to_string(),
+            path: PathBuf::from(format!("out/subcrates/lib{}.rlib", internal)),
+        }
+    }
+
+    #[test]
+    fn a_dependency_is_linked_by_internal_name_and_imported_under_its_alias() {
+        let sub = top("b", vec![]);
+        let deps = [linked("__subcrate_a_1", "a"), linked("__subcrate_c_2", "z")];
+
+        let args = config().rustc_args(&sub, &deps, Path::new("out/subcrates"));
+        assert!(args.contains(&"--extern".to_string()));
+        assert!(args.contains(&"__subcrate_a_1=out/subcrates/lib__subcrate_a_1.rlib".to_string()));
+        assert!(args.contains(&"__subcrate_c_2=out/subcrates/lib__subcrate_c_2.rlib".to_string()));
+        assert!(args.contains(&"dependency=out/subcrates".to_string()));
+
+        let source = render_source(&[], &deps, "2021", &[]);
+        assert!(source.contains("use ::__subcrate_a_1 as a;"), "{}", source);
+        assert!(source.contains("use ::__subcrate_c_2 as z;"), "{}", source);
+    }
+
+    #[test]
+    fn a_crate_under_two_aliases_is_linked_once() {
+        let deps = [linked("__subcrate_a_1", "x"), linked("__subcrate_a_1", "y")];
+        let args = config().rustc_args(&top("b", vec![]), &deps, Path::new("out/subcrates"));
+        assert_eq!(args.iter().filter(|a| *a == "--extern").count(), 1);
+        let source = render_source(&[], &deps, "2021", &[]);
+        assert!(source.contains("use ::__subcrate_a_1 as x;"));
+        assert!(source.contains("use ::__subcrate_a_1 as y;"));
+    }
+
+    #[test]
+    fn a_2015_edition_subcrate_imports_with_extern_crate() {
+        let deps = [linked("__subcrate_a_1", "a")];
+        let source = render_source(&[], &deps, "2015", &[]);
+        assert!(
+            source.contains("extern crate __subcrate_a_1 as a;"),
+            "{}",
+            source
+        );
+        assert!(!source.contains("use ::"), "{}", source);
+    }
+
+    #[test]
+    fn the_injected_import_follows_crate_level_attributes() {
+        let file = syn::parse_file("#![allow(dead_code)] fn f() {}").unwrap();
+        let source = render_source(
+            &file.attrs,
+            &[linked("__subcrate_a_1", "a")],
+            "2021",
+            &file.items,
+        );
+        let attr = source.find("allow").unwrap();
+        let import = source.find("use ::__subcrate_a_1").unwrap();
+        let item = source.find("fn f").unwrap();
+        assert!(attr < import && import < item, "{}", source);
+    }
+
+    #[test]
+    fn a_subcrate_without_dependencies_renders_no_import() {
+        let args = config().rustc_args(&top("b", vec![]), &[], Path::new("out/subcrates"));
+        assert!(!args.contains(&"--extern".to_string()));
+        assert!(!args.contains(&"-L".to_string()));
+        assert!(!render_source(&[], &[], "2021", &[]).contains("use ::"));
+    }
+
+    #[test]
+    fn external_crates_are_reserved_but_not_supported() {
+        let mut external = on("serde");
+        external.external = true;
+        let message = order(&[top("a", vec![external])]).unwrap_err();
+        assert!(message.contains("`::serde`"), "{}", message);
+        assert!(message.contains("not implemented yet"), "{}", message);
+    }
+
+    #[test]
+    fn two_dependencies_with_one_name_are_an_error() {
+        let subs = [
+            top("x", vec![]),
+            top("y", vec![]),
+            top("a", vec![on("x"), dep("x", &["y"])]),
+        ];
+        let message = order(&subs).unwrap_err();
+        assert!(message.contains("more than one dependency named `x`"));
     }
 }

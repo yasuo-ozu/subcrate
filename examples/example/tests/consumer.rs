@@ -16,6 +16,13 @@ fn library_subcrates_usable_by_a_consumer() {
 }
 
 #[test]
+fn subcrate_depending_on_a_subcrate_usable_by_a_consumer() {
+    // `doubled` links against `my_crate`; a downstream crate that uses `doubled`
+    // must find `my_crate`'s artifact too (it is recorded in `doubled`'s metadata).
+    assert_eq!(example::doubled::calc(), 64);
+}
+
+#[test]
 fn proc_macro_subcrate_usable_by_a_consumer() {
     // Both the module path and the crate-root re-export resolve.
     assert_eq!(example::my_macro::mac!(), 42);

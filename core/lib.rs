@@ -12,7 +12,10 @@
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{AttrStyle, Attribute, Expr, ExprLit, Item, Lit, Meta, MetaNameValue, Token};
+use syn::{
+    AttrStyle, Attribute, Expr, ExprLit, ExprPath, Item, Lit, Meta, MetaNameValue, PathArguments,
+    Token,
+};
 use template_quote::quote;
 
 /// The prefix of every generated internal crate name.
@@ -25,7 +28,19 @@ use template_quote::quote;
 pub const INTERNAL_PREFIX: &str = "__subcrate_";
 
 /// Arguments accepted by the `#[subcrate]` attribute, e.g.
-/// `#[subcrate(proc_macro = true, edition = "2018")]`.
+/// `#[subcrate(proc_macro, edition = "2018", other_subcrate)]`.
+///
+/// The attribute takes a flat, comma-separated list. Each argument is one of:
+///
+/// * `proc_macro` (or `proc_macro = true`) — compile as a `proc-macro` crate.
+/// * `edition = "2018"` — compile with this edition.
+/// * `path::to::dep` — depend on the sibling subcrate at that module path,
+///   visible inside this subcrate under the path's last segment.
+/// * `alias = path::to::dep` — the same, visible under `alias`.
+/// * `::name` — an *external* (build-dependency) crate. This is reserved
+///   syntax: it parses, but external crates are not implemented yet, so the
+///   build helper rejects it. (A bare path that matches no sibling subcrate is
+///   reserved for the same purpose and rejected the same way.)
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Args {
     /// Compile the module as a `proc-macro` crate rather than an ordinary
@@ -33,17 +48,59 @@ pub struct Args {
     pub proc_macro: bool,
     /// Compile the subcrate with this edition instead of the owning package's.
     pub edition: Option<String>,
+    /// The crates this subcrate links against, in the order written.
+    pub deps: Vec<Dependency>,
+}
+
+/// One dependency of a subcrate, as written in `#[subcrate(...)]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependency {
+    /// The name the dependency is visible under inside the subcrate: the explicit
+    /// `alias = …`, or else the last segment of `path`. (The build helper imports
+    /// the dependency's crate under this name at the subcrate's crate root.)
+    pub alias: String,
+    /// The module path of the depended-on subcrate, from its crate root, with
+    /// any leading `crate` removed (e.g. `["nested", "inner"]`). For an
+    /// external crate this is the crate's path after the leading `::`.
+    pub path: Vec<String>,
+    /// `true` for a leading-`::` path naming an external crate (reserved, not
+    /// implemented yet).
+    pub external: bool,
+}
+
+impl Dependency {
+    /// The dependency's path as written, e.g. `nested::inner` or `::serde`.
+    pub fn path_display(&self) -> String {
+        format!(
+            "{}{}",
+            if self.external { "::" } else { "" },
+            self.path.join("::")
+        )
+    }
 }
 
 impl Args {
     /// A stable textual form of the arguments, folded into the internal crate
     /// name so that two otherwise-identical module bodies compiled with
-    /// different arguments (e.g. different editions) get distinct crates.
+    /// different arguments (e.g. different editions or dependencies) get
+    /// distinct crates.
+    ///
+    /// Dependencies are sorted, so reordering them does not change the name. Only
+    /// their *paths* are folded in, not the depended-on crate's content: the
+    /// build helper recompiles a subcrate whenever a dependency's crate name
+    /// (which embeds that dependency's content hash) changes.
     fn fingerprint(&self) -> String {
+        let mut deps: Vec<String> = self
+            .deps
+            .iter()
+            .map(|dep| format!("{}={}", dep.alias, dep.path_display()))
+            .collect();
+        deps.sort();
         format!(
-            "{}|{}",
+            "{}|{}|{}",
             self.proc_macro,
-            self.edition.as_deref().unwrap_or("")
+            self.edition.as_deref().unwrap_or(""),
+            deps.join(",")
         )
     }
 }
@@ -51,21 +108,102 @@ impl Args {
 impl Parse for Args {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut args = Args::default();
-        let metas = Punctuated::<MetaNameValue, Token![,]>::parse_terminated(input)?;
+        let metas = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
         for meta in metas {
-            if meta.path.is_ident("proc_macro") {
-                args.proc_macro = parse_bool(&meta.value)?;
-            } else if meta.path.is_ident("edition") {
-                args.edition = Some(parse_string(&meta.value)?);
-            } else {
-                return Err(syn::Error::new_spanned(
-                    &meta.path,
-                    "unknown `#[subcrate]` argument (expected `proc_macro` or `edition`)",
-                ));
+            match &meta {
+                // A bare path: the `proc_macro` flag, or a dependency.
+                Meta::Path(path) => {
+                    if path.is_ident("proc_macro") {
+                        args.proc_macro = true;
+                    } else {
+                        args.deps.push(parse_dependency(None, path)?);
+                    }
+                }
+                Meta::NameValue(MetaNameValue { path, value, .. }) => {
+                    let key = match path.get_ident() {
+                        Some(ident) => ident.to_string(),
+                        None => return Err(unknown_argument(path)),
+                    };
+                    // The value's kind picks the meaning: a path renames a
+                    // dependency, a literal sets a known key.
+                    match value {
+                        Expr::Path(ExprPath {
+                            qself: None,
+                            path: target,
+                            ..
+                        }) => {
+                            if key == "proc_macro" {
+                                return Err(syn::Error::new_spanned(
+                                    path,
+                                    "`proc_macro` is reserved and cannot name a dependency",
+                                ));
+                            }
+                            args.deps.push(parse_dependency(Some(key), target)?);
+                        }
+                        _ if key == "proc_macro" => args.proc_macro = parse_bool(value)?,
+                        _ if key == "edition" => args.edition = Some(parse_string(value)?),
+                        _ => return Err(unknown_argument(path)),
+                    }
+                }
+                Meta::List(list) => return Err(unknown_argument(&list.path)),
             }
         }
         Ok(args)
     }
+}
+
+fn unknown_argument(path: &syn::Path) -> syn::Error {
+    syn::Error::new_spanned(
+        path,
+        "unknown `#[subcrate]` argument (expected `proc_macro`, `edition = \"…\"`, or a \
+         dependency: `path::to::subcrate` or `alias = path::to::subcrate`)",
+    )
+}
+
+/// Parses one dependency path, optionally renamed to `alias`.
+///
+/// A single leading `crate` is dropped (module paths are relative to the crate
+/// root); `self`/`super`/`Self` and generic arguments are rejected, since a
+/// subcrate has no meaningful position to resolve them against.
+fn parse_dependency(alias: Option<String>, path: &syn::Path) -> syn::Result<Dependency> {
+    let external = path.leading_colon.is_some();
+    let mut segments = Vec::new();
+    for segment in &path.segments {
+        if !matches!(segment.arguments, PathArguments::None) {
+            return Err(syn::Error::new_spanned(
+                segment,
+                "a subcrate dependency path cannot have generic arguments",
+            ));
+        }
+        segments.push(segment.ident.to_string());
+    }
+    if !external && segments.first().map(String::as_str) == Some("crate") {
+        segments.remove(0);
+    }
+    if segments
+        .iter()
+        .any(|s| matches!(s.as_str(), "crate" | "self" | "super" | "Self"))
+    {
+        return Err(syn::Error::new_spanned(
+            path,
+            "a subcrate dependency path must name a module from the crate root, \
+             like `outer::inner` (`self`, `super` and `Self` are not allowed)",
+        ));
+    }
+    let last = match segments.last() {
+        Some(last) => last.clone(),
+        None => {
+            return Err(syn::Error::new_spanned(
+                path,
+                "expected the path of a subcrate",
+            ))
+        }
+    };
+    Ok(Dependency {
+        alias: alias.unwrap_or(last),
+        path: segments,
+        external,
+    })
 }
 
 fn parse_bool(expr: &Expr) -> syn::Result<bool> {
@@ -125,6 +263,47 @@ pub fn parse_attr_args(attr: &Attribute) -> syn::Result<Args> {
             "`#[subcrate]` does not take a `= value` form",
         )),
     }
+}
+
+/// A sibling dependency of a subcrate that the build helper resolved *under the
+/// same crate root*, as recorded in the manifest: the name it is visible under
+/// (the alias) and its module path from that root.
+pub type ResolvedDep = (String, Vec<String>);
+
+/// Renders one line of the build helper's manifest: the subcrate's internal name,
+/// then one tab-separated `alias=path::to::dep` per resolved dependency.
+///
+/// The macro reads the dependencies back to give a subcrate's `cfg(doc)`
+/// stand-in the same names in scope that the real crate gets from `--extern`.
+pub fn manifest_line(internal: &str, deps: &[ResolvedDep]) -> String {
+    let mut line = internal.to_string();
+    for (alias, path) in deps {
+        line.push('\t');
+        line.push_str(alias);
+        line.push('=');
+        line.push_str(&path.join("::"));
+    }
+    line
+}
+
+/// Finds the manifest line for `internal` (see [`manifest_line`]) and returns its
+/// resolved dependencies, or `None` if the subcrate is not listed.
+pub fn manifest_lookup(manifest: &str, internal: &str) -> Option<Vec<ResolvedDep>> {
+    manifest.lines().find_map(|line| {
+        let mut fields = line.trim().split('\t');
+        if fields.next()? != internal {
+            return None;
+        }
+        Some(
+            fields
+                .filter_map(|field| {
+                    let (alias, path) = field.split_once('=')?;
+                    let path = path.split("::").map(str::to_string).collect();
+                    Some((alias.to_string(), path))
+                })
+                .collect(),
+        )
+    })
 }
 
 /// Produces the canonical textual form of a module body.

@@ -142,16 +142,77 @@ exactly as Cargo builds a normal proc-macro crate.
 
 ### Per-subcrate options
 
-- `#[subcrate(proc_macro = true)]` — compile the module as a `proc-macro` crate.
+- `#[subcrate(proc_macro)]` (or `proc_macro = true`) — compile the module as a
+  `proc-macro` crate.
 - `#[subcrate(edition = "2018")]` — compile just this subcrate with a specific
   edition instead of the package's.
 - Crate-root inner attributes written in the body (`#![no_std]`, `#![allow(…)]`,
   …) are applied to the subcrate's crate root.
 - A subcrate body may use `mod foo;` to pull in other files (resolved like
   ordinary Rust modules, `#[path]` included); the build helper inlines them
-  before compiling, and edits to those files trigger a rebuild. This needs a
-  Rust newer than the 1.56 MSRV, since a non-inline `mod foo;` in proc-macro
-  input was unstable on 1.56 (`E0658`); inline `mod foo { … }` works everywhere.
+  before compiling, and edits to those files trigger a rebuild. This form needs
+  **nightly** Rust — a non-inline `mod foo;` in proc-macro input is unstable
+  (`E0658`) on stable. Inline `mod foo { … }` works everywhere, including on the
+  1.56 MSRV.
+
+### Subcrates that depend on subcrates
+
+A subcrate can link against other `#[subcrate]` modules of the same package.
+List them among the attribute's arguments, as the path of the module:
+
+```rust ignore
+#[subcrate]
+pub mod base {
+    pub fn helper() -> u32 { 10 }
+}
+
+pub mod nested {
+    use subcrate::subcrate;
+    #[subcrate]
+    pub mod leaf { pub fn n() -> u32 { 3 } }
+}
+
+#[subcrate(base, nested::leaf)]   // `base` and `leaf` are visible inside `derived`
+pub mod derived {
+    pub fn f() -> u32 { base::helper() + leaf::n() }
+}
+
+#[subcrate(h = base)]             // `alias = path` renames the dependency
+pub mod renamed {
+    pub fn f() -> u32 { h::helper() }
+}
+```
+
+- A bare path (`base`, `nested::leaf`) makes the sibling subcrate available under
+  the path's last segment; `alias = path` makes it available under `alias`
+  instead. `proc_macro` is the only reserved bare name.
+- Under the hood the dependency is passed to `rustc` as `--extern <its internal
+  crate name>=<artifact>`, and `use ::<internal name> as <alias>;` is added at
+  the subcrate's crate root (`extern crate … as …;` in edition 2015). That
+  import is a build-time detail: it is not part of the subcrate's name. Since it
+  sits at the crate root, a nested module of the subcrate reaches the dependency
+  as `crate::alias` or `super::alias`, and the subcrate can re-export it
+  (`pub use alias::Thing;`).
+- The path is the module's path from its crate root (a leading `crate::` is
+  allowed). A lone ident finds the subcrate with that name wherever it is nested;
+  a full path picks among same-named ones. If a name is still ambiguous the
+  subcrate under the same crate root (the same `src/lib.rs`, or the same
+  `tests/foo.rs`) wins; otherwise, or if nothing matches, the build fails with a
+  message saying so. Dependencies may cross crate roots (a `tests/` subcrate can
+  depend on a `src/lib.rs` one).
+- Subcrates are compiled **in dependency order** (a topological sort, done with
+  [`safegraph`](https://docs.rs/safegraph)), and a dependency cycle is a build
+  error that names the cycle (`subcrate dependency cycle: a -> b -> a`).
+- Dependencies are part of a subcrate's identity, and changing a dependency's
+  body recompiles its dependents (the artifact path they are linked against
+  embeds the dependency's content hash).
+- A library subcrate may depend on a `proc_macro` subcrate and invoke its macros
+  (`name::mac!()`). A `proc_macro` subcrate may depend on library subcrates too
+  (the macro can call them as it expands), except when cross-compiling: a library
+  subcrate is built for the target, but a proc-macro runs on the host.
+- Depending on an *external* (build-dependency) crate is not implemented yet.
+  The syntax is reserved for it: `::name`, and a bare path that matches no
+  sibling subcrate, are rejected with a clear error.
 
 ### Crate boundaries are real
 
@@ -176,7 +237,13 @@ All tests are integration tests under `tests/` directories, run by
   test file (proving `tests/` discovery and that `crate::` resolves to the
   subcrate's own root).
 - `examples/example/tests/consumer.rs` — the same subcrates used from a separate
-  consuming crate (each `tests/` file is its own crate linking `example`).
+  consuming crate (each `tests/` file is its own crate linking `example`),
+  including one that depends on another subcrate.
+- `examples/example/tests/dependencies.rs` — subcrates depending on subcrates:
+  chains, diamonds, paths, aliases, and proc-macro subcrates on either side.
+- `core/tests/args.rs` and the unit tests in `build.rs` — `#[subcrate(...)]`
+  argument parsing, and dependency resolution/ordering including the build-error
+  cases (cycles, unknown or ambiguous dependencies).
 
 Code generation throughout uses `template-quote` (<https://docs.rs/template-quote>).
 
@@ -198,6 +265,10 @@ transitive crates back down.)
   dependency's subcrate-backed items referenced in documented code — Cargo
   forwards the search path to `rustc` but not to `rustdoc`. Guard such
   references with `#[cfg(not(doc))]` if you need downstream docs to build.
+- That `cfg(doc)` stand-in imports a subcrate's dependencies at the top of its
+  module, mirroring the real crate-root import, but only when the dependency is
+  under the same crate root (a dependency in another crate root has no
+  `crate::` path to import).
 
 ## License
 
