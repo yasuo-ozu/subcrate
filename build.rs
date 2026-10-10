@@ -4596,4 +4596,68 @@ other = "1"
         let message = order(&subs).unwrap_err();
         assert!(message.contains("more than one dependency named `x`"));
     }
+
+    #[test]
+    fn is_artifact_matches_compiled_outputs_only() {
+        for name in ["deps/libfoo-1.rlib", "x.rmeta", "x.so", "x.dylib", "x.dll"] {
+            assert!(
+                is_artifact(Path::new(name)),
+                "{} should be an artifact",
+                name
+            );
+        }
+        for name in [
+            "x.rs",
+            "x.d",
+            "libfoo",
+            // The hard-link temp file (`<name>.subcrate-link-tmp-<pid>`) must not
+            // be picked up as an artifact to relink.
+            "libfoo-1.rlib.subcrate-link-tmp-42",
+        ] {
+            assert!(!is_artifact(Path::new(name)), "{} is not an artifact", name);
+        }
+    }
+
+    #[test]
+    fn dedup_hard_links_byte_identical_artifacts() {
+        let base = std::env::temp_dir().join(format!("subcrate-dedup-test-{}", std::process::id()));
+        let main = base.join("main");
+        let side = base.join("side");
+        std::fs::create_dir_all(main.join("deps")).unwrap();
+        std::fs::create_dir_all(side.join("deps")).unwrap();
+
+        let bytes = b"rlib-bytes-0123456789".repeat(16);
+        // A dependency present in both, byte-identical: the reclaimable case.
+        std::fs::write(main.join("deps/libdup-abc.rlib"), &bytes).unwrap();
+        std::fs::write(side.join("deps/libdup-abc.rlib"), &bytes).unwrap();
+        // A side artifact with no twin in main: left alone.
+        std::fs::write(side.join("deps/libsolo-xyz.rlib"), b"solo").unwrap();
+        // A same-named pair whose contents differ: must not be linked.
+        std::fs::write(main.join("deps/libdiff-def.rlib"), b"one").unwrap();
+        std::fs::write(side.join("deps/libdiff-def.rlib"), b"two").unwrap();
+
+        dedup_against_main(&side, &main);
+
+        let side_dup = side.join("deps/libdup-abc.rlib");
+        let main_dup = main.join("deps/libdup-abc.rlib");
+        // The identical twin is now one file with the main copy, and still reads
+        // back the same bytes.
+        assert!(
+            same_file(&side_dup, &main_dup),
+            "a byte-identical artifact should be hard-linked to the main copy"
+        );
+        assert_eq!(std::fs::read(&side_dup).unwrap(), bytes);
+        // The crate with no main twin, and the same-named-but-different one, are
+        // untouched separate files.
+        assert!(!same_file(
+            &side.join("deps/libsolo-xyz.rlib"),
+            &main.join("deps/libsolo-xyz.rlib")
+        ));
+        assert_eq!(
+            std::fs::read(side.join("deps/libdiff-def.rlib")).unwrap(),
+            b"two"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
