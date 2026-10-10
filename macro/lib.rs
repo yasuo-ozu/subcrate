@@ -10,21 +10,6 @@ use subcrate_core::{internal_crate_name, Args};
 use syn::{parse_macro_input, Ident, ItemMod};
 use template_quote::quote;
 
-/// Replaces an inline module with a binding to the real crate compiled from it
-/// by the build helper.
-///
-/// See the crate-level documentation of `subcrate` for the full contract. In
-/// short, `#[subcrate] pub mod foo { .. }` expands to
-/// `pub extern crate __subcrate_foo_<hash> as foo;`, preserving the module's
-/// name, visibility and attributes while giving `foo` a genuinely separate
-/// crate identity.
-///
-/// The attribute takes a comma-separated list of arguments: `proc_macro`
-/// (compile as a proc-macro crate), `edition = "2018"`, and dependencies:
-/// on sibling subcrates, `path::to::other` or `alias = path::to::other`, which
-/// the build helper links in and compiles first, and on crates the owning
-/// package depends on (or the package's own library), `::name` or
-/// `alias = ::name`, which it has Cargo build.
 #[proc_macro_attribute]
 pub fn subcrate(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as Args);
