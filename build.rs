@@ -59,6 +59,15 @@
 //! compiled against: a type from `serde` means the same thing in the subcrate and
 //! in the owner.
 //!
+//! The separate target directory would otherwise store the owner's dependency
+//! chain twice — once there, once in the main target. But Cargo names an artifact
+//! by a hash of its content and configuration, so the two copies are byte for byte
+//! the same file under the same name. After the nested build the build script
+//! replaces each duplicate in the separate directory with a hard link to the main
+//! copy (both are in one `target/` tree, hence on one filesystem; a shared hash
+//! name can never mean two contents, so the shared inode is safe), reclaiming that
+//! disk. It is best effort — a failure just keeps the extra copy.
+//!
 //! `::name` is the name the package's own code uses for the crate, which
 //! `Cargo.toml` says is the dependency's key. For a renamed dependency
 //! (`myleaf = { package = "leaf", … }`) the package to build is the `package`, and
@@ -578,6 +587,18 @@ impl Config {
             )));
         }
 
+        // Reclaim the disk the nested build just spent. It re-stored the owner's
+        // dependency chain in its own target directory, byte for byte the same as
+        // the copies already in the main target: Cargo names an artifact by a hash
+        // of its content and configuration, so one name is one content. Replace
+        // each duplicate with a hard link to the main copy — both live in the same
+        // `target/` tree, hence on the same filesystem, and a shared hash name can
+        // never come to mean two different contents, so the shared inode is safe.
+        // Best effort: any I/O failure just leaves the extra copy in place.
+        if let Some(main) = self.main_profile_dir() {
+            dedup_against_main(&target_dir, &main);
+        }
+
         let mut deps = parse_artifacts(&String::from_utf8_lossy(&output.stdout));
         deps.externals = crates;
         // Rebuild the subcrates when the crates they link against change. Cargo
@@ -650,6 +671,20 @@ impl Config {
             &self.package,
             rustc_key(&self.rustc).as_deref(),
         )
+    }
+
+    /// The main build's profile directory — `target/debug`, `target/<triple>/release`
+    /// — the one `OUT_DIR` sits under (the directory holding `build`). The owner's
+    /// own dependency artifacts live beneath it, and the nested build's target
+    /// directory ([`owner_deps_target_dir`](Self::owner_deps_target_dir)) sits
+    /// beneath it too, under `subcrate-owner-deps`. `None` when the layout is not the
+    /// usual one, in which case the disk-reclaiming step is simply skipped.
+    fn main_profile_dir(&self) -> Option<PathBuf> {
+        self.out_dir
+            .ancestors()
+            .find(|dir| dir.file_name().map_or(false, |name| name == "build"))
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
     }
 
     /// The arguments of the nested `cargo build` of `packages` into `target_dir`.
@@ -884,6 +919,146 @@ fn shared_target_dir(out_dir: &Path, package: &str, compiler: Option<&str>) -> P
             }
         }
         None => out_dir.join("owner-deps-target"),
+    }
+}
+
+/// The compiled-output extensions worth deduplicating — the large artifacts.
+/// Cargo names each by a hash of its content and configuration, so two files of
+/// one name hold one content.
+const ARTIFACT_EXTENSIONS: &[&str] = &["rlib", "rmeta", "so", "dylib", "dll"];
+
+fn is_artifact(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map_or(false, |ext| ARTIFACT_EXTENSIONS.contains(&ext))
+}
+
+/// Replace every artifact under `side` that is byte-identical to one in the main
+/// profile directory `main` with a hard link to the main copy, reclaiming the disk
+/// the nested build spent re-storing the owner's dependency chain. See the call
+/// site for why this is sound. Best effort throughout: an I/O error on any one
+/// file leaves that duplicate in place and moves on.
+fn dedup_against_main(side: &Path, main: &Path) {
+    // Index the main target's artifacts by file name — content-addressed, so the
+    // name is a near-unique key. Skip the whole `subcrate-owner-deps` subtree (the
+    // nested builds' target directories, `side` among them, live there): its copies
+    // are duplicates themselves, and a side artifact should link to the canonical
+    // copy in the main target, not to another package's duplicate.
+    let mut by_name: BTreeMap<OsString, PathBuf> = BTreeMap::new();
+    index_artifacts(main, &main.join("subcrate-owner-deps"), &mut by_name);
+    link_duplicates(side, &by_name);
+}
+
+/// Walk `dir` (skipping the subtree `skip`) and record each artifact file under
+/// its file name. The first file of a given name wins; a second is all but
+/// impossible under content addressing, and either copy would serve.
+fn index_artifacts(dir: &Path, skip: &Path, by_name: &mut BTreeMap<OsString, PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == skip {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => index_artifacts(&path, skip, by_name),
+            Ok(ft) if ft.is_file() && is_artifact(&path) => {
+                by_name.entry(entry.file_name()).or_insert(path);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walk `dir` and hard-link each artifact whose name matches one in `by_name`.
+fn link_duplicates(dir: &Path, by_name: &BTreeMap<OsString, PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => link_duplicates(&path, by_name),
+            Ok(ft) if ft.is_file() && is_artifact(&path) => {
+                if let Some(main) = by_name.get(&entry.file_name()) {
+                    link_if_identical(&path, main);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Replace `side` with a hard link to `main` when the two hold the same bytes and
+/// are not already one file. The link is made under a temporary name and renamed
+/// over `side`, so an interruption can never leave `side` missing (a half-done
+/// step just leaves the original, which the next build reuses).
+fn link_if_identical(side: &Path, main: &Path) {
+    if same_file(side, main) || !same_contents(side, main) {
+        return;
+    }
+    // A temporary name unique to this file and this process, so two builds
+    // deduplicating the same directory at once never clobber each other's
+    // in-progress link (they would only ever race to the identical result, but
+    // sharing one temp name would make them skip work needlessly).
+    let tmp = match side.file_name().and_then(|name| name.to_str()) {
+        Some(name) => {
+            side.with_file_name(format!("{}.subcrate-link-tmp-{}", name, std::process::id()))
+        }
+        None => return,
+    };
+    let _ = std::fs::remove_file(&tmp);
+    if std::fs::hard_link(main, &tmp).is_ok() && std::fs::rename(&tmp, side).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Whether two paths already refer to one file (a hard link made on an earlier
+/// build), so there is nothing to reclaim. A false negative only repeats the
+/// content check and relink; a false positive only skips a dedup — neither can
+/// affect correctness, since same-named artifacts always hold the same bytes.
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+/// Windows exposes no file identity on stable without opening a handle, so this
+/// compares size and last-write time: a hard link shares the underlying file's
+/// metadata, so a match means `a` is already linked to `b`. Freshly built copies
+/// differ in write time, so the first link is still made; afterwards the linked
+/// file reports `b`'s time and is skipped.
+#[cfg(windows)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => {
+            x.file_size() == y.file_size() && x.last_write_time() == y.last_write_time()
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(_a: &Path, _b: &Path) -> bool {
+    false
+}
+
+/// Whether two files hold the same bytes. A size comparison comes first; the
+/// names are content-addressed, so a match here is all but certain and this only
+/// confirms it before anything is replaced.
+fn same_contents(a: &Path, b: &Path) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => {
+            matches!((std::fs::read(a), std::fs::read(b)), (Ok(da), Ok(db)) if da == db)
+        }
+        _ => false,
     }
 }
 

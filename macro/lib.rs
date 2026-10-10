@@ -15,7 +15,7 @@ use template_quote::quote;
 ///
 /// See the crate-level documentation of `subcrate` for the full contract. In
 /// short, `#[subcrate] pub mod foo { .. }` expands to
-/// `pub extern crate __subcrate__foo__<hash> as foo;`, preserving the module's
+/// `pub extern crate __subcrate_foo_<hash> as foo;`, preserving the module's
 /// name, visibility and attributes while giving `foo` a genuinely separate
 /// crate identity.
 ///
@@ -239,7 +239,7 @@ and declare `subcrate` under `[build-dependencies]` in Cargo.toml.";
 /// The directory holding the build helper's metadata.
 ///
 /// `SUBCRATE_MANIFEST_DIR` is set by `subcrate::build::compile()` via
-/// `cargo::rustc-env`, so its mere presence proves the build helper ran during
+/// `cargo:rustc-env`, so its mere presence proves the build helper ran during
 /// this compilation. We deliberately do **not** fall back to `OUT_DIR`: a
 /// build script that exists but never calls `compile()` still has an `OUT_DIR`,
 /// and a stale metadata file there could mask the "helper not invoked" error.
