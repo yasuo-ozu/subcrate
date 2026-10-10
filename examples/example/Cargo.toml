@@ -8,6 +8,14 @@ publish = false
 
 [dependencies]
 subcrate = { path = "../.." }
+# Owner dependencies that `tests/owner.rs` hands to subcrates (`#[subcrate(::leaf)]`).
+# `leaf` depends on `leaf-base`, so that is a transitive dependency; `leaf-base` is also
+# listed here so a subcrate can name it directly (`::leaf_base`).
+leaf = { path = "../leaf" }
+leaf-base = { path = "../leaf-base" }
+# A package this one renames: its code calls it `alt` (`alt::value()`), and so does a
+# subcrate (`#[subcrate(::alt)]`), although the package, and the crate, is `leaf-alt`.
+alt = { package = "leaf-alt", path = "../leaf-alt" }
 
 [build-dependencies]
 subcrate = { path = "../.." }

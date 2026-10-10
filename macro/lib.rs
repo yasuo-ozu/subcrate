@@ -20,9 +20,11 @@ use template_quote::quote;
 /// crate identity.
 ///
 /// The attribute takes a comma-separated list of arguments: `proc_macro`
-/// (compile as a proc-macro crate), `edition = "2018"`, and dependencies on
-/// sibling subcrates, `path::to::other` or `alias = path::to::other`, which the
-/// build helper links in and compiles first.
+/// (compile as a proc-macro crate), `edition = "2018"`, and dependencies:
+/// on sibling subcrates, `path::to::other` or `alias = path::to::other`, which
+/// the build helper links in and compiles first, and on crates the owning
+/// package depends on (or the package's own library), `::name` or
+/// `alias = ::name`, which it has Cargo build.
 #[proc_macro_attribute]
 pub fn subcrate(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as Args);
@@ -87,13 +89,13 @@ fn expand(args: Args, item_mod: ItemMod) -> syn::Result<proc_macro2::TokenStream
     // succeed. (Downstream packages documenting their own code still go through
     // the real crate, since dependencies are not compiled with `cfg(doc)`.)
     //
-    // A library subcrate's body may name its sibling dependencies (which the real
-    // build links with `--extern`), so the stand-in imports them from their own
-    // stand-ins under the same names.
+    // A library subcrate's body may name its dependencies (which the real build
+    // links with `--extern`), so the stand-in imports the sibling ones from their
+    // own stand-ins, and the external ones from the owner's, under the same names.
     let doc_surface = if args.proc_macro {
         proc_macro_doc_surface(items, &internal)
     } else {
-        let imports = doc_dependency_imports(&doc_deps);
+        let imports = doc_dependency_imports(&doc_deps, &args.deps);
         quote! { #imports #(#items)* }
     };
 
@@ -114,16 +116,30 @@ fn expand(args: Args, item_mod: ItemMod) -> syn::Result<proc_macro2::TokenStream
 /// scope in its `cfg(doc)` stand-in, mirroring the `--extern` names of the real
 /// crate.
 ///
-/// Each dependency's stand-in lives at its module path from the crate root, so
-/// `crate::<path>` reaches it. Like the real crate-root import, the names are in
-/// scope at the top of the stand-in only. Only dependencies under the same crate
-/// root are listed in the manifest, so a dependency declared in another root has
-/// no import here.
-fn doc_dependency_imports(deps: &[subcrate_core::ResolvedDep]) -> proc_macro2::TokenStream {
+/// Each sibling dependency's stand-in lives at its module path from the crate
+/// root, so `crate::<path>` reaches it. Like the real crate-root import, the names
+/// are in scope at the top of the stand-in only. Only dependencies under the same
+/// crate root are listed in the manifest, so a dependency declared in another root
+/// has no import here. An external dependency (`::name`) is a crate the owning
+/// package itself links, so `::name` reaches it directly.
+fn doc_dependency_imports(
+    deps: &[subcrate_core::ResolvedDep],
+    declared: &[subcrate_core::Dependency],
+) -> proc_macro2::TokenStream {
     let mut out = proc_macro2::TokenStream::new();
     for (alias, path) in deps {
         let alias = syn::parse_str::<Ident>(alias);
         let path = syn::parse_str::<syn::Path>(&format!("crate::{}", path.join("::")));
+        if let (Ok(alias), Ok(path)) = (alias, path) {
+            out.extend(quote! {
+                #[allow(unused_imports)]
+                use #path as #alias;
+            });
+        }
+    }
+    for dep in declared.iter().filter(|dep| dep.external) {
+        let alias = syn::parse_str::<Ident>(&dep.alias);
+        let path = syn::parse_str::<syn::Path>(&format!("::{}", dep.path.join("::")));
         if let (Ok(alias), Ok(path)) = (alias, path) {
             out.extend(quote! {
                 #[allow(unused_imports)]

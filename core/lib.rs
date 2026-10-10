@@ -37,10 +37,10 @@ pub const INTERNAL_PREFIX: &str = "__subcrate_";
 /// * `path::to::dep` — depend on the sibling subcrate at that module path,
 ///   visible inside this subcrate under the path's last segment.
 /// * `alias = path::to::dep` — the same, visible under `alias`.
-/// * `::name` — an *external* (build-dependency) crate. This is reserved
-///   syntax: it parses, but external crates are not implemented yet, so the
-///   build helper rejects it. (A bare path that matches no sibling subcrate is
-///   reserved for the same purpose and rejected the same way.)
+/// * `::name` (or `alias = ::name`) — an *external* crate: one the owning
+///   package depends on, or — if `name` is the package's own library — the owner
+///   crate itself. The build helper has Cargo build it for the subcrate. It is
+///   visible inside the subcrate under `name` (or `alias`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Args {
     /// Compile the module as a `proc-macro` crate rather than an ordinary
@@ -63,8 +63,9 @@ pub struct Dependency {
     /// any leading `crate` removed (e.g. `["nested", "inner"]`). For an
     /// external crate this is the crate's path after the leading `::`.
     pub path: Vec<String>,
-    /// `true` for a leading-`::` path naming an external crate (reserved, not
-    /// implemented yet).
+    /// `true` for a leading-`::` path naming an external crate: one the owning
+    /// package depends on, or the owner crate itself. (The build helper accepts
+    /// just the crate's name, not a path into it.)
     pub external: bool,
 }
 
@@ -156,7 +157,7 @@ fn unknown_argument(path: &syn::Path) -> syn::Error {
     syn::Error::new_spanned(
         path,
         "unknown `#[subcrate]` argument (expected `proc_macro`, `edition = \"…\"`, or a \
-         dependency: `path::to::subcrate` or `alias = path::to::subcrate`)",
+         dependency: `path::to::subcrate`, `::crate_name`, or either with an `alias = `)",
     )
 }
 

@@ -114,7 +114,9 @@ machinery from its own compilation with `default-features = false`.
 2. Parses them and finds every `#[subcrate]` inline module.
 3. Compiles each one by invoking `rustc` directly (from `$RUSTC`), feeding the
    module body in on **stdin** — no temporary `.rs` files, no per-subcrate
-   `Cargo.toml`, and no recursive Cargo.
+   `Cargo.toml`, and no recursive Cargo for the subcrates themselves. (Only a
+   subcrate that uses its owner's dependencies, below, has Cargo build those
+   first, in a separate target directory.)
 4. Puts the compiled artifacts on the library search path and records a small
    manifest the procedural macro reads to confirm it ran.
 
@@ -210,9 +212,107 @@ pub mod renamed {
   (`name::mac!()`). A `proc_macro` subcrate may depend on library subcrates too
   (the macro can call them as it expands), except when cross-compiling: a library
   subcrate is built for the target, but a proc-macro runs on the host.
-- Depending on an *external* (build-dependency) crate is not implemented yet.
-  The syntax is reserved for it: `::name`, and a bare path that matches no
-  sibling subcrate, are rejected with a clear error.
+- A bare path that matches no sibling subcrate is a build error. To depend on a
+  crate the package itself depends on, write `::name` (next section).
+
+### Subcrates that use the owner's dependencies, or the owner itself
+
+A subcrate may also use the crates the package that owns it depends on, and the
+owner crate itself (the package's own library). A leading `::` marks them:
+
+```rust ignore
+// `serde` is a `[dependencies]` entry of this package.
+#[subcrate(::serde)]
+pub mod uses_serde {
+    pub fn f() { let _ = serde::de::IgnoredAny; }
+}
+
+#[subcrate(s = ::serde)]          // `alias = ::name` renames it, as for subcrates
+pub mod renamed { /* … `s::…` … */ }
+
+// In `tests/foo.rs` (or `src/main.rs`, `src/bin/…`, `examples/…`): the package's own library.
+#[subcrate(::my_package)]
+pub mod uses_the_owner {
+    pub fn f() -> u32 { my_package::something() }
+}
+```
+
+- `::name` is the name the package's own code uses for a dependency of this
+  package (a dash in the name is an underscore: `::proc_macro2` for `proc-macro2`)
+  or the name of the package itself (`CARGO_PKG_NAME`, dashes as underscores). A
+  name that is neither is a build error. It is visible inside the subcrate under
+  `name` (or the `alias`), imported at the subcrate's crate root exactly like a
+  subcrate dependency.
+- **Renamed dependencies** work: with `myleaf = { package = "leaf", path = "../leaf"
+  }` in `[dependencies]`, `#[subcrate(::myleaf)]` links the crate of the package
+  `leaf` under the name `myleaf`, as the package's own code sees it. The build
+  script finds the dependency by its key in `Cargo.toml` (`[dependencies]` first,
+  then `[dev-dependencies]` and `[build-dependencies]`, also under `[target.…]`,
+  and — for `name = { workspace = true }` — `[workspace.dependencies]`), takes the
+  real package from its `package` field (else the key), builds that, and finds
+  its crate by the package's name. (Cargo does not let a package list one package
+  under two names.)
+- **Several versions** of a crate in the dependency graph work too. `cargo build -p
+  serde` is ambiguous then, so the build script takes the version the package
+  resolves to from the `Cargo.lock` and builds `-p serde:1.0.200` (the
+  `name:version` pkgid spec, which every Cargo accepts, Cargo 1.56 included;
+  `name@version` is newer and rejected by Cargo 1.56), and picks that version's
+  artifacts out of what Cargo built. A name that is not ambiguous stays a plain
+  `-p name`. If the package itself depends on two versions of one package (the usual
+  reason for renaming: `dup = "2"` and `dup_old = { package = "dup", version = "1" }`),
+  the `version` requirement — or the version at the `path` — declared for each name
+  says which is meant.
+- The crate really is the owner's: Cargo builds it with the same versions and
+  features as for the package, and the subcrate links against that build, so a
+  type from it means the same thing in the subcrate and in the owner.
+- **How:** a subcrate is compiled by the build script, before Cargo builds the
+  package's dependencies, so the build script asks Cargo to build the ones that are
+  needed — one nested `cargo build -p <dep> … [-p <owner>] --lib --offline
+  --target-dir <profile dir>/subcrate-owner-deps/<package>/<rustc> [--release]`, run from
+  the package's manifest directory. The separate target directory is essential: the
+  build in progress holds the lock on the main one. It is shared by every
+  configuration of the package (`cargo build`, `cargo test`, `cargo check`, … each
+  have an `OUT_DIR` of their own), so the crates are compiled once, not once per
+  configuration; it is per package, per profile (`target/debug`,
+  `target/release`, `target/<triple>/debug`, …) and per compiler (its release and
+  commit, so toolchains do not overwrite each other's crates), and persists between
+  builds. The crates (and their own dependencies)
+  are then passed to `rustc` as `--extern <name>=<rlib>` *and* `--extern
+  <name>=<rmeta>`, with `-L` for the directories holding them. A package that uses
+  none of this builds nothing extra, and only the crates a subcrate names are built
+  (with their own dependencies) — the owner crate only if one uses `::<owner>`.
+- **The owner crate** is the package's *library*, built a second time (running
+  this build script again in the nested build, with `SUBCRATE_NESTED` set, which
+  makes it compile only the subcrates the library uses and never start another
+  owner build). A subcrate that is part of the library (`src/lib.rs` and the files it
+  reaches) cannot use the owner crate — the library would depend on itself — and
+  that is a build error; one in `tests/`, `src/main.rs`, `src/bin/`, `examples/` or
+  `benches/` can. A package with no library has no owner crate to use.
+- The subcrates are compiled after the owner's own subcrates (the library is made
+  of them), and recompiled when the crates they link against are rebuilt; the build
+  script reruns when a path dependency's sources, `Cargo.lock` or `Cargo.toml`
+  change.
+- **Limitations:** the crate must be an ordinary library crate (not a proc-macro),
+  and `::name` names the crate itself, not a path into it (`::serde::de` is
+  an error). A dev-dependency is built as `cargo build` would build it, so its
+  features differ from the test build's if (resolver 2) only a dev-dependency edge
+  enables them. Cargo and the build script must agree on the build, so a custom profile
+  is built as `dev` or `release` (a build script is only told `debug` or `release`)
+  and, when cross-compiling, a proc-macro subcrate cannot use these crates (they
+  are built for the target, a proc-macro runs on the host). The nested build runs
+  from the package's own directory and `--offline`, so it expects to be part of a
+  workspace with its `Cargo.lock` and sources already in place (a package built
+  as someone's *dependency* resolves its own versions instead). Under `cargo check` and
+  clippy, Cargo builds different copies of the dependencies than `cargo build` does,
+  so a *type* from one is not the same type as the subcrate's there: code that
+  passes such a value across the boundary compiles under `cargo build`/`test`, but
+  not under `cargo check`. If the package itself depends on two versions of one
+  package and gives the dependency no `version` (or `path`) that tells them apart, or
+  on two packages of one name and version from different sources, the lock file does
+  not say which `::name` means, and the build stops with an error. Building the
+  owner crate compiles its build-dependencies (`subcrate` itself, `syn`, …) once in
+  the shared directory above, which is most of that directory's size; that is
+  inherent in building the library separately.
 
 ### Crate boundaries are real
 
@@ -241,9 +341,14 @@ All tests are integration tests under `tests/` directories, run by
   including one that depends on another subcrate.
 - `examples/example/tests/dependencies.rs` — subcrates depending on subcrates:
   chains, diamonds, paths, aliases, and proc-macro subcrates on either side.
+- `examples/example/tests/owner.rs` — subcrates using the owner's dependencies
+  (`::leaf`, with its own dependency `leaf-base`), a renamed one (`::alt` for the
+  package `leaf-alt`) and the owner crate itself (`::example`).
 - `core/tests/args.rs` and the unit tests in `build.rs` — `#[subcrate(...)]`
   argument parsing, and dependency resolution/ordering including the build-error
-  cases (cycles, unknown or ambiguous dependencies).
+  cases (cycles, unknown or ambiguous dependencies, the owner crate used from its
+  own library, a `::name` that is not a dependency), and the reading of renamed
+  dependencies from `Cargo.toml` and of multiple versions from `Cargo.lock`.
 
 Code generation throughout uses `template-quote` (<https://docs.rs/template-quote>).
 
@@ -257,8 +362,9 @@ transitive crates back down.)
 ## Known limitations
 
 - Subcrate bodies are compiled against the standard library (and `proc_macro`
-  for `proc_macro = true`). Pulling the parent's own dependencies into a
-  subcrate is out of scope.
+  for `proc_macro = true`), plus whatever they name as a dependency: sibling
+  subcrates, and the owner's dependencies or the owner crate (`::name`, with the
+  limitations above).
 - `cargo doc` of the subcrate-defining crate works (subcrates are rendered via a
   `#[cfg(doc)]` stand-in, since rustdoc is not given the build-script search
   path). However, a *downstream* crate's `cargo doc` cannot resolve a
