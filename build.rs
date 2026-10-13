@@ -431,6 +431,21 @@ impl Config {
                     name
                 ))
             })?;
+        // Under resolver 2 a crate can be built more than once with different
+        // features; refuse to guess which build the subcrate meant.
+        if let Some(other) = &krate.conflict {
+            return Err(Error::new(format!(
+                "subcrate `{}` depends on `::{}`, but Cargo built it more than once with \
+                 incompatible features — [{}] and [{}], neither a superset of the other — so \
+                 which build to link is ambiguous. This happens under resolver 2 when a crate's \
+                 features differ between the normal and build-dependency graphs; use \
+                 `resolver = \"1\"`, or arrange for it to be built once.",
+                sub.display_name(),
+                name,
+                krate.features.join(", "),
+                other.join(", "),
+            )));
+        }
         // Cargo pipelines compilation: the rlib alone has only a metadata stub, so
         // the real `.rmeta` has to be named as well.
         let paths = krate
@@ -2439,6 +2454,14 @@ struct OwnerDeps {
 struct OwnerCrate {
     rlib: Option<PathBuf>,
     rmeta: Option<PathBuf>,
+    /// The features of the build `rlib`/`rmeta` come from. Under resolver 2 one
+    /// version can be built more than once with different features; the build kept
+    /// is the one whose feature set is a superset of the others' (see `merge_build`).
+    features: Vec<String>,
+    /// The features of another build whose set is neither a subset nor a superset
+    /// of `features`. When set, which build to link is ambiguous, and linking this
+    /// crate is an error rather than a silent wrong choice.
+    conflict: Option<Vec<String>>,
 }
 
 /// The crate behind a `::name` that a subcrate uses.
@@ -2476,25 +2499,46 @@ fn parse_artifacts(stdout: &str) -> OwnerDeps {
         let version = json_string_field(line, "package_id")
             .as_deref()
             .and_then(package_id_version);
+        // The features this build was compiled with; empty from older Cargo, which
+        // does not report them (then there is only ever one build to choose).
+        let features = json_string_array_field(line, "features");
+        // One message is one build: collect its rlib and rmeta together, so the
+        // feature set can be matched to the right pair.
+        let mut rlib = None;
+        let mut rmeta = None;
         for file in json_string_array_field(line, "filenames") {
             let file = PathBuf::from(file);
-            let is_rlib = match file.extension().and_then(|ext| ext.to_str()) {
-                Some("rlib") => Some(true),
-                Some("rmeta") => Some(false),
+            match file.extension().and_then(|ext| ext.to_str()) {
+                Some("rlib") => {
+                    rlib.get_or_insert_with(|| file.clone());
+                }
+                Some("rmeta") => {
+                    rmeta.get_or_insert_with(|| file.clone());
+                }
                 // A proc-macro crate: not linkable here, but a library may depend
                 // on it, so its directory has to be searched too.
-                Some("so") | Some("dylib") | Some("dll") => None,
+                Some("so") | Some("dylib") | Some("dll") => {}
                 _ => continue,
-            };
-            if let Some(is_rlib) = is_rlib {
-                record_artifact(deps.crates.entry(name.clone()).or_default(), is_rlib, &file);
-                if let Some(version) = &version {
-                    let key = (name.clone(), version.clone());
-                    record_artifact(deps.versions.entry(key).or_default(), is_rlib, &file);
-                }
             }
             if let Some(dir) = file.parent() {
                 deps.lib_dirs.insert(dir.to_path_buf());
+            }
+        }
+        if rlib.is_some() || rmeta.is_some() {
+            merge_build(
+                deps.crates.entry(name.clone()).or_default(),
+                rlib.clone(),
+                rmeta.clone(),
+                &features,
+            );
+            if let Some(version) = &version {
+                let key = (name.clone(), version.clone());
+                merge_build(
+                    deps.versions.entry(key).or_default(),
+                    rlib,
+                    rmeta,
+                    &features,
+                );
             }
         }
 
@@ -2540,15 +2584,44 @@ impl OwnerCrate {
     }
 }
 
-/// Notes `file`, an rlib or an rmeta, as an artifact of `krate`; the first of each
-/// kind wins.
-fn record_artifact(krate: &mut OwnerCrate, is_rlib: bool, file: &Path) {
-    let slot = if is_rlib {
-        &mut krate.rlib
-    } else {
-        &mut krate.rmeta
-    };
-    slot.get_or_insert_with(|| file.to_path_buf());
+/// Merges one build of a crate into `slot`, keeping the build whose feature set is
+/// a superset. Under resolver 2 one version can be built more than once with
+/// different features; the subcrate must link the build that has the features it
+/// needs. The build with the most features (a superset of the others') is safe:
+/// whatever any build offers, it offers too. If two builds' feature sets are
+/// incomparable — neither contains the other — the choice is genuinely ambiguous,
+/// so `slot` keeps one and records the other in `conflict`, and linking the crate
+/// reports it rather than picking the wrong one silently.
+fn merge_build(
+    slot: &mut OwnerCrate,
+    rlib: Option<PathBuf>,
+    rmeta: Option<PathBuf>,
+    features: &[String],
+) {
+    if slot.rlib.is_none() && slot.rmeta.is_none() {
+        slot.rlib = rlib;
+        slot.rmeta = rmeta;
+        slot.features = features.to_vec();
+        return;
+    }
+    let current: BTreeSet<&str> = slot.features.iter().map(String::as_str).collect();
+    let incoming: BTreeSet<&str> = features.iter().map(String::as_str).collect();
+    if incoming == current {
+        // The same build, reported across two messages (pipelining emits the rmeta
+        // before the rlib): fill in whichever this message carries.
+        slot.rlib = slot.rlib.take().or(rlib);
+        slot.rmeta = slot.rmeta.take().or(rmeta);
+    } else if incoming.is_superset(&current) {
+        // Strictly more features: prefer this build. A conflict seen earlier stays
+        // recorded (ambiguity, once found, is reported conservatively).
+        slot.rlib = rlib;
+        slot.rmeta = rmeta;
+        slot.features = features.to_vec();
+    } else if current.is_superset(&incoming) {
+        // The build already kept has every feature this one does: keep it.
+    } else if slot.conflict.is_none() {
+        slot.conflict = Some(features.to_vec());
+    }
 }
 
 /// The version in a Cargo package id: `name version (source)` for older Cargo,
@@ -3450,6 +3523,7 @@ mod tests {
             OwnerCrate {
                 rlib: Some(PathBuf::from("t/debug/libleaf.rlib")),
                 rmeta: Some(PathBuf::from("t/debug/build/leaf/h/out/libleaf-h.rmeta")),
+                ..OwnerCrate::default()
             },
         );
         deps.lib_dirs.insert(PathBuf::from("t/debug"));
@@ -4343,6 +4417,66 @@ other = "1"
                 Path::new("/t/debug/build/serde/ab/out"),
                 Path::new("/t/debug/deps"),
             ]
+        );
+    }
+
+    /// One `compiler-artifact` message for a build of `syn 2.0.0` with the given
+    /// features (a comma-separated list of quoted names) and an rlib/rmeta named by
+    /// `hash`, so different builds are told apart.
+    fn syn_build(features: &str, hash: &str) -> String {
+        format!(
+            concat!(
+                r#"{{"reason":"compiler-artifact","#,
+                r#""package_id":"registry+https://github.com/rust-lang/crates.io-index#syn@2.0.0","#,
+                r#""target":{{"kind":["lib"],"name":"syn"}},"features":[{features}],"#,
+                r#""filenames":["/t/debug/deps/libsyn-{hash}.rlib","/t/debug/deps/libsyn-{hash}.rmeta"]}}"#
+            ),
+            features = features,
+            hash = hash,
+        )
+    }
+
+    #[test]
+    fn a_feature_superset_build_is_preferred() {
+        let key = ("syn".to_string(), "2.0.0".to_string());
+        // `[parsing, full]` is a superset of `[parsing]`, so it is the one kept —
+        // whichever order Cargo reported the two builds in.
+        for stdout in [
+            format!(
+                "{}\n{}\n",
+                syn_build(r#""parsing""#, "aa"),
+                syn_build(r#""parsing","full""#, "bb")
+            ),
+            format!(
+                "{}\n{}\n",
+                syn_build(r#""parsing","full""#, "bb"),
+                syn_build(r#""parsing""#, "aa")
+            ),
+        ] {
+            let deps = parse_artifacts(&stdout);
+            let syn = &deps.versions[&key];
+            assert_eq!(
+                syn.rlib.as_deref(),
+                Some(Path::new("/t/debug/deps/libsyn-bb.rlib"))
+            );
+            assert!(syn.conflict.is_none());
+        }
+    }
+
+    #[test]
+    fn incompatible_feature_builds_are_flagged() {
+        // `[parsing, full]` and `[parsing, visit-mut]`: neither contains the other,
+        // so the choice is ambiguous and recorded for `external_dep` to report.
+        let stdout = format!(
+            "{}\n{}\n",
+            syn_build(r#""parsing","full""#, "aa"),
+            syn_build(r#""parsing","visit-mut""#, "bb"),
+        );
+        let deps = parse_artifacts(&stdout);
+        let syn = &deps.versions[&("syn".to_string(), "2.0.0".to_string())];
+        assert!(
+            syn.conflict.is_some(),
+            "incomparable feature builds should flag a conflict"
         );
     }
 
