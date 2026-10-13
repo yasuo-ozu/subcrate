@@ -53,6 +53,13 @@
 //! copies are byte-identical, so the build script hard-links each to the main copy
 //! to reclaim the disk (best effort; one `target/` tree, so one filesystem).
 //!
+//! The `<package>` component can be shared across a workspace: set
+//! `SUBCRATE_OWNER_DEPS_KEY` (or [`Config::owner_deps_key`]) to one key for every
+//! package, and they build the owner's dependencies into one directory instead of
+//! once per package. The dedup step then runs under a lock file, so the packages'
+//! build scripts do not rewrite each other's links at once. Only share it when the
+//! packages resolve those crates to the same versions and features.
+//!
 //! `::name` is the dependency's key in `Cargo.toml`, or the package's own name. A
 //! rename (`myleaf = { package = "leaf", … }`) builds the `package` but is seen
 //! under the key. When the graph holds several versions, the build script picks the
@@ -99,6 +106,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use safegraph::algo::toposort::toposort;
 use safegraph::graph::Graph;
@@ -167,6 +175,11 @@ pub struct Config {
     /// Whether this build script runs inside the nested Cargo build of another
     /// `subcrate` build script (`SUBCRATE_NESTED` is set).
     nested: bool,
+    /// An opt-in key that replaces the package name in the nested owner-dependency
+    /// target directory, so the packages of a workspace can share one such build
+    /// instead of each rebuilding the owner's dependencies (`SUBCRATE_OWNER_DEPS_KEY`,
+    /// or [`Config::owner_deps_key`]). `None` keeps the per-package default.
+    owner_deps_key: Option<String>,
     /// The owner's dependencies (and the owner crate), built for the subcrates
     /// that use them. Filled in by [`Config::run`].
     owner_deps: OwnerDeps,
@@ -209,6 +222,9 @@ impl Config {
         let debug_assertions = std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some();
         let rustflags = decode_rustflags();
         let feature_cfgs = enabled_feature_cfgs(&manifest_dir);
+        let owner_deps_key = std::env::var("SUBCRATE_OWNER_DEPS_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         Ok(Config {
             manifest_dir,
@@ -226,6 +242,7 @@ impl Config {
             package,
             profile,
             nested,
+            owner_deps_key,
             owner_deps: OwnerDeps::default(),
         })
     }
@@ -240,6 +257,22 @@ impl Config {
     /// Adds an extra argument passed to every `rustc` invocation.
     pub fn extra_rustc_arg(mut self, arg: impl Into<String>) -> Self {
         self.extra_rustc_args.push(arg.into());
+        self
+    }
+
+    /// Shares the nested owner-dependency build across packages that pass the same
+    /// `key`, instead of giving each package its own copy (the default). Every
+    /// package in a workspace that sets the same key builds the owner's
+    /// dependencies into one directory, so they are compiled once rather than once
+    /// per package. The key is one path component — non-alphanumeric characters
+    /// (path separators included) become `_` — and the per-compiler, per-profile
+    /// split is kept, so toolchains and profiles still do not mix.
+    ///
+    /// Also set from the `SUBCRATE_OWNER_DEPS_KEY` environment variable. Only use it
+    /// when the packages genuinely resolve the shared crates to the same versions
+    /// and features; otherwise leave it unset.
+    pub fn owner_deps_key(mut self, key: impl Into<String>) -> Self {
+        self.owner_deps_key = Some(key.into());
         self
     }
 
@@ -605,6 +638,11 @@ impl Config {
         // never come to mean two different contents, so the shared inode is safe.
         // Best effort: any I/O failure just leaves the extra copy in place.
         if let Some(main) = self.main_profile_dir() {
+            // Serialize the dedup across build scripts sharing this directory (see
+            // `owner_deps_key`, and the same package's parallel `build`/`test`),
+            // so they never rewrite each other's links at once. Uncontended — the
+            // per-package default — acquisition is immediate.
+            let _lock = DedupLock::acquire(&target_dir);
             dedup_against_main(&target_dir, &main);
         }
 
@@ -679,9 +717,20 @@ impl Config {
     fn owner_deps_target_dir(&self) -> PathBuf {
         shared_target_dir(
             &self.out_dir,
-            &self.package,
+            &self.owner_deps_dir_key(),
             rustc_key(&self.rustc).as_deref(),
         )
+    }
+
+    /// The directory component naming the nested build: the opt-in
+    /// [`owner_deps_key`](Self::owner_deps_key) when set (sanitized to one path
+    /// component so it cannot escape), else the package name (the per-package
+    /// default).
+    fn owner_deps_dir_key(&self) -> String {
+        match &self.owner_deps_key {
+            Some(key) => sanitize_dir_component(key),
+            None => self.package.clone(),
+        }
     }
 
     /// The main build's profile directory — `target/debug`, `target/<triple>/release`
@@ -949,6 +998,84 @@ fn shared_target_dir(out_dir: &Path, package: &str, compiler: Option<&str>) -> P
             }
         }
         None => out_dir.join("owner-deps-target"),
+    }
+}
+
+/// Makes a user-supplied key safe as a single path component: ASCII alphanumerics
+/// and `-`/`_` are kept, everything else (path separators and `.` among them, so no
+/// `..` traversal) becomes `_`. An all-stripped key would be empty, so `_` stands
+/// in to keep it a valid directory name.
+fn sanitize_dir_component(key: &str) -> String {
+    let mut out: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+/// A best-effort cross-process advisory lock for the nested owner-dependency
+/// directory, held around the [`dedup_against_main`] step. When several build
+/// scripts share one such directory ([`Config::owner_deps_key`], or a package's own
+/// parallel `build`/`test`), it stops them rewriting each other's hard links at
+/// once. It is a lock *file* created with `create_new`; [`acquire`](Self::acquire)
+/// spins briefly for it and steals one a crashed build left behind (older than a
+/// timeout) so a crash cannot wedge other builds, and `Drop` removes it. If it
+/// cannot be taken the dedup still runs — it is only disk reclamation, and each
+/// link is made atomically regardless.
+struct DedupLock {
+    path: PathBuf,
+}
+
+impl DedupLock {
+    fn acquire(dir: &Path) -> Option<DedupLock> {
+        Self::acquire_with(dir, Duration::from_secs(10), Duration::from_secs(30))
+    }
+
+    fn acquire_with(dir: &Path, wait: Duration, stale: Duration) -> Option<DedupLock> {
+        let path = dir.join(".subcrate-dedup.lock");
+        let deadline = Instant::now() + wait;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Some(DedupLock { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Steal a lock a crashed build left behind (older than `stale`).
+                    let aged = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .map_or(false, |age| age > stale);
+                    if aged {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                // The directory is gone or unwritable: skip locking.
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+impl Drop for DedupLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -3269,6 +3396,7 @@ mod tests {
             package: "owner".to_string(),
             profile: "debug".to_string(),
             nested: false,
+            owner_deps_key: None,
             owner_deps: OwnerDeps::default(),
         }
     }
@@ -4321,6 +4449,59 @@ other = "1"
             dir("/w/elsewhere/out", "pkg", compiler),
             Path::new("/w/elsewhere/out/owner-deps-target")
         );
+    }
+
+    #[test]
+    fn an_owner_deps_key_overrides_the_package_in_the_shared_dir() {
+        // Default: the directory component is the package name.
+        let cfg = config();
+        assert_eq!(cfg.owner_deps_dir_key(), "owner");
+        // Set: the key replaces it.
+        assert_eq!(
+            config().owner_deps_key("ws-shared").owner_deps_dir_key(),
+            "ws-shared"
+        );
+        // The key is sanitized to one path component, so it cannot escape the
+        // directory (no separators, no `..`).
+        assert_eq!(
+            config()
+                .owner_deps_key("../evil/key.x")
+                .owner_deps_dir_key(),
+            "___evil_key_x"
+        );
+        // An all-stripped key still yields a valid component.
+        assert_eq!(config().owner_deps_key("/").owner_deps_dir_key(), "_");
+    }
+
+    #[test]
+    fn the_dedup_lock_is_exclusive_and_released_on_drop() {
+        let dir = std::env::temp_dir().join(format!("subcrate-deduplock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lockfile = dir.join(".subcrate-dedup.lock");
+
+        let held =
+            DedupLock::acquire_with(&dir, Duration::from_millis(60), Duration::from_secs(30));
+        assert!(held.is_some());
+        assert!(lockfile.exists());
+        // A second holder cannot take it while it is held and fresh: it waits out
+        // the short deadline and gives up.
+        assert!(
+            DedupLock::acquire_with(&dir, Duration::from_millis(60), Duration::from_secs(30))
+                .is_none()
+        );
+        drop(held);
+        assert!(!lockfile.exists(), "the lock file is removed on drop");
+
+        // A lock left behind by a crashed build (older than the stale timeout) is
+        // stolen rather than waited on forever.
+        std::fs::write(&lockfile, b"").unwrap();
+        let stolen =
+            DedupLock::acquire_with(&dir, Duration::from_millis(60), Duration::from_millis(0));
+        assert!(stolen.is_some(), "a stale lock is stolen");
+        drop(stolen);
+        assert!(!lockfile.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
