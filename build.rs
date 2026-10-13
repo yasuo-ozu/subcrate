@@ -24,10 +24,13 @@
 //!    (`#[subcrate(::serde)]`) or the package's own library
 //!    (`#[subcrate(::my_package)]`) — build those first (see
 //!    [below](#owner-dependencies)).
-//! 5. Compile each module with `rustc` (from `$RUSTC`), dependencies first,
-//!    reading the source from stdin — no temporary `.rs` files or `Cargo.toml`s. A
-//!    dependency reaches its dependent as `--extern <internal>=<artifact>` plus an
-//!    `extern crate … as <alias>;` at the dependent's crate root.
+//! 5. Compile each module with `rustc` (from `$RUSTC`), dependencies first and
+//!    independent ones in parallel, reading the source from stdin — no temporary
+//!    `.rs` files and no `Cargo.toml`s. The source is pretty-printed, so a
+//!    diagnostic's `<anon>:<line>:<col>` points at the right construct rather than
+//!    one long line. A dependency reaches its dependent as `--extern
+//!    <internal>=<artifact>` plus an `extern crate … as <alias>;` at the
+//!    dependent's crate root.
 //! 6. Put the artifacts on the library search path and record metadata the macro
 //!    reads to confirm the helper ran.
 //!
@@ -108,6 +111,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 use safegraph::algo::toposort::toposort;
 use safegraph::graph::Graph;
 use safegraph::BTreeGraph;
@@ -323,14 +327,14 @@ impl Config {
         self.owner_deps = self.build_owner_deps(subcrates, &links, &wanted)?;
 
         let owner_linked = owner_linked(&links, &order);
-        for ix in order {
-            if !wanted[ix] {
-                continue;
-            }
-            let deps =
-                self.extern_deps(subcrates, ix, &links[ix], &subcrates_dir, &owner_linked)?;
-            self.compile_subcrate(&subcrates[ix], &deps, &subcrates_dir)?;
-        }
+        self.compile_all(
+            subcrates,
+            &links,
+            &needs,
+            &wanted,
+            &subcrates_dir,
+            &owner_linked,
+        )?;
         let internal_names: Vec<String> = subcrates.iter().map(|s| s.internal.clone()).collect();
 
         prune_stale(&subcrates_dir, &internal_names);
@@ -787,12 +791,17 @@ impl Config {
         sub.edition.as_deref().unwrap_or(&self.edition)
     }
 
-    fn compile_subcrate(
+    /// Prepares `sub` for compilation, doing the parts that need `self` and syn
+    /// (whose tokens are not `Send`) on the calling thread: render the source,
+    /// build the `rustc` arguments, and decide reuse. Returns either that it is
+    /// already up to date (with any cached warnings to re-emit) or an owned,
+    /// `Send` [`CompileJob`] a worker thread runs with [`run_compile_job`].
+    fn prepare_subcrate(
         &self,
         sub: &Subcrate,
         deps: &[ExternDep],
         out_dir: &Path,
-    ) -> Result<(), Error> {
+    ) -> Result<Prepared, Error> {
         let args = self.rustc_args(sub, deps, out_dir);
         let source = render_source(&sub.inner_attrs, deps, &sub.items);
 
@@ -807,14 +816,16 @@ impl Config {
         // A dependency's name embeds that dependency's own content hash, so a
         // changed dependency changes this subcrate's fingerprint and recompiles it
         // too, even though this subcrate's own name is unchanged. (The injected
-        // `use` of each dependency is part of the rendered source, so it is in the
-        // fingerprint, but it is a build-time detail and not in the name.)
+        // `extern crate` of each dependency is part of the rendered source, so it is
+        // in the fingerprint, but it is a build-time detail and not in the name.)
         //
         // An owner dependency's file name is *not* content-addressed: Cargo's hash
         // covers its package and features, not its source. So its files' sizes and
         // modification times are folded in instead, and a rebuilt dependency then
         // recompiles the subcrates linked against it. The same goes for a sibling
-        // subcrate built on one, whose name does not cover that either.
+        // subcrate built on one, whose name does not cover that either. (The
+        // fingerprint reads these files *after* the dependency's wave has built, so
+        // the stamps are current.)
         let mut fingerprint = format!("{}\u{1f}{}", args.join("\u{1f}"), source);
         for path in deps
             .iter()
@@ -825,68 +836,191 @@ impl Config {
             fingerprint.push_str(&file_stamp(path));
         }
         let stamp = out_dir.join(format!("{}.stamp", sub.internal));
-        let warnings = out_dir.join(format!("{}.warnings", sub.internal));
+        let warnings_file = out_dir.join(format!("{}.warnings", sub.internal));
         if let Ok(previous) = std::fs::read_to_string(&stamp) {
             if previous == fingerprint {
                 // Reuse: rustc is not run, so re-emit the warnings it printed when
                 // it last was (kept beside the stamp), so they show on every build
                 // as Cargo's own do, not only when the subcrate is recompiled.
-                if let Ok(text) = std::fs::read_to_string(&warnings) {
-                    emit_subcrate_warnings(sub, &text);
+                return Ok(Prepared::Reused(
+                    std::fs::read_to_string(&warnings_file).ok(),
+                ));
+            }
+        }
+        Ok(Prepared::Compile(Box::new(CompileJob {
+            rustc: self.rustc.clone(),
+            args,
+            source,
+            out_dir: out_dir.to_path_buf(),
+            stamp,
+            fingerprint,
+            warnings_file,
+            display_name: sub.display_name(),
+            proc_macro: sub.proc_macro,
+        })))
+    }
+
+    /// Compiles the wanted subcrates in dependency order, independent ones in
+    /// parallel: each step's "wave" is every subcrate whose sibling dependencies
+    /// have all succeeded, and its members are compiled on worker threads (capped
+    /// by Cargo's `NUM_JOBS`). The syn work for each is done on this thread first,
+    /// since syn tokens are not `Send`. It does not stop at the first failure: a
+    /// subcrate whose dependency failed is left unbuilt, and if any failed the
+    /// returned error lists them all, so one build reports every broken subcrate.
+    fn compile_all(
+        &self,
+        subcrates: &[Subcrate],
+        links: &[Vec<Link>],
+        needs: &[Vec<usize>],
+        wanted: &[bool],
+        subcrates_dir: &Path,
+        owner_linked: &[bool],
+    ) -> Result<(), Error> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Status {
+            Pending,
+            Done,
+            Failed,
+        }
+        let n = subcrates.len();
+        let mut status = vec![Status::Pending; n];
+        let mut errors: Vec<String> = Vec::new();
+        let mut skipped: Vec<usize> = Vec::new();
+        let jobs = std::env::var("NUM_JOBS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&j| j > 0)
+            .unwrap_or(4);
+
+        loop {
+            let mut progressed = false;
+
+            // A subcrate a failed (or already-skipped) dependency makes unbuildable
+            // is itself skipped — recorded, and marked `Failed` so its own
+            // dependents skip in turn.
+            for ix in 0..n {
+                if !wanted[ix] || status[ix] != Status::Pending {
+                    continue;
                 }
-                return Ok(());
+                if needs[ix]
+                    .iter()
+                    .any(|&d| wanted[d] && status[d] == Status::Failed)
+                {
+                    status[ix] = Status::Failed;
+                    skipped.push(ix);
+                    progressed = true;
+                }
+            }
+
+            // The ready wave: pending, wanted, every wanted dependency done. (A
+            // wanted subcrate never needs a non-wanted one — the wanted set is
+            // closed over `needs` — so non-wanted ones never block it.)
+            let wave: Vec<usize> = (0..n)
+                .filter(|&ix| {
+                    wanted[ix]
+                        && status[ix] == Status::Pending
+                        && needs[ix]
+                            .iter()
+                            .all(|&d| !wanted[d] || status[d] == Status::Done)
+                })
+                .collect();
+            if wave.is_empty() {
+                // Nothing ready: either everything is handled, or (defensively — a
+                // cycle is already rejected) progress stalled.
+                if progressed {
+                    continue;
+                }
+                break;
+            }
+
+            // Prepare each member on this thread (the syn work), turning it into a
+            // runnable job; reuse and prepare errors are handled here.
+            let mut batch: Vec<(usize, CompileJob)> = Vec::new();
+            for &ix in &wave {
+                let deps = match self.extern_deps(
+                    subcrates,
+                    ix,
+                    &links[ix],
+                    subcrates_dir,
+                    owner_linked,
+                ) {
+                    Ok(deps) => deps,
+                    Err(e) => {
+                        status[ix] = Status::Failed;
+                        errors.push(e.to_string());
+                        continue;
+                    }
+                };
+                match self.prepare_subcrate(&subcrates[ix], &deps, subcrates_dir) {
+                    Ok(Prepared::Reused(cached)) => {
+                        if let Some(text) = cached {
+                            emit_subcrate_warnings(&subcrates[ix], &text);
+                        }
+                        status[ix] = Status::Done;
+                    }
+                    Ok(Prepared::Compile(job)) => batch.push((ix, *job)),
+                    Err(e) => {
+                        status[ix] = Status::Failed;
+                        errors.push(e.to_string());
+                    }
+                }
+            }
+
+            // Run the jobs on worker threads, at most `jobs` at a time.
+            let mut rest = batch;
+            while !rest.is_empty() {
+                let take = rest.len().min(jobs);
+                let now: Vec<(usize, CompileJob)> = rest.drain(..take).collect();
+                let handles: Vec<(usize, JobHandle)> = now
+                    .into_iter()
+                    .map(|(ix, job)| (ix, std::thread::spawn(move || run_compile_job(&job))))
+                    .collect();
+                for (ix, handle) in handles {
+                    let result = handle.join().unwrap_or_else(|_| {
+                        Err(format!(
+                            "compiling subcrate `{}` panicked",
+                            subcrates[ix].display_name()
+                        ))
+                    });
+                    match result {
+                        Ok(warnings) => {
+                            if let Some(text) = warnings {
+                                emit_subcrate_warnings(&subcrates[ix], &text);
+                            }
+                            status[ix] = Status::Done;
+                        }
+                        Err(message) => {
+                            status[ix] = Status::Failed;
+                            errors.push(message);
+                        }
+                    }
+                }
             }
         }
 
-        let mut cmd = Command::new(&self.rustc);
-        cmd.arg("-"); // read source from stdin
-        for arg in &args {
-            cmd.arg(arg);
+        if errors.is_empty() {
+            return Ok(());
         }
-        cmd.arg("--out-dir").arg(out_dir);
-
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd.spawn().map_err(|e| {
-            Error::new(format!(
-                "failed to launch `{}`: {}",
-                self.rustc.display(),
-                e
-            ))
-        })?;
-        {
-            let mut stdin = child.stdin.take().expect("stdin was requested");
-            stdin.write_all(source.as_bytes())?;
-            // Dropping `stdin` closes the pipe so rustc sees EOF.
-        }
-        let output = child.wait_with_output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::new(format!(
-                "failed to compile subcrate `{}`{}:\n{}",
-                sub.display_name(),
-                if sub.proc_macro { " (proc-macro)" } else { "" },
-                indent(stderr.trim_end())
-            )));
-        }
-
-        // rustc's stderr on success is its warnings (and notes). Cargo hides a
-        // build script's own stderr, so forward each line as a `cargo:warning=`,
-        // and cache it beside the stamp so a later reused build can re-emit it.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
-        if stderr.is_empty() {
-            let _ = std::fs::remove_file(&warnings);
+        let mut message = if errors.len() == 1 {
+            errors.remove(0)
         } else {
-            let _ = std::fs::write(&warnings, stderr);
-            emit_subcrate_warnings(sub, stderr);
+            format!(
+                "{} subcrates failed to compile:\n\n{}",
+                errors.len(),
+                errors.join("\n\n")
+            )
+        };
+        if !skipped.is_empty() {
+            let names: Vec<String> = skipped
+                .iter()
+                .map(|&ix| format!("`{}`", subcrates[ix].display_name()))
+                .collect();
+            message.push_str(&format!(
+                "\n\nnot built, because a dependency above failed: {}",
+                names.join(", ")
+            ));
         }
-
-        std::fs::write(&stamp, fingerprint)?;
-        Ok(())
+        Err(Error::new(message))
     }
 
     /// Builds the `rustc` argument list (everything except the `-` input and
@@ -1984,8 +2118,188 @@ fn render_source(inner_attrs: &[Attribute], deps: &[ExternDep], items: &[Item]) 
             dep.internal, dep.alias
         ));
     }
-    let items = quote! { #(#items)* }.to_string();
-    format!("{}\n{}{}", attrs, imports, items)
+    let items = quote! { #(#items)* };
+    // Pretty-print the body (multi-line) so a `rustc` diagnostic's line and column
+    // point at the right construct, not a column deep into one long line.
+    // `pretty_tokens` only adds whitespace, but fall back to the compact form if
+    // the result somehow fails to re-parse, so the compiled source is always valid.
+    let pretty = format!("{}\n{}{}", attrs, imports, pretty_tokens(&items));
+    if syn::parse_file(&pretty).is_ok() {
+        pretty
+    } else {
+        format!("{}\n{}{}", attrs, imports, items)
+    }
+}
+
+/// Renders a token stream as multi-line source so a `rustc` diagnostic lands on a
+/// meaningful line and column instead of one long line. It only inserts
+/// whitespace (newlines after `;` and around block braces), respecting punct
+/// joint/alone spacing so multi-character operators still reassemble; a caller
+/// verifies the result re-parses.
+fn pretty_tokens(stream: &TokenStream) -> String {
+    let mut out = String::new();
+    write_pretty(stream.clone(), 0, &mut out);
+    out
+}
+
+fn write_pretty(stream: TokenStream, depth: usize, out: &mut String) {
+    for tt in stream {
+        match tt {
+            TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => {
+                out.push('{');
+                push_indent(out, depth + 1);
+                write_pretty(group.stream(), depth + 1, out);
+                push_indent(out, depth);
+                out.push('}');
+                push_indent(out, depth);
+            }
+            TokenTree::Group(group) => {
+                let (open, close) = match group.delimiter() {
+                    Delimiter::Parenthesis => ('(', ')'),
+                    Delimiter::Bracket => ('[', ']'),
+                    Delimiter::Brace | Delimiter::None => ('\0', '\0'),
+                };
+                if open != '\0' {
+                    out.push(open);
+                }
+                write_pretty(group.stream(), depth, out);
+                if close != '\0' {
+                    out.push(close);
+                }
+                out.push(' ');
+            }
+            TokenTree::Ident(ident) => {
+                out.push_str(&ident.to_string());
+                out.push(' ');
+            }
+            TokenTree::Literal(lit) => {
+                out.push_str(&lit.to_string());
+                out.push(' ');
+            }
+            TokenTree::Punct(punct) => match punct.as_char() {
+                ';' => {
+                    out.push(';');
+                    push_indent(out, depth);
+                }
+                // The lead-in of an attribute: no space before the `[` or `!`.
+                '#' => out.push('#'),
+                c => {
+                    out.push(c);
+                    if punct.spacing() == Spacing::Alone {
+                        out.push(' ');
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Starts a new line indented to `depth`.
+fn push_indent(out: &mut String, depth: usize) {
+    out.push('\n');
+    for _ in 0..depth {
+        out.push_str("    ");
+    }
+}
+
+/// The result of [`Config::prepare_subcrate`]: either the subcrate is up to date,
+/// or there is work to run.
+enum Prepared {
+    /// Reuse (the stamp matched): the cached warning text to re-emit, if any.
+    Reused(Option<String>),
+    /// A job to run on a worker thread.
+    Compile(Box<CompileJob>),
+}
+
+/// A spawned compile: the worker returns the warnings to emit (`None` if none) or
+/// the failure message.
+type JobHandle = std::thread::JoinHandle<Result<Option<String>, String>>;
+
+/// Everything a worker thread needs to compile one subcrate: all owned and `Send`,
+/// with no borrow of `Config` or any syn data (those are not `Send`, so all of
+/// that work is done up front in [`Config::prepare_subcrate`]).
+struct CompileJob {
+    rustc: PathBuf,
+    args: Vec<String>,
+    source: String,
+    out_dir: PathBuf,
+    stamp: PathBuf,
+    fingerprint: String,
+    warnings_file: PathBuf,
+    display_name: String,
+    proc_macro: bool,
+}
+
+/// Runs `rustc` for one prepared subcrate (on a worker thread): feeds the source
+/// in on stdin, and on success writes the reuse stamp and caches the warnings.
+/// Returns the warning text to emit (`None` if there was none) on success, or the
+/// full failure message as `Err`.
+fn run_compile_job(job: &CompileJob) -> Result<Option<String>, String> {
+    let mut cmd = Command::new(&job.rustc);
+    // Read the source from stdin. rustc names it `<anon>`, which is the same in
+    // every build — including the separate nested build of the owner crate — so a
+    // subcrate compiled in two places keeps one identity. (A per-`OUT_DIR` file
+    // path would differ between those builds and break that match.) The source is
+    // pretty-printed, so `<anon>:<line>:<col>` still points at the right construct.
+    cmd.arg("-");
+    for arg in &job.args {
+        cmd.arg(arg);
+    }
+    cmd.arg("--out-dir").arg(&job.out_dir);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return Err(format!("failed to launch `{}`: {}", job.rustc.display(), e)),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(job.source.as_bytes()) {
+            return Err(format!(
+                "failed to send source to `{}`: {}",
+                job.rustc.display(),
+                e
+            ));
+        }
+        // Dropping `stdin` closes the pipe so rustc sees EOF.
+    }
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(e) => return Err(format!("failed to run `{}`: {}", job.rustc.display(), e)),
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to compile subcrate `{}`{}:\n{}",
+            job.display_name,
+            if job.proc_macro { " (proc-macro)" } else { "" },
+            indent(stderr.trim_end()),
+        ));
+    }
+
+    // rustc's stderr on success is its warnings (and notes). Cargo hides a build
+    // script's own stderr, so the caller forwards each line as a `cargo:warning=`;
+    // cache it beside the stamp so a later reused build can re-emit it.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    let warnings = if stderr.is_empty() {
+        let _ = std::fs::remove_file(&job.warnings_file);
+        None
+    } else {
+        let _ = std::fs::write(&job.warnings_file, stderr);
+        Some(stderr.to_string())
+    };
+
+    if let Err(e) = std::fs::write(&job.stamp, &job.fingerprint) {
+        return Err(format!(
+            "failed to write stamp `{}`: {}",
+            job.stamp.display(),
+            e
+        ));
+    }
+    Ok(warnings)
 }
 
 /// Reads the package's edition from `Cargo.toml`, following
@@ -3455,6 +3769,23 @@ mod tests {
         let import = source.find("extern crate __subcrate_a_1").unwrap();
         let item = source.find("fn f").unwrap();
         assert!(attr < import && import < item, "{}", source);
+    }
+
+    #[test]
+    fn the_rendered_source_is_multi_line_and_re_parses() {
+        // The body is pretty-printed for readable diagnostic locations; the result
+        // must stay valid Rust.
+        let file =
+            syn::parse_file("pub fn f() -> usize { let x = 1; x + 2 }\npub struct S { a: u32 }")
+                .unwrap();
+        let source = render_source(&[], &[], &file.items);
+        assert!(
+            source.lines().count() > 3,
+            "expected multi-line source, got:\n{}",
+            source
+        );
+        let back = syn::parse_file(&source).expect("rendered source must re-parse");
+        assert_eq!(back.items.len(), 2);
     }
 
     #[test]
