@@ -11,8 +11,13 @@ env:
 
 jobs:
   test:
-    name: Test (Windows)
-    runs-on: windows-latest
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # amd64 and arm64 (windows-11-arm is GitHub's arm64 Windows runner).
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       # Exercises the whole machinery on Windows: the nested Cargo build, `rustc`

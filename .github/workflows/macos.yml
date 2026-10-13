@@ -11,8 +11,13 @@ env:
 
 jobs:
   test:
-    name: Test (macOS)
-    runs-on: macos-latest
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # arm64 (macos-latest, Apple Silicon) and amd64 (macos-15-intel, Intel).
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       # Covers the Unix-but-not-Linux surface: APFS hard-link/inode behaviour,

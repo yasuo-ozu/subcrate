@@ -11,8 +11,13 @@ env:
 
 jobs:
   test:
-    name: Test (Linux)
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # amd64 and arm64 (GitHub's free arm64 Linux runner for public repos).
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-test

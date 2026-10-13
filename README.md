@@ -2,16 +2,24 @@
   <img src="https://raw.githubusercontent.com/yasuo-ozu/subcrate/main/logo.png" width="168" alt="subcrate logo">
 </p>
 
-# subcrate [![Latest Version]][crates.io] [![Documentation]][docs.rs] [![CI]][ci-workflow] [![MSRV]][msrv-workflow]
+# subcrate [![Latest Version]][crates.io] [![Documentation]][docs.rs] [![MSRV]][msrv-workflow]
+
+[![Linux]][linux-workflow] [![Windows]][windows-workflow] [![macOS]][macos-workflow] [![Checks]][checks-workflow]
 
 [Latest Version]: https://img.shields.io/crates/v/subcrate.svg
 [crates.io]: https://crates.io/crates/subcrate
 [Documentation]: https://img.shields.io/docsrs/subcrate
 [docs.rs]: https://docs.rs/subcrate/latest/subcrate/
-[CI]: https://github.com/yasuo-ozu/subcrate/actions/workflows/ci.yml/badge.svg
-[ci-workflow]: https://github.com/yasuo-ozu/subcrate/actions/workflows/ci.yml
 [MSRV]: https://img.shields.io/crates/msrv/subcrate.svg
 [msrv-workflow]: https://github.com/yasuo-ozu/subcrate/actions/workflows/msrv.yml
+[Linux]: https://github.com/yasuo-ozu/subcrate/actions/workflows/linux.yml/badge.svg
+[linux-workflow]: https://github.com/yasuo-ozu/subcrate/actions/workflows/linux.yml
+[Windows]: https://github.com/yasuo-ozu/subcrate/actions/workflows/windows.yml/badge.svg
+[windows-workflow]: https://github.com/yasuo-ozu/subcrate/actions/workflows/windows.yml
+[macOS]: https://github.com/yasuo-ozu/subcrate/actions/workflows/macos.yml/badge.svg
+[macos-workflow]: https://github.com/yasuo-ozu/subcrate/actions/workflows/macos.yml
+[Checks]: https://github.com/yasuo-ozu/subcrate/actions/workflows/checks.yml/badge.svg
+[checks-workflow]: https://github.com/yasuo-ozu/subcrate/actions/workflows/checks.yml
 
 **Write real, separately compiled Rust crates as inline modules.**
 
