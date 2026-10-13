@@ -314,9 +314,10 @@ pub fn manifest_lookup(manifest: &str, internal: &str) -> Option<Vec<ResolvedDep
 ///
 /// We do **not** hash `TokenStream::to_string()`. That text differs between the
 /// real proc-macro backend (used in the macro) and `proc_macro2`'s fallback
-/// backend (used in the build script), mostly in whitespace. Instead we walk the
-/// token tree and write a form that depends only on each token's kind and text,
-/// not its spacing, so both backends produce the same bytes.
+/// backend (used in the build script) — in whitespace, and in how a string
+/// literal is spelled (raw vs escaped). Instead we walk the token tree and write a
+/// form that depends only on each token's kind and, for literals, decoded value —
+/// not its spacing or spelling — so both backends produce the same bytes.
 pub fn canonical_body(attrs: &[Attribute], items: &[Item]) -> String {
     let tokens: TokenStream = quote! { #(#attrs)* #(#items)* };
     let mut out = String::new();
@@ -348,13 +349,31 @@ fn write_canonical(tokens: &TokenStream, out: &mut String) {
             // Punct characters are concatenated verbatim; multi-character
             // operators arrive as separate joint puncts and reassemble exactly.
             TokenTree::Punct(punct) => out.push(punct.as_char()),
-            // Literals are wrapped in markers so their boundaries are explicit.
+            // Literals are wrapped in markers so their boundaries are explicit,
+            // and reduced to their value (see `canonical_literal`).
             TokenTree::Literal(lit) => {
                 out.push('\u{2045}');
-                out.push_str(&lit.to_string());
+                out.push_str(&canonical_literal(&lit.to_string()));
                 out.push('\u{2046}');
             }
         }
+    }
+}
+
+/// Reduces a literal to a backend-independent form. A string, byte-string, char
+/// or byte literal becomes its decoded value, so the raw and escaped spellings of
+/// one value agree: the two proc-macro backends spell the same value differently
+/// (a raw `r"a\b"` on one, an escaped `"a\\b"` on the other — notably for a doc
+/// comment carrying `"` or `\`), and hashing the spelling would make the macro and
+/// the build helper disagree on a module's name. Numeric literals render the same
+/// on both backends, and anything that does not parse as a literal is left as is.
+fn canonical_literal(text: &str) -> String {
+    match syn::parse_str::<Lit>(text) {
+        Ok(Lit::Str(s)) => format!("s\u{1f}{}", s.value()),
+        Ok(Lit::ByteStr(s)) => format!("b\u{1f}{:?}", s.value()),
+        Ok(Lit::Char(c)) => format!("c\u{1f}{}", c.value()),
+        Ok(Lit::Byte(b)) => format!("y\u{1f}{}", b.value()),
+        _ => text.to_string(),
     }
 }
 
@@ -446,5 +465,28 @@ impl Fnv1a {
 
     fn finish(&self) -> u64 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A raw and an escaped spelling of one string value must canonicalize the
+    // same, so the macro and the build helper (whose proc-macro backends spell
+    // literals differently) agree on the internal name. Regression test for the
+    // "a doc comment with `\"` or `\\` breaks discovery" bug.
+    #[test]
+    fn literals_canonicalize_by_value_not_spelling() {
+        let raw: Item = syn::parse_str(r##"fn f() -> &'static str { r"a\b" }"##).unwrap();
+        let escaped: Item = syn::parse_str(r#"fn f() -> &'static str { "a\\b" }"#).unwrap();
+        assert_eq!(
+            canonical_body(&[], std::slice::from_ref(&raw)),
+            canonical_body(&[], std::slice::from_ref(&escaped)),
+        );
+        assert_eq!(
+            internal_crate_name("m", &Args::default(), &[], std::slice::from_ref(&raw)),
+            internal_crate_name("m", &Args::default(), &[], std::slice::from_ref(&escaped)),
+        );
     }
 }
