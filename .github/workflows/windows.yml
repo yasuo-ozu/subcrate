@@ -1,0 +1,20 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Exercises the whole machinery on Windows: the nested Cargo build, `rustc`
+      # over stdin, proc-macro `.dll` linking, and the artifact hard-linking step.
+      - uses: ./.github/actions/build-test

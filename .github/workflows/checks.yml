@@ -1,4 +1,4 @@
-name: CI
+name: Checks
 
 on:
   push:
@@ -10,36 +10,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          rustc --version
-      - name: Test (default features)
-        run: cargo test --workspace
-      - name: Build the attribute-only path (no default features)
-        run: cargo check -p subcrate --no-default-features
-
-  windows:
-    name: Test (Windows)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          rustc --version
-      # Exercises the whole machinery on Windows: the nested Cargo build, `rustc`
-      # over stdin, proc-macro `.dll` linking, and the artifact hard-linking step.
-      - name: Test (default features)
-        run: cargo test --workspace
-      - name: Build the attribute-only path (no default features)
-        run: cargo check -p subcrate --no-default-features
-
   nightly:
     name: Nightly-only tests
     runs-on: ubuntu-latest

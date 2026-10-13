@@ -1,0 +1,20 @@
+name: macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Covers the Unix-but-not-Linux surface: APFS hard-link/inode behaviour,
+      # a case-insensitive filesystem, and macOS path handling.
+      - uses: ./.github/actions/build-test

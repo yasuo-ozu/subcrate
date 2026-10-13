@@ -1,0 +1,20 @@
+name: Build and test
+description: >
+  Install the stable toolchain, run the workspace tests, and build the
+  attribute-only path (no default features). Shared by the per-platform
+  workflows so the machinery lives in one place.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        rustup toolchain install stable --profile minimal --no-self-update
+        rustup default stable
+        rustc --version
+    - name: Test (default features)
+      shell: bash
+      run: cargo test --workspace
+    - name: Build the attribute-only path (no default features)
+      shell: bash
+      run: cargo check -p subcrate --no-default-features
