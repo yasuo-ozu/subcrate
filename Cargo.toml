@@ -25,7 +25,10 @@ subcrate-macros = { path = "macro", version = "0.1.0" }
 # avoid compiling them for the target.
 subcrate-core = { path = "core", version = "0.1.0", optional = true }
 syn = { version = "2", features = ["full", "parsing", "printing"], optional = true }
-proc-macro2 = { version = "1", optional = true }
+# `span-locations` lets the build helper read each token's original line (via
+# `Span::start()`), so `rustc` diagnostics pointing at the generated `<anon>`
+# source can be rewritten to the user's real file and line.
+proc-macro2 = { version = "1", features = ["span-locations"], optional = true }
 template-quote = { version = "0.3", optional = true }
 # Topologically sorts the subcrates by their dependencies (only the algorithm
 # is used, so the optional `matrix` feature — and its `sprs` dependency — is off).

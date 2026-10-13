@@ -803,7 +803,10 @@ impl Config {
         out_dir: &Path,
     ) -> Result<Prepared, Error> {
         let args = self.rustc_args(sub, deps, out_dir);
-        let source = render_source(&sub.inner_attrs, deps, &sub.items);
+        // `mappable` off for a body inlined from several files (`mod foo;`): its
+        // tokens span more than `source_file`, so leave diagnostics as `<anon>`.
+        let (source, line_map) =
+            render_source(&sub.inner_attrs, deps, &sub.items, !sub.inlined_files);
 
         // Reuse decision. The crate *name* is already a hash of the body as
         // written. The stamp records more: the exact `rustc` configuration, and
@@ -857,6 +860,8 @@ impl Config {
             warnings_file,
             display_name: sub.display_name(),
             proc_macro: sub.proc_macro,
+            line_map,
+            source_file: sub.source_file.display().to_string(),
         })))
     }
 
@@ -1386,6 +1391,14 @@ struct Subcrate {
     /// The crate-root file the module was discovered from, which scopes
     /// dependency resolution (see [`resolve_dependency`]).
     root: PathBuf,
+    /// The file the `#[subcrate]` module is written in (the crate root, or a file
+    /// reached by `mod foo;`). Its tokens' spans point into this file, so a `rustc`
+    /// diagnostic on the generated source can be reported against it.
+    source_file: PathBuf,
+    /// Whether the body pulled in other files via `mod foo;` (so its tokens span
+    /// several files). When it did, spans cannot be mapped to one file, and
+    /// diagnostics keep the generated `<anon>` name.
+    inlined_files: bool,
     /// The crates this subcrate links against, as written in its arguments.
     deps: Vec<Dependency>,
     /// The generated, content-addressed crate name.
@@ -1492,6 +1505,9 @@ struct Walker {
     seen_internal: HashSet<String>,
     /// The crate-root file currently being walked.
     root: PathBuf,
+    /// The file currently being walked (the crate root, or one reached by
+    /// `mod foo;`). A subcrate's tokens' spans point into this file.
+    current_file: PathBuf,
     /// Module path (from `root`) of the items currently being walked.
     mod_path: Vec<String>,
 }
@@ -1521,7 +1537,12 @@ impl Walker {
         };
 
         self.out.files.push(path.to_path_buf());
+        // Track the file being walked (restored on return), so a `mod foo;` that
+        // recurses into another file does not leave its name set for the items
+        // after it in this one.
+        let prev_file = std::mem::replace(&mut self.current_file, path.to_path_buf());
         self.walk_items(&file.items, mod_dir);
+        self.current_file = prev_file;
     }
 
     fn walk_items(&mut self, items: &[Item], mod_dir: &Path) {
@@ -1608,12 +1629,15 @@ impl Walker {
         };
         let mut extra_files = Vec::new();
         let compiled_items = inline_external_mods(items, &body_dir, &mut extra_files);
+        let inlined_files = !extra_files.is_empty();
         self.out.files.extend(extra_files);
 
         if self.seen_internal.insert(internal.clone()) {
             self.out.subcrates.push(Subcrate {
                 module_path,
                 root: self.root.clone(),
+                source_file: self.current_file.clone(),
+                inlined_files,
                 deps: args.deps,
                 internal,
                 proc_macro: args.proc_macro,
@@ -2108,7 +2132,18 @@ fn path_attr_value(attr: &Attribute) -> Option<String> {
 /// part of the subcrate's content-addressed name (the dependency *list* in the
 /// arguments is). It sits at the crate root, so nested modules reach the alias as
 /// `crate::<alias>` or `super::<alias>`.
-fn render_source(inner_attrs: &[Attribute], deps: &[ExternDep], items: &[Item]) -> String {
+/// Renders a subcrate's source, and a map from each generated line (1-based) to
+/// the original source line it came from — used to rewrite `rustc`'s `<anon>:L:C`
+/// diagnostics to the user's real file and line. The map is empty (so diagnostics
+/// keep the `<anon>` name) when `mappable` is false — the body was pulled from
+/// several files via `mod foo;`, whose spans would point at the wrong file — or
+/// when the pretty form fails to re-parse and the compact fallback is used.
+fn render_source(
+    inner_attrs: &[Attribute],
+    deps: &[ExternDep],
+    items: &[Item],
+    mappable: bool,
+) -> (String, Vec<Option<usize>>) {
     let attrs = quote! { #(#inner_attrs)* }.to_string();
     let mut imports = String::new();
     for dep in deps {
@@ -2123,83 +2158,150 @@ fn render_source(inner_attrs: &[Attribute], deps: &[ExternDep], items: &[Item]) 
     // point at the right construct, not a column deep into one long line.
     // `pretty_tokens` only adds whitespace, but fall back to the compact form if
     // the result somehow fails to re-parse, so the compiled source is always valid.
-    let pretty = format!("{}\n{}{}", attrs, imports, pretty_tokens(&items));
-    if syn::parse_file(&pretty).is_ok() {
-        pretty
-    } else {
-        format!("{}\n{}{}", attrs, imports, items)
+    let (body, body_map) = pretty_tokens(&items);
+    let pretty = format!("{}\n{}{}", attrs, imports, body);
+    if syn::parse_file(&pretty).is_err() {
+        return (format!("{}\n{}{}", attrs, imports, items), Vec::new());
     }
+    if !mappable {
+        return (pretty, Vec::new());
+    }
+    // The body follows the preamble — the crate-root attributes and the injected
+    // `extern crate` imports — which have no user-source line. Shift the body's
+    // per-line map past those.
+    let preamble_lines = attrs.matches('\n').count() + 1 + imports.matches('\n').count();
+    let mut map = vec![None; preamble_lines + 1];
+    map.extend(body_map);
+    (pretty, map)
 }
 
-/// Renders a token stream as multi-line source so a `rustc` diagnostic lands on a
-/// meaningful line and column instead of one long line. It only inserts
-/// whitespace (newlines after `;` and around block braces), respecting punct
-/// joint/alone spacing so multi-character operators still reassemble; a caller
-/// verifies the result re-parses.
-fn pretty_tokens(stream: &TokenStream) -> String {
-    let mut out = String::new();
-    write_pretty(stream.clone(), 0, &mut out);
-    out
+/// Renders a token stream as multi-line source (see [`render_source`]) and, for
+/// each output line, the original source line of the tokens on it (0-based,
+/// `None` where no spanned token landed). Only inserts whitespace, so it re-parses.
+fn pretty_tokens(stream: &TokenStream) -> (String, Vec<Option<usize>>) {
+    let mut pretty = Pretty {
+        out: String::new(),
+        map: vec![None],
+    };
+    pretty.write(stream.clone(), 0);
+    (pretty.out, pretty.map)
 }
 
-fn write_pretty(stream: TokenStream, depth: usize, out: &mut String) {
-    for tt in stream {
-        match tt {
-            TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => {
-                out.push('{');
-                push_indent(out, depth + 1);
-                write_pretty(group.stream(), depth + 1, out);
-                push_indent(out, depth);
-                out.push('}');
-                push_indent(out, depth);
-            }
-            TokenTree::Group(group) => {
-                let (open, close) = match group.delimiter() {
-                    Delimiter::Parenthesis => ('(', ')'),
-                    Delimiter::Bracket => ('[', ']'),
-                    Delimiter::Brace | Delimiter::None => ('\0', '\0'),
-                };
-                if open != '\0' {
-                    out.push(open);
+/// Builds the pretty-printed text and, in lock-step, the original source line of
+/// each output line.
+struct Pretty {
+    out: String,
+    /// `map[i]` is the smallest original source line of the tokens on output line
+    /// `i` (0-based), or `None` if none of them carried a location.
+    map: Vec<Option<usize>>,
+}
+
+impl Pretty {
+    /// Records that a token from original source line `line` (0 = no location) is
+    /// on the current output line.
+    fn note(&mut self, line: usize) {
+        if line != 0 {
+            let i = self.map.len() - 1;
+            self.map[i] = Some(self.map[i].map_or(line, |e| e.min(line)));
+        }
+    }
+
+    /// Starts a new output line indented to `depth`.
+    fn newline(&mut self, depth: usize) {
+        self.out.push('\n');
+        for _ in 0..depth {
+            self.out.push_str("    ");
+        }
+        self.map.push(None);
+    }
+
+    fn write(&mut self, stream: TokenStream, depth: usize) {
+        for tt in stream {
+            self.note(tt.span().start().line);
+            match tt {
+                TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => {
+                    self.out.push('{');
+                    self.newline(depth + 1);
+                    self.write(group.stream(), depth + 1);
+                    self.newline(depth);
+                    self.out.push('}');
+                    self.newline(depth);
                 }
-                write_pretty(group.stream(), depth, out);
-                if close != '\0' {
-                    out.push(close);
-                }
-                out.push(' ');
-            }
-            TokenTree::Ident(ident) => {
-                out.push_str(&ident.to_string());
-                out.push(' ');
-            }
-            TokenTree::Literal(lit) => {
-                out.push_str(&lit.to_string());
-                out.push(' ');
-            }
-            TokenTree::Punct(punct) => match punct.as_char() {
-                ';' => {
-                    out.push(';');
-                    push_indent(out, depth);
-                }
-                // The lead-in of an attribute: no space before the `[` or `!`.
-                '#' => out.push('#'),
-                c => {
-                    out.push(c);
-                    if punct.spacing() == Spacing::Alone {
-                        out.push(' ');
+                TokenTree::Group(group) => {
+                    let (open, close) = match group.delimiter() {
+                        Delimiter::Parenthesis => ('(', ')'),
+                        Delimiter::Bracket => ('[', ']'),
+                        Delimiter::Brace | Delimiter::None => ('\0', '\0'),
+                    };
+                    if open != '\0' {
+                        self.out.push(open);
                     }
+                    self.write(group.stream(), depth);
+                    if close != '\0' {
+                        self.out.push(close);
+                    }
+                    self.out.push(' ');
                 }
-            },
+                TokenTree::Ident(ident) => {
+                    self.out.push_str(&ident.to_string());
+                    self.out.push(' ');
+                }
+                TokenTree::Literal(lit) => {
+                    self.out.push_str(&lit.to_string());
+                    self.out.push(' ');
+                }
+                TokenTree::Punct(punct) => match punct.as_char() {
+                    ';' => {
+                        self.out.push(';');
+                        self.newline(depth);
+                    }
+                    // The lead-in of an attribute: no space before the `[` or `!`.
+                    '#' => self.out.push('#'),
+                    c => {
+                        self.out.push(c);
+                        if punct.spacing() == Spacing::Alone {
+                            self.out.push(' ');
+                        }
+                    }
+                },
+            }
         }
     }
 }
 
-/// Starts a new line indented to `depth`.
-fn push_indent(out: &mut String, depth: usize) {
-    out.push('\n');
-    for _ in 0..depth {
-        out.push_str("    ");
+/// Rewrites `rustc`'s `<anon>:LINE:COL` references (`<anon>` is the stdin source)
+/// to the user's real `file:line:col`, using the generated-to-original line `map`
+/// from [`render_source`]. The column is `rustc`'s (into the generated source), so
+/// it is approximate; a line with no mapping keeps `<anon>`. A no-op when the map
+/// is empty (an unmappable subcrate).
+fn remap_diagnostics(stderr: &str, map: &[Option<usize>], file: &str) -> String {
+    const MARKER: &str = "<anon>:";
+    if map.is_empty() {
+        return stderr.to_string();
     }
+    let mut out = String::with_capacity(stderr.len());
+    let mut rest = stderr;
+    while let Some(pos) = rest.find(MARKER) {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + MARKER.len()..];
+        let digits = after.chars().take_while(char::is_ascii_digit).count();
+        match after[..digits].parse::<usize>() {
+            Ok(gline) if map.get(gline).copied().flatten().is_some() => {
+                let oline = map[gline].unwrap();
+                out.push_str(file);
+                out.push(':');
+                out.push_str(&oline.to_string());
+                rest = &after[digits..]; // keep the ":col…" tail
+            }
+            // No digits, or an unmapped line: leave `<anon>:` as written.
+            _ => {
+                out.push_str(MARKER);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The result of [`Config::prepare_subcrate`]: either the subcrate is up to date,
@@ -2228,6 +2330,11 @@ struct CompileJob {
     warnings_file: PathBuf,
     display_name: String,
     proc_macro: bool,
+    /// Generated line → original source line, for rewriting `<anon>` diagnostics
+    /// (see [`render_source`]). Empty when the subcrate is not mappable.
+    line_map: Vec<Option<usize>>,
+    /// The user's source file the diagnostics are rewritten to name.
+    source_file: String,
 }
 
 /// Runs `rustc` for one prepared subcrate (on a worker thread): feeds the source
@@ -2270,7 +2377,12 @@ fn run_compile_job(job: &CompileJob) -> Result<Option<String>, String> {
     };
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Rewrite `<anon>:L:C` to the user's real file:line before reporting.
+        let stderr = remap_diagnostics(
+            &String::from_utf8_lossy(&output.stderr),
+            &job.line_map,
+            &job.source_file,
+        );
         return Err(format!(
             "failed to compile subcrate `{}`{}:\n{}",
             job.display_name,
@@ -2281,8 +2393,13 @@ fn run_compile_job(job: &CompileJob) -> Result<Option<String>, String> {
 
     // rustc's stderr on success is its warnings (and notes). Cargo hides a build
     // script's own stderr, so the caller forwards each line as a `cargo:warning=`;
-    // cache it beside the stamp so a later reused build can re-emit it.
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // cache it beside the stamp so a later reused build can re-emit it. Rewrite the
+    // `<anon>` locations first, so the cache (and the re-emit) carry real file:line.
+    let stderr = remap_diagnostics(
+        &String::from_utf8_lossy(&output.stderr),
+        &job.line_map,
+        &job.source_file,
+    );
     let stderr = stderr.trim();
     let warnings = if stderr.is_empty() {
         let _ = std::fs::remove_file(&job.warnings_file);
@@ -3491,6 +3608,8 @@ mod tests {
         Subcrate {
             module_path: path.iter().map(|s| s.to_string()).collect(),
             root: PathBuf::from(root),
+            source_file: PathBuf::from(root),
+            inlined_files: false,
             deps,
             internal: format!("__subcrate_{}", path.join("_")),
             proc_macro: false,
@@ -3735,7 +3854,7 @@ mod tests {
         assert!(args.contains(&"__subcrate_c_2=out/subcrates/lib__subcrate_c_2.rlib".to_string()));
         assert!(args.contains(&"dependency=out/subcrates".to_string()));
 
-        let source = render_source(&[], &deps, &[]);
+        let (source, _) = render_source(&[], &deps, &[], true);
         // `extern crate … as …;` (not `use`) so the alias lands in the extern
         // prelude: the subcrate can write `::a` and `pub use a::…;`.
         assert!(
@@ -3756,7 +3875,7 @@ mod tests {
         let deps = [linked("__subcrate_a_1", "x"), linked("__subcrate_a_1", "y")];
         let args = config().rustc_args(&top("b", vec![]), &deps, Path::new("out/subcrates"));
         assert_eq!(args.iter().filter(|a| *a == "--extern").count(), 1);
-        let source = render_source(&[], &deps, &[]);
+        let (source, _) = render_source(&[], &deps, &[], true);
         assert!(source.contains("extern crate __subcrate_a_1 as x;"));
         assert!(source.contains("extern crate __subcrate_a_1 as y;"));
     }
@@ -3764,7 +3883,12 @@ mod tests {
     #[test]
     fn the_injected_import_follows_crate_level_attributes() {
         let file = syn::parse_file("#![allow(dead_code)] fn f() {}").unwrap();
-        let source = render_source(&file.attrs, &[linked("__subcrate_a_1", "a")], &file.items);
+        let (source, _) = render_source(
+            &file.attrs,
+            &[linked("__subcrate_a_1", "a")],
+            &file.items,
+            true,
+        );
         let attr = source.find("allow").unwrap();
         let import = source.find("extern crate __subcrate_a_1").unwrap();
         let item = source.find("fn f").unwrap();
@@ -3778,7 +3902,7 @@ mod tests {
         let file =
             syn::parse_file("pub fn f() -> usize { let x = 1; x + 2 }\npub struct S { a: u32 }")
                 .unwrap();
-        let source = render_source(&[], &[], &file.items);
+        let (source, _) = render_source(&[], &[], &file.items, true);
         assert!(
             source.lines().count() > 3,
             "expected multi-line source, got:\n{}",
@@ -3793,7 +3917,9 @@ mod tests {
         let args = config().rustc_args(&top("b", vec![]), &[], Path::new("out/subcrates"));
         assert!(!args.contains(&"--extern".to_string()));
         assert!(!args.contains(&"-L".to_string()));
-        assert!(!render_source(&[], &[], &[]).contains("extern crate"));
+        assert!(!render_source(&[], &[], &[], true)
+            .0
+            .contains("extern crate"));
     }
 
     // -- Owner dependencies: crates the package depends on, and the owner crate ----
@@ -4000,7 +4126,7 @@ mod tests {
         assert!(args.contains(&"dependency=t/debug".to_string()));
         assert!(args.contains(&"dependency=t/debug/build/leaf/h/out".to_string()));
 
-        let source = render_source(&[], &deps, &[]);
+        let (source, _) = render_source(&[], &deps, &[], true);
         assert!(source.contains("extern crate leaf as l;"), "{}", source);
     }
 
@@ -5286,5 +5412,38 @@ other = "1"
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn remap_rewrites_anon_to_the_real_file_and_line() {
+        // Generated line 3 came from source line 20; line 4 has no mapping.
+        let map = vec![None, None, None, Some(20)];
+        let stderr = " --> <anon>:3:5\n3 | code\n --> <anon>:4:1\n";
+        let out = remap_diagnostics(stderr, &map, "src/lib.rs");
+        assert!(out.contains("--> src/lib.rs:20:5"), "{}", out);
+        // An unmapped line keeps `<anon>` rather than claim a wrong line.
+        assert!(out.contains("<anon>:4:1"), "{}", out);
+        // An empty map (an unmappable subcrate) is a no-op.
+        assert_eq!(remap_diagnostics(stderr, &[], "src/lib.rs"), stderr);
+    }
+
+    #[test]
+    fn generated_lines_map_back_to_source_lines() {
+        // `BADTOKEN` is on source line 3.
+        let src = "fn f() -> u8 {\n    let x = 1;\n    BADTOKEN\n}\n";
+        let items = syn::parse_file(src).unwrap().items;
+        let (source, map) = render_source(&[], &[], &items, true);
+        assert!(!map.is_empty());
+        let gline = source[..source.find("BADTOKEN").unwrap()]
+            .matches('\n')
+            .count()
+            + 1;
+        assert_eq!(
+            map.get(gline).copied().flatten(),
+            Some(3),
+            "source:\n{}\nmap: {:?}",
+            source,
+            map
+        );
     }
 }
