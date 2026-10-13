@@ -26,8 +26,8 @@
 //!    [below](#owner-dependencies)).
 //! 5. Compile each module with `rustc` (from `$RUSTC`), dependencies first,
 //!    reading the source from stdin — no temporary `.rs` files or `Cargo.toml`s. A
-//!    dependency reaches its dependent as `--extern <internal>=<artifact>` plus a
-//!    `use` at the dependent's crate root.
+//!    dependency reaches its dependent as `--extern <internal>=<artifact>` plus an
+//!    `extern crate … as <alias>;` at the dependent's crate root.
 //! 6. Put the artifacts on the library search path and record metadata the macro
 //!    reads to confirm the helper ran.
 //!
@@ -745,7 +745,7 @@ impl Config {
         out_dir: &Path,
     ) -> Result<(), Error> {
         let args = self.rustc_args(sub, deps, out_dir);
-        let source = render_source(&sub.inner_attrs, deps, self.edition_of(sub), &sub.items);
+        let source = render_source(&sub.inner_attrs, deps, &sub.items);
 
         // Reuse decision. The crate *name* is already a hash of the body as
         // written. The stamp records more: the exact `rustc` configuration, and
@@ -1840,33 +1840,22 @@ fn path_attr_value(attr: &Attribute) -> Option<String> {
 /// attributes first (they must lead the crate root), then the import of each
 /// linked dependency under its alias, then the items.
 ///
-/// The import is `use ::<internal name> as <alias>;`. On edition 2015, where
-/// `::name` means something else, it is instead the equivalent `extern crate
-/// <internal name> as <alias>;`. It is an injected render-time detail and is not
+/// The import is `extern crate <internal name> as <alias>;`. This binds `alias`
+/// into the subcrate's *extern prelude* (on every edition), so the body can reach
+/// the dependency as `::<alias>` and re-export it with `pub use <alias>::…;`, not
+/// just as a plain `use` alias. It is an injected render-time detail and is not
 /// part of the subcrate's content-addressed name (the dependency *list* in the
 /// arguments is). It sits at the crate root, so nested modules reach the alias as
 /// `crate::<alias>` or `super::<alias>`.
-fn render_source(
-    inner_attrs: &[Attribute],
-    deps: &[ExternDep],
-    edition: &str,
-    items: &[Item],
-) -> String {
+fn render_source(inner_attrs: &[Attribute], deps: &[ExternDep], items: &[Item]) -> String {
     let attrs = quote! { #(#inner_attrs)* }.to_string();
     let mut imports = String::new();
     for dep in deps {
-        // `unused_imports` is allowed: a dependency need not be used.
-        if edition == "2015" {
-            imports.push_str(&format!(
-                "#[allow(unused_extern_crates)] extern crate {} as {};\n",
-                dep.internal, dep.alias
-            ));
-        } else {
-            imports.push_str(&format!(
-                "#[allow(unused_imports)] use ::{} as {};\n",
-                dep.internal, dep.alias
-            ));
-        }
+        // `unused_extern_crates` is allowed: a dependency need not be used.
+        imports.push_str(&format!(
+            "#[allow(unused_extern_crates)] extern crate {} as {};\n",
+            dep.internal, dep.alias
+        ));
     }
     let items = quote! { #(#items)* }.to_string();
     format!("{}\n{}{}", attrs, imports, items)
@@ -3304,27 +3293,16 @@ mod tests {
         assert!(args.contains(&"__subcrate_c_2=out/subcrates/lib__subcrate_c_2.rlib".to_string()));
         assert!(args.contains(&"dependency=out/subcrates".to_string()));
 
-        let source = render_source(&[], &deps, "2021", &[]);
-        assert!(source.contains("use ::__subcrate_a_1 as a;"), "{}", source);
-        assert!(source.contains("use ::__subcrate_c_2 as z;"), "{}", source);
-    }
-
-    #[test]
-    fn a_crate_under_two_aliases_is_linked_once() {
-        let deps = [linked("__subcrate_a_1", "x"), linked("__subcrate_a_1", "y")];
-        let args = config().rustc_args(&top("b", vec![]), &deps, Path::new("out/subcrates"));
-        assert_eq!(args.iter().filter(|a| *a == "--extern").count(), 1);
-        let source = render_source(&[], &deps, "2021", &[]);
-        assert!(source.contains("use ::__subcrate_a_1 as x;"));
-        assert!(source.contains("use ::__subcrate_a_1 as y;"));
-    }
-
-    #[test]
-    fn a_2015_edition_subcrate_imports_with_extern_crate() {
-        let deps = [linked("__subcrate_a_1", "a")];
-        let source = render_source(&[], &deps, "2015", &[]);
+        let source = render_source(&[], &deps, &[]);
+        // `extern crate … as …;` (not `use`) so the alias lands in the extern
+        // prelude: the subcrate can write `::a` and `pub use a::…;`.
         assert!(
             source.contains("extern crate __subcrate_a_1 as a;"),
+            "{}",
+            source
+        );
+        assert!(
+            source.contains("extern crate __subcrate_c_2 as z;"),
             "{}",
             source
         );
@@ -3332,16 +3310,21 @@ mod tests {
     }
 
     #[test]
+    fn a_crate_under_two_aliases_is_linked_once() {
+        let deps = [linked("__subcrate_a_1", "x"), linked("__subcrate_a_1", "y")];
+        let args = config().rustc_args(&top("b", vec![]), &deps, Path::new("out/subcrates"));
+        assert_eq!(args.iter().filter(|a| *a == "--extern").count(), 1);
+        let source = render_source(&[], &deps, &[]);
+        assert!(source.contains("extern crate __subcrate_a_1 as x;"));
+        assert!(source.contains("extern crate __subcrate_a_1 as y;"));
+    }
+
+    #[test]
     fn the_injected_import_follows_crate_level_attributes() {
         let file = syn::parse_file("#![allow(dead_code)] fn f() {}").unwrap();
-        let source = render_source(
-            &file.attrs,
-            &[linked("__subcrate_a_1", "a")],
-            "2021",
-            &file.items,
-        );
+        let source = render_source(&file.attrs, &[linked("__subcrate_a_1", "a")], &file.items);
         let attr = source.find("allow").unwrap();
-        let import = source.find("use ::__subcrate_a_1").unwrap();
+        let import = source.find("extern crate __subcrate_a_1").unwrap();
         let item = source.find("fn f").unwrap();
         assert!(attr < import && import < item, "{}", source);
     }
@@ -3351,7 +3334,7 @@ mod tests {
         let args = config().rustc_args(&top("b", vec![]), &[], Path::new("out/subcrates"));
         assert!(!args.contains(&"--extern".to_string()));
         assert!(!args.contains(&"-L".to_string()));
-        assert!(!render_source(&[], &[], "2021", &[]).contains("use ::"));
+        assert!(!render_source(&[], &[], &[]).contains("extern crate"));
     }
 
     // -- Owner dependencies: crates the package depends on, and the owner crate ----
@@ -3558,9 +3541,7 @@ mod tests {
         assert!(args.contains(&"dependency=t/debug".to_string()));
         assert!(args.contains(&"dependency=t/debug/build/leaf/h/out".to_string()));
 
-        let source = render_source(&[], &deps, "2021", &[]);
-        assert!(source.contains("use ::leaf as l;"), "{}", source);
-        let source = render_source(&[], &deps, "2015", &[]);
+        let source = render_source(&[], &deps, &[]);
         assert!(source.contains("extern crate leaf as l;"), "{}", source);
     }
 
