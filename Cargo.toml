@@ -1,7 +1,7 @@
 [package]
 name = "subcrate"
 description = "Define real, independently compiled Rust crates with inline `#[subcrate]` module syntax."
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.56"
 license = "MIT"
@@ -17,13 +17,13 @@ path = "lib.rs"
 [dependencies]
 # Always available: the `#[subcrate]` attribute (re-exported in lib.rs). This is
 # a tiny proc-macro dependency with no further transitive cost for plain users.
-subcrate-macros = { path = "macro", version = "0.1.0" }
+subcrate-macros = { path = "macro", version = "0.1.1" }
 
 # Everything needed by `subcrate::build::compile()`. These are pulled in only
 # when the (default) `build` feature is on, so a crate that depends on
 # `subcrate` purely for the attribute can set `default-features = false` and
 # avoid compiling them for the target.
-subcrate-core = { path = "core", version = "0.1.0", optional = true }
+subcrate-core = { path = "core", version = "0.1.1", optional = true }
 syn = { version = "2", features = ["full", "parsing", "printing"], optional = true }
 # `span-locations` lets the build helper read each token's original line (via
 # `Span::start()`), so `rustc` diagnostics pointing at the generated `<anon>`
