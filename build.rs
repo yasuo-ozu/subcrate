@@ -376,7 +376,14 @@ impl Config {
 
     /// The package's library, as dependency resolution sees it.
     fn owner(&self) -> Owner {
-        let lib = self.manifest_dir.join("src").join("lib.rs");
+        // `[lib] path = "…"` if the manifest has one, else the default `src/lib.rs`.
+        // The same path as `crate_roots` builds, so a subcrate in the library is
+        // still recognised as part of it.
+        let lib = std::fs::read_to_string(self.manifest_dir.join("Cargo.toml"))
+            .ok()
+            .and_then(|manifest| lib_source_path(&manifest))
+            .map(|rel| self.manifest_dir.join(rel))
+            .unwrap_or_else(|| self.manifest_dir.join("src").join("lib.rs"));
         Owner {
             name: self.owner_crate_name(),
             lib: if lib.is_file() { Some(lib) } else { None },
@@ -1503,8 +1510,24 @@ fn crate_roots(manifest_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
 /// stray extra root only gets scanned for `#[subcrate]` and, finding none, costs
 /// nothing, so there is no need to replicate Cargo's exclusion rules.
 fn target_source_paths(manifest: &str) -> Vec<String> {
+    target_paths(manifest)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// The `path` of the `[lib]` table of a `Cargo.toml`, if it has one.
+fn lib_source_path(manifest: &str) -> Option<String> {
+    target_paths(manifest)
+        .into_iter()
+        .find(|(table, _)| table == "lib")
+        .map(|(_, path)| path)
+}
+
+/// The `path` of every explicitly-declared target, with the name of its table.
+fn target_paths(manifest: &str) -> Vec<(String, String)> {
     let mut paths = Vec::new();
-    let mut in_target = false;
+    let mut table = None;
     for raw in manifest.lines() {
         let line = strip_toml_comment(raw).trim();
         if line.is_empty() {
@@ -1517,17 +1540,21 @@ fn target_source_paths(manifest: &str) -> Vec<String> {
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .trim();
-            in_target = matches!(inner, "lib" | "bin" | "test" | "bench" | "example");
+            table = match inner {
+                "lib" | "bin" | "test" | "bench" | "example" => Some(inner.to_string()),
+                _ => None,
+            };
             continue;
         }
-        if !in_target {
-            continue;
-        }
+        let table = match &table {
+            Some(table) => table,
+            None => continue,
+        };
         // `path = "…"` (require `path` as its own key, not a prefix like `pathsep`).
         if let Some(rest) = line.strip_prefix("path") {
             if let Some(value) = rest.trim_start().strip_prefix('=') {
                 if let Some(s) = toml_string_value(value.trim()) {
-                    paths.push(s);
+                    paths.push((table.clone(), s));
                 }
             }
         }
@@ -1727,7 +1754,7 @@ struct ExternDep {
 struct Owner {
     /// The library's crate name: the package name with `-` as `_`.
     name: String,
-    /// `src/lib.rs`, if the package has a library.
+    /// The library's root (`[lib] path`, or `src/lib.rs`), if the package has one.
     lib: Option<PathBuf>,
 }
 
@@ -1814,7 +1841,7 @@ fn resolve_external(sub: &Subcrate, dep: &Dependency, owner: &Owner) -> Result<L
     match &owner.lib {
         None => Err(Error::new(format!(
             "subcrate `{}` depends on `::{}`, the owner crate, but this package has no library \
-             (`src/lib.rs`) for it to depend on",
+             (`src/lib.rs`, or a `[lib] path`) for it to depend on",
             sub.display_name(),
             name
         ))),
@@ -4941,6 +4968,9 @@ path = \"ignored\"
                 "examples/weird.rs",
             ]
         );
+        // The library's own path, for the owner crate.
+        assert_eq!(lib_source_path(manifest).as_deref(), Some("src/the_lib.rs"));
+        assert_eq!(lib_source_path("[package]\nname = \"p\"\n"), None);
     }
 
     #[test]
