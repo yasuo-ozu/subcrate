@@ -49,6 +49,7 @@ members = [
     "core",
     "macro",
     "examples/example",
+    "examples/custom-layout",
     "examples/leaf",
     "examples/leaf-alt",
     "examples/leaf-base",

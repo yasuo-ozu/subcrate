@@ -1,0 +1,18 @@
+[package]
+name = "custom-layout"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.56"
+build = "build.rs"
+publish = false
+
+[lib]
+# The library is deliberately NOT at `src/lib.rs`. The build helper must read this
+# path from the manifest to discover the `#[subcrate]` modules in it.
+path = "weird/the_lib.rs"
+
+[dependencies]
+subcrate = { path = "../.." }
+
+[build-dependencies]
+subcrate = { path = "../.." }
