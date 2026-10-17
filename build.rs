@@ -1475,7 +1475,64 @@ fn crate_roots(manifest_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     // Examples: `examples/*.rs` and `examples/<name>/main.rs`.
     collect_root_dir(&manifest_dir.join("examples"), &mut roots);
 
+    // Targets whose source is not at a default location: a `[lib] path = "…"`, or
+    // a `[[bin]]`/`[[test]]`/`[[bench]]`/`[[example]]` with a `path`. Cargo lets any
+    // target live anywhere, so the library is not always `src/lib.rs`. The path is
+    // relative to the manifest directory and may point outside it (`../shared`),
+    // which a workspace can share between members. Added on top of the defaults
+    // above; `Walker` dedups by canonical path, so an overlap compiles once.
+    if let Ok(manifest) = std::fs::read_to_string(manifest_dir.join("Cargo.toml")) {
+        for rel in target_source_paths(&manifest) {
+            let file = manifest_dir.join(&rel);
+            if file.is_file() {
+                let dir = file
+                    .parent()
+                    .map_or_else(|| manifest_dir.to_path_buf(), Path::to_path_buf);
+                roots.push((file, dir));
+            }
+        }
+    }
+
     roots
+}
+
+/// The `path` of every explicitly-declared target in a `Cargo.toml`: the `[lib]`
+/// table and the `[[bin]]`, `[[test]]`, `[[bench]]` and `[[example]]` arrays of
+/// tables. These let a target's source live anywhere, so the library need not be
+/// `src/lib.rs`. Auto-discovery flags (`autolib`, `autobins`, …) are ignored: a
+/// stray extra root only gets scanned for `#[subcrate]` and, finding none, costs
+/// nothing, so there is no need to replicate Cargo's exclusion rules.
+fn target_source_paths(manifest: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut in_target = false;
+    for raw in manifest.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            // `[lib]`, or an array-of-tables header like `[[bin]]` (inner `[bin]`).
+            let inner = line[1..line.len() - 1]
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim();
+            in_target = matches!(inner, "lib" | "bin" | "test" | "bench" | "example");
+            continue;
+        }
+        if !in_target {
+            continue;
+        }
+        // `path = "…"` (require `path` as its own key, not a prefix like `pathsep`).
+        if let Some(rest) = line.strip_prefix("path") {
+            if let Some(value) = rest.trim_start().strip_prefix('=') {
+                if let Some(s) = toml_string_value(value.trim()) {
+                    paths.push(s);
+                }
+            }
+        }
+    }
+    paths
 }
 
 /// Collects root files from a directory that may contain both `*.rs` files and
@@ -4846,6 +4903,44 @@ other = "1"
         );
         assert_eq!(inline_table_field("{ a = [1, 2] }", "b"), None);
         assert_eq!(inline_table_field("\"1.0\"", "b"), None);
+    }
+
+    #[test]
+    fn explicit_target_paths_are_read_from_the_manifest() {
+        let manifest = "\
+[package]
+name = \"x\"
+path = \"not-a-target.rs\"
+
+[lib]
+path = \"src/the_lib.rs\"
+
+[[bin]]
+name = \"tool\"
+path = \"bin/tool.rs\"
+
+[[test]]
+name = \"it\"
+path = \"../shared/it.rs\"
+
+[[example]]
+# a comment
+path = \"examples/weird.rs\"
+
+[dependencies]
+path = \"ignored\"
+";
+        // `[lib]`/`[[bin]]`/`[[test]]`/`[[example]]` paths, in order; a `path` key
+        // in a non-target section (`[package]`, `[dependencies]`) is ignored.
+        assert_eq!(
+            target_source_paths(manifest),
+            [
+                "src/the_lib.rs",
+                "bin/tool.rs",
+                "../shared/it.rs",
+                "examples/weird.rs",
+            ]
+        );
     }
 
     #[test]
