@@ -1,7 +1,7 @@
 [package]
 name = "subcrate-macros"
 description = "Procedural macro implementation for the `subcrate` crate. Use `subcrate` instead."
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.56"
 license = "MIT"
@@ -12,7 +12,7 @@ proc-macro = true
 path = "lib.rs"
 
 [dependencies]
-subcrate-core = { path = "../core", version = "0.1.1" }
+subcrate-core = { path = "../core", version = "0.1.2" }
 syn = { version = "2", features = ["full", "parsing", "printing"] }
 proc-macro2 = "1"
 template-quote = "0.3"
