@@ -5,3 +5,6 @@ edition = "2021"
 rust-version = "1.56"
 publish = false
 description = "Test fixture: a package that its dependents rename (`package = \"leaf-alt\"`)."
+
+[lib]
+path = "lib.rs"

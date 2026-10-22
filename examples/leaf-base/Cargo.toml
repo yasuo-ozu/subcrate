@@ -5,3 +5,6 @@ edition = "2021"
 rust-version = "1.56"
 publish = false
 description = "Test fixture: the bottom of a two-crate chain of owner dependencies."
+
+[lib]
+path = "lib.rs"

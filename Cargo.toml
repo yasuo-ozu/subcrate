@@ -7,48 +7,34 @@ rust-version = "1.56"
 license = "MIT"
 repository = "https://github.com/yasuo-ozu/subcrate"
 readme = "README.md"
-# `build.rs` here is the build-helper *module* (`subcrate::build`), not a build
-# script, so auto-detection of a package build script is disabled.
+# `build.rs` is the build-helper module, not a build script.
 build = false
-# The integration tests live in their own package (`subcrate-tests`, rooted at
-# `./tests`), so this crate does not auto-discover `tests/*.rs` as its own.
+# Integration tests are their own package (`subcrate-tests`, ./tests).
 autotests = false
-# Keep the nested test/benchmark packages out of this crate's published archive
-# (the `tests` symlink in particular is not packageable).
+# Nested test/benchmark packages (and the `tests` symlink) are not published.
 exclude = ["/tests", "/benchmarks"]
 
 [lib]
 path = "lib.rs"
 
 [dependencies]
-# Always available: the `#[subcrate]` attribute (re-exported in lib.rs). This is
-# a tiny proc-macro dependency with no further transitive cost for plain users.
+# The `#[subcrate]` attribute; always available.
 subcrate-macros = { path = "macro", version = "0.1.3" }
-
-# Everything needed by `subcrate::build::compile()`. These are pulled in only
-# when the (default) `build` feature is on, so a crate that depends on
-# `subcrate` purely for the attribute can set `default-features = false` and
-# avoid compiling them for the target.
+# The rest back `subcrate::build::compile()`, behind the default `build` feature,
+# so attribute-only users can opt out with `default-features = false`.
 subcrate-core = { path = "core", version = "0.1.3", optional = true }
 syn = { version = "2", features = ["full", "parsing", "printing"], optional = true }
-# `span-locations` lets the build helper read each token's original line (via
-# `Span::start()`), so `rustc` diagnostics pointing at the generated `<anon>`
-# source can be rewritten to the user's real file and line.
+# `span-locations`: rewrite `<anon>` diagnostics to the user's real file and line.
 proc-macro2 = { version = "1", features = ["span-locations"], optional = true }
 template-quote = { version = "0.3", optional = true }
-# Topologically sorts the subcrates by their dependencies (only the algorithm
-# is used, so the optional `matrix` feature — and its `sprs` dependency — is off).
+# Topological sort of subcrates (no `matrix`/`sprs`).
 safegraph = { version = "0.3", default-features = false, optional = true }
 
 [features]
 default = ["build"]
-# Enables `subcrate::build`, the helper called from `build.rs`. The entries name
-# the optional dependencies directly (rather than `dep:`, which is 1.60+) to keep
-# the manifest parseable at the 1.56 MSRV.
+# Named directly (not `dep:`) to stay parseable at the 1.56 MSRV.
 build = ["subcrate-core", "syn", "proc-macro2", "template-quote", "safegraph"]
 
-# Plain `[workspace]` member lists predate workspace inheritance, so this stays
-# compatible with the 1.56 MSRV. Each member manifest is self-contained.
 [workspace]
 resolver = "2"
 members = [
@@ -60,10 +46,7 @@ members = [
     "examples/leaf-alt",
     "examples/leaf-base",
 ]
-# A bare `cargo test`/`build`/`check` at the root is run against this package
-# only, because the workspace root is itself the `subcrate` package. Listing every
-# member as a default makes those bare commands fan out across the whole
-# workspace instead (`.` is this `subcrate` package).
+# Bare `cargo test`/`build` at the root fans out to every member (`.` is `subcrate`).
 default-members = [
     ".",
     "core",
@@ -74,7 +57,5 @@ default-members = [
     "examples/leaf-alt",
     "examples/leaf-base",
 ]
-# The performance benchmark (subcrate vs. trybuild) is its own workspace: it pulls
-# in trybuild, which has a higher MSRV than this crate, so keeping it out of the
-# workspace keeps it out of the 1.56-locked `Cargo.lock` the `msrv` check uses.
+# Its own workspace: keeps trybuild out of the MSRV-locked `Cargo.lock`.
 exclude = ["benchmarks"]
