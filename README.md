@@ -145,6 +145,37 @@ machinery out of its own build with `default-features = false`.
   This needs **nightly** Rust (`mod foo;` in proc-macro input is unstable, `E0658`,
   on stable); inline `mod foo { … }` works everywhere.
 
+### UI testing
+
+A subcrate can assert what the compiler says about it. Pass `#[subcrate(...)]` one
+or more of these and the build helper checks `rustc`'s diagnostics:
+
+- `should_error` — it must *fail* to compile. Such a subcrate produces no crate, so
+  its module expands to an empty one. Add `= "…"` to also require an error whose
+  text contains that string.
+- `should_warn` — it must emit at least one warning. Add `= "…"` to require a
+  warning whose text contains that string.
+- `should_spanned = "…"` — some diagnostic must underline this code (compared with
+  whitespace removed).
+
+Each may be repeated, and **every one must hold** — they are combined with AND. For
+example, two `should_error = "…"` require an error for *each* string (not just one
+of them).
+
+```rust ignore
+#[subcrate(should_error = "cannot find value", should_spanned = "nope")]
+mod ui_test {
+    pub fn f() -> u32 { nope }
+}
+```
+
+The checks run during a plain `cargo build`/`test`: if one is not met the build
+fails and prints what the compiler actually said. A subcrate without `should_error`
+must still compile, so it stays a real, usable crate; its asserted warnings are not
+forwarded as build warnings. A UI-test subcrate is compiled with its lints capped at
+`warn`, so a `should_warn` keeps working even when the rest of the build runs under
+`-D warnings` (which would otherwise turn the warning into a hard error).
+
 ## Known limitations
 
 - `cargo doc` on the defining crate works. But a *downstream* crate's `cargo doc`
