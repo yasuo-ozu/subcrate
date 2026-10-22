@@ -1,0 +1,21 @@
+[package]
+name = "subcrate-tests"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.56"
+publish = false
+# `build.rs` runs `subcrate::build::compile()`, so the `#[subcrate(should_*)]`
+# UI tests in `ui.rs` are compiled and checked at build time.
+build = "build.rs"
+
+[dependencies]
+# The attribute, plus `build::compile` used by `build_api.rs`; default features
+# (the `build` machinery) are needed here, unlike an ordinary consumer.
+subcrate = { path = ".." }
+
+[build-dependencies]
+subcrate = { path = ".." }
+
+[dev-dependencies]
+subcrate-core = { path = "../core" }
+syn = "2"

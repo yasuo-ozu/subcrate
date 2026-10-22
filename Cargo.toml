@@ -10,6 +10,12 @@ readme = "README.md"
 # `build.rs` here is the build-helper *module* (`subcrate::build`), not a build
 # script, so auto-detection of a package build script is disabled.
 build = false
+# The integration tests live in their own package (`subcrate-tests`, rooted at
+# `./tests`), so this crate does not auto-discover `tests/*.rs` as its own.
+autotests = false
+# Keep the nested test/benchmark packages out of this crate's published archive
+# (the `tests` symlink in particular is not packageable).
+exclude = ["/tests", "/benchmarks"]
 
 [lib]
 path = "lib.rs"
@@ -48,6 +54,22 @@ resolver = "2"
 members = [
     "core",
     "macro",
+    "tests",
+    "examples/example",
+    "examples/custom-layout",
+    "examples/leaf",
+    "examples/leaf-alt",
+    "examples/leaf-base",
+]
+# A bare `cargo test`/`build`/`check` at the root is run against this package
+# only, because the workspace root is itself the `subcrate` package. Listing every
+# member as a default makes those bare commands fan out across the whole
+# workspace instead (`.` is this `subcrate` package).
+default-members = [
+    ".",
+    "core",
+    "macro",
+    "tests",
     "examples/example",
     "examples/custom-layout",
     "examples/leaf",

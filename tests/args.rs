@@ -125,3 +125,48 @@ fn dependency_order_does_not_change_the_internal_name() {
         name(&parse("a").unwrap())
     );
 }
+
+// --- UI-test expectations (`should_error` / `should_warn` / `should_spanned`) ---
+
+#[test]
+fn ui_test_expectations_parse_and_repeat() {
+    let args = parse(concat!(
+        r#"should_error = "cannot find", should_error = "value `x`", "#,
+        r#"should_warn = "unused", should_spanned = "x + 1""#,
+    ))
+    .unwrap();
+    assert_eq!(
+        args.ui.should_errors,
+        vec![
+            Some("cannot find".to_string()),
+            Some("value `x`".to_string())
+        ]
+    );
+    assert_eq!(args.ui.should_warns, vec![Some("unused".to_string())]);
+    assert_eq!(args.ui.should_spanned, vec!["x + 1".to_string()]);
+    assert!(args.is_ui_test());
+    assert!(args.expects_error());
+
+    let warn_only = parse(r#"should_warn = "unused variable""#).unwrap();
+    assert!(warn_only.is_ui_test());
+    assert!(!warn_only.expects_error());
+
+    // Different expectations yield different internal names (so the check re-runs).
+    assert_ne!(name(&args), name(&warn_only));
+}
+
+#[test]
+fn bare_should_error_and_should_warn_parse_without_a_value() {
+    let args = parse("should_error, should_warn").unwrap();
+    assert_eq!(args.ui.should_errors, vec![None]);
+    assert_eq!(args.ui.should_warns, vec![None]);
+    assert!(args.expects_error());
+
+    // Bare and valued forms mix, in any order.
+    let args = parse(r#"should_warn, should_error = "boom", should_warn = "slow""#).unwrap();
+    assert_eq!(args.ui.should_errors, vec![Some("boom".to_string())]);
+    assert_eq!(args.ui.should_warns, vec![None, Some("slow".to_string())]);
+
+    // A bare `should_spanned` is rejected: it has nothing to compare.
+    assert!(parse("should_spanned").is_err());
+}
