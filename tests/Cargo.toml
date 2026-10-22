@@ -4,14 +4,22 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.56"
 publish = false
-# `build.rs` runs `subcrate::build::compile()`, so the `#[subcrate(should_*)]`
-# UI tests in `ui.rs` are compiled and checked at build time.
+# `build.rs` runs `subcrate::build::compile()`, so the `#[subcrate]` modules in
+# `src/lib.rs` and the test files are compiled and checked at build time.
 build = "build.rs"
 
 [dependencies]
 # The attribute, plus `build::compile` used by `build_api.rs`; default features
 # (the `build` machinery) are needed here, unlike an ordinary consumer.
 subcrate = { path = ".." }
+# Owner dependencies that `owner.rs` hands to subcrates (`#[subcrate(::leaf)]`).
+# `leaf` depends on `leaf-base`, so that is a transitive owner dependency;
+# `leaf-base` is also listed so a subcrate can name it directly (`::leaf_base`).
+leaf = { path = "../examples/leaf" }
+leaf-base = { path = "../examples/leaf-base" }
+# A package this one renames: its code and subcrates call it `alt` (`::alt`),
+# though the package, and the crate, is `leaf-alt`.
+alt = { package = "leaf-alt", path = "../examples/leaf-alt" }
 
 [build-dependencies]
 subcrate = { path = ".." }
@@ -19,3 +27,9 @@ subcrate = { path = ".." }
 [dev-dependencies]
 subcrate-core = { path = "../core" }
 syn = "2"
+
+[features]
+# Gates the tests whose subcrate body uses `mod foo;` — non-inline modules in
+# proc-macro input are unstable (`E0658`) on stable, so those test crates are
+# empty without this. The nightly CI job enables it.
+nightly = []

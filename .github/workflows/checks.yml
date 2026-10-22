@@ -21,7 +21,7 @@ jobs:
           rustc --version
       # Exercises the `mod foo;`-inside-a-subcrate tests, which require nightly
       # (non-inline modules in proc-macro input are unstable on stable).
-      - run: cargo test -p example --features nightly
+      - run: cargo test -p subcrate-tests --features nightly
 
   fmt:
     name: Rustfmt

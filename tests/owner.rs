@@ -1,7 +1,7 @@
 //! Subcrates using their *owner's* dependencies and the owner crate itself:
 //! `#[subcrate(::leaf)]` links the crate `leaf`, a dependency of this package
 //! (`examples/leaf`, which depends on `examples/leaf-base`), and
-//! `#[subcrate(::example)]` links this package's own library.
+//! `#[subcrate(::subcrate_tests)]` links this package's own library.
 //!
 //! The build helper has Cargo build those crates into a separate target
 //! directory (the main one is locked by the build in progress) and passes them to
@@ -187,30 +187,30 @@ fn a_proc_macro_subcrate_can_use_an_owner_dependency() {
 
 // -- The owner crate -----------------------------------------------------------------
 
-// `::example` is this package's own library (`examples/example/src/lib.rs`), built
+// `::subcrate_tests` is this package's own library (`tests/src/lib.rs`), built
 // separately for the subcrate. It is only allowed outside the library itself, as
 // here in a test file.
-#[subcrate(::example)]
+#[subcrate(::subcrate_tests)]
 pub mod uses_owner {
     pub fn total() -> usize {
-        example::calculate() + 1
+        subcrate_tests::calculate() + 1
     }
 
     // The owner's own subcrates are reachable through it, and so is the macro its
     // proc-macro subcrate exports.
     pub fn from_a_subcrate() -> usize {
-        example::my_crate::calc()
+        subcrate_tests::my_crate::calc()
     }
 
     pub fn from_a_macro() -> usize {
-        example::mac!()
+        subcrate_tests::mac!()
     }
 }
 
 #[test]
 fn a_subcrate_can_use_the_owner_crate() {
     // `calculate()` is `my_crate::calc() + nested::inner::answer()`: 32 + 42.
-    assert_eq!(example::calculate(), 74);
+    assert_eq!(subcrate_tests::calculate(), 74);
     assert_eq!(uses_owner::total(), 75);
 }
 
@@ -235,10 +235,10 @@ fn a_subcrate_can_depend_on_a_subcrate_that_uses_the_owner_crate() {
 }
 
 // Both at once: the owner crate and the dependencies it was built against.
-#[subcrate(::example, ::leaf)]
+#[subcrate(::subcrate_tests, ::leaf)]
 pub mod owner_and_leaf {
     pub fn f() -> usize {
-        example::calculate() + leaf::value() as usize
+        subcrate_tests::calculate() + leaf::value() as usize
     }
 }
 
