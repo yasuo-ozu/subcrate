@@ -1,0 +1,8 @@
+[package]
+name = "trybuild-side"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+trybuild = "1"
