@@ -54,3 +54,7 @@ members = [
     "examples/leaf-alt",
     "examples/leaf-base",
 ]
+# The performance benchmark (subcrate vs. trybuild) is its own workspace: it pulls
+# in trybuild, which has a higher MSRV than this crate, so keeping it out of the
+# workspace keeps it out of the 1.56-locked `Cargo.lock` the `msrv` check uses.
+exclude = ["benchmarks"]

@@ -1,0 +1,17 @@
+[package]
+name = "subcrate-side"
+version = "0.0.0"
+edition = "2021"
+publish = false
+# The UI-test cases are compiled and checked by this build script.
+build = "build.rs"
+
+# Only the `#[subcrate]` attribute is needed in the crate itself; the build
+# machinery lives in the build-dependency below. Dropping default features here
+# keeps the heavy build helper (and its dependency tree) from being compiled a
+# second time for the target — the pattern the README recommends.
+[dependencies]
+subcrate = { path = "../..", default-features = false }
+
+[build-dependencies]
+subcrate = { path = "../.." }
