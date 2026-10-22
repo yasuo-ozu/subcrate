@@ -1,7 +1,4 @@
-# A standalone workspace, separate from the crate it benchmarks, so that
-# trybuild (and its dependency tree) never enters the main crate's
-# MSRV-locked `Cargo.lock`. Build/run it with the scripts here, not from the
-# repository root.
+# Separate workspace: keeps trybuild out of the main MSRV-locked `Cargo.lock`.
 [workspace]
 resolver = "2"
 members = ["subcrate-side", "trybuild-side"]

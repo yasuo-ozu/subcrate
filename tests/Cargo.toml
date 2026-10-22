@@ -4,21 +4,15 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.56"
 publish = false
-# `build.rs` runs `subcrate::build::compile()`, so the `#[subcrate]` modules in
-# `src/lib.rs` and the test files are compiled and checked at build time.
+# Runs `subcrate::build::compile()`, checking the `#[subcrate]` tests at build time.
 build = "build.rs"
 
 [dependencies]
-# The attribute, plus `build::compile` used by `build_api.rs`; default features
-# (the `build` machinery) are needed here, unlike an ordinary consumer.
+# Attribute + `build::compile` (build_api.rs); needs the default `build` feature.
 subcrate = { path = ".." }
-# Owner dependencies that `owner.rs` hands to subcrates (`#[subcrate(::leaf)]`).
-# `leaf` depends on `leaf-base`, so that is a transitive owner dependency;
-# `leaf-base` is also listed so a subcrate can name it directly (`::leaf_base`).
+# Owner dependencies used by owner.rs (`#[subcrate(::leaf)]`); `alt` renames `leaf-alt`.
 leaf = { path = "../examples/leaf" }
 leaf-base = { path = "../examples/leaf-base" }
-# A package this one renames: its code and subcrates call it `alt` (`::alt`),
-# though the package, and the crate, is `leaf-alt`.
 alt = { package = "leaf-alt", path = "../examples/leaf-alt" }
 
 [build-dependencies]
@@ -29,7 +23,5 @@ subcrate-core = { path = "../core" }
 syn = "2"
 
 [features]
-# Gates the tests whose subcrate body uses `mod foo;` — non-inline modules in
-# proc-macro input are unstable (`E0658`) on stable, so those test crates are
-# empty without this. The nightly CI job enables it.
+# Gates tests whose subcrate body uses `mod foo;` (unstable in proc-macro input on stable).
 nightly = []

@@ -6,5 +6,8 @@ rust-version = "1.56"
 publish = false
 description = "Test fixture: an owner dependency that itself has a dependency."
 
+[lib]
+path = "lib.rs"
+
 [dependencies]
 leaf-base = { path = "../leaf-base" }
