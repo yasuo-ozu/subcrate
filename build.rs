@@ -4100,6 +4100,28 @@ mod tests {
 
     use super::*;
 
+    // `compile()` and `Config::from_env()` must fail with a clear, actionable
+    // error — not panic — when called outside a Cargo build script (`OUT_DIR`
+    // unset). They live here, in the build-script-free `subcrate` crate: a crate
+    // whose own build script set that environment could not observe its absence.
+    #[test]
+    fn compile_outside_a_build_script_reports_a_clear_error() {
+        let error = compile().expect_err("compile() should fail without a build script");
+        assert!(
+            error.to_string().contains("build script"),
+            "error should mention the build script, got: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn config_from_env_requires_build_script_env() {
+        assert!(
+            Config::from_env().is_err(),
+            "Config::from_env() should fail without build-script environment"
+        );
+    }
+
     fn dep(alias: &str, path: &[&str]) -> Dependency {
         Dependency {
             alias: alias.to_string(),
