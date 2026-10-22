@@ -96,10 +96,10 @@ Three pieces, all required.
 
 ```toml
 [dependencies]
-subcrate = "0.1"
+subcrate = "0.2"
 
 [build-dependencies]
-subcrate = "0.1"
+subcrate = "0.2"
 ```
 
 **`build.rs`** — one required call:
