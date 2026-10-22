@@ -40,6 +40,20 @@ pub const INTERNAL_PREFIX: &str = "__subcrate_";
 ///   package depends on, or — if `name` is the package's own library — the owner
 ///   crate itself. The build helper has Cargo build it for the subcrate. It is
 ///   visible inside the subcrate under `name` (or `alias`).
+///
+/// The remaining arguments turn the subcrate into a **UI test** — a build-time
+/// assertion about the diagnostics `rustc` produces for it. Each may be given more
+/// than once, and every one must hold (they are combined with AND — e.g. two
+/// `should_error = "…"` require a matching error for *each* string):
+///
+/// * `should_error` — the subcrate must *fail* to compile. Any `should_error`
+///   makes it expected to fail, so it produces no artifact and its module expands
+///   to an empty stand-in. With `= "…"` an error's rendered text must also contain
+///   that string.
+/// * `should_warn` — the subcrate must emit at least one warning. With `= "…"` a
+///   warning's rendered text must contain that string.
+/// * `should_spanned = "…"` — some diagnostic must underline source code equal to
+///   this string once whitespace is removed from both sides. (A value is required.)
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Args {
     /// Compile the module as a `proc-macro` crate rather than an ordinary
@@ -49,6 +63,67 @@ pub struct Args {
     pub edition: Option<String>,
     /// The crates this subcrate links against, in the order written.
     pub deps: Vec<Dependency>,
+    /// The UI-test expectations (`should_error`/`should_warn`/`should_spanned`).
+    pub ui: UiExpectations,
+}
+
+impl Args {
+    /// Whether these arguments make the subcrate a UI test (any `should_*`).
+    pub fn is_ui_test(&self) -> bool {
+        self.ui.is_ui_test()
+    }
+
+    /// Whether the subcrate is expected to fail to compile (any `should_error`),
+    /// so it produces no artifact.
+    pub fn expects_error(&self) -> bool {
+        self.ui.expects_error()
+    }
+}
+
+/// A subcrate's UI-test expectations: assertions about the diagnostics `rustc`
+/// produces for it, from `#[subcrate(should_error/should_warn/should_spanned …)]`.
+///
+/// Any non-empty field makes the subcrate a UI test. Every expectation must hold
+/// — they are combined with AND.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiExpectations {
+    /// One entry per `should_error`: `Some(s)` requires an error whose rendered
+    /// text contains `s`, `None` (bare `should_error`) only that compilation
+    /// fails. A non-empty list makes the subcrate a UI test expected to fail.
+    pub should_errors: Vec<Option<String>>,
+    /// One entry per `should_warn`: `Some(s)` requires a warning whose rendered
+    /// text contains `s`, `None` (bare `should_warn`) only that some warning is
+    /// emitted.
+    pub should_warns: Vec<Option<String>>,
+    /// Code a diagnostic must underline, compared with whitespace removed.
+    pub should_spanned: Vec<String>,
+}
+
+impl UiExpectations {
+    /// Whether any expectation is set, so the subcrate is a UI test.
+    pub fn is_ui_test(&self) -> bool {
+        !self.should_errors.is_empty()
+            || !self.should_warns.is_empty()
+            || !self.should_spanned.is_empty()
+    }
+
+    /// Whether the subcrate is expected to fail to compile (any `should_error`),
+    /// so it produces no artifact.
+    pub fn expects_error(&self) -> bool {
+        !self.should_errors.is_empty()
+    }
+
+    /// A stable textual form folded into the internal crate name (see
+    /// [`Args::fingerprint`]): `S<text>` for a `Some`, `N` for a bare (`None`)
+    /// occurrence.
+    fn fingerprint(&self) -> String {
+        format!(
+            "e:{}|w:{}|s:{}",
+            fingerprint_opts(&self.should_errors),
+            fingerprint_opts(&self.should_warns),
+            self.should_spanned.join("\u{1f}"),
+        )
+    }
 }
 
 /// One dependency of a subcrate, as written in `#[subcrate(...)]`.
@@ -89,6 +164,11 @@ impl Args {
     /// their *paths* are folded in, not the depended-on crate's content: the
     /// build helper recompiles a subcrate whenever a dependency's crate name
     /// (which embeds that dependency's content hash) changes.
+    ///
+    /// The UI-test expectations are folded in too, so editing a `should_error`
+    /// (or sibling) gives a fresh crate name and re-runs the check. They do not
+    /// change what is compiled, only what the build helper asserts about the
+    /// result, but a UI test has no downstream users to churn.
     fn fingerprint(&self) -> String {
         let mut deps: Vec<String> = self
             .deps
@@ -97,12 +177,25 @@ impl Args {
             .collect();
         deps.sort();
         format!(
-            "{}|{}|{}",
+            "{}|{}|{}|{}",
             self.proc_macro,
             self.edition.as_deref().unwrap_or(""),
-            deps.join(",")
+            deps.join(","),
+            self.ui.fingerprint(),
         )
     }
+}
+
+/// A stable textual form of a `should_error`/`should_warn` list for the
+/// fingerprint: `S<text>` for `Some`, `N` for a bare (`None`) occurrence.
+fn fingerprint_opts(opts: &[Option<String>]) -> String {
+    opts.iter()
+        .map(|opt| match opt {
+            Some(text) => format!("S{}", text),
+            None => "N".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
 }
 
 impl Parse for Args {
@@ -111,10 +204,21 @@ impl Parse for Args {
         let metas = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
         for meta in metas {
             match &meta {
-                // A bare path: the `proc_macro` flag, or a dependency.
+                // A bare path: the `proc_macro` flag, a bare UI-test assertion, or
+                // a dependency.
                 Meta::Path(path) => {
                     if path.is_ident("proc_macro") {
                         args.proc_macro = true;
+                    } else if path.is_ident("should_error") {
+                        args.ui.should_errors.push(None);
+                    } else if path.is_ident("should_warn") {
+                        args.ui.should_warns.push(None);
+                    } else if path.is_ident("should_spanned") {
+                        return Err(syn::Error::new_spanned(
+                            path,
+                            "`should_spanned` needs the code to match: \
+                             `should_spanned = \"…\"`",
+                        ));
                     } else {
                         args.deps.push(parse_dependency(None, path)?);
                     }
@@ -142,6 +246,15 @@ impl Parse for Args {
                         }
                         _ if key == "proc_macro" => args.proc_macro = parse_bool(value)?,
                         _ if key == "edition" => args.edition = Some(parse_string(value)?),
+                        _ if key == "should_error" => {
+                            args.ui.should_errors.push(Some(parse_string(value)?))
+                        }
+                        _ if key == "should_warn" => {
+                            args.ui.should_warns.push(Some(parse_string(value)?))
+                        }
+                        _ if key == "should_spanned" => {
+                            args.ui.should_spanned.push(parse_string(value)?)
+                        }
                         _ => return Err(unknown_argument(path)),
                     }
                 }
@@ -155,8 +268,10 @@ impl Parse for Args {
 fn unknown_argument(path: &syn::Path) -> syn::Error {
     syn::Error::new_spanned(
         path,
-        "unknown `#[subcrate]` argument (expected `proc_macro`, `edition = \"…\"`, or a \
-         dependency: `path::to::subcrate`, `::crate_name`, or either with an `alias = `)",
+        "unknown `#[subcrate]` argument (expected `proc_macro`, `edition = \"…\"`, a \
+         dependency: `path::to::subcrate`, `::crate_name`, or either with an `alias = `, or a \
+         UI-test assertion: `should_error`, `should_warn` (each optionally `= \"…\"`), or \
+         `should_spanned = \"…\"`)",
     )
 }
 
@@ -488,5 +603,51 @@ mod tests {
             internal_crate_name("m", &Args::default(), &[], std::slice::from_ref(&raw)),
             internal_crate_name("m", &Args::default(), &[], std::slice::from_ref(&escaped)),
         );
+    }
+
+    #[test]
+    fn ui_test_args_parse_and_repeat() {
+        let args: Args = syn::parse_str(concat!(
+            r#"should_error = "cannot find", should_error = "value `x`", "#,
+            r#"should_warn = "unused", should_spanned = "x + 1""#,
+        ))
+        .unwrap();
+        assert_eq!(
+            args.ui.should_errors,
+            vec![
+                Some("cannot find".to_string()),
+                Some("value `x`".to_string())
+            ]
+        );
+        assert_eq!(args.ui.should_warns, vec![Some("unused".to_string())]);
+        assert_eq!(args.ui.should_spanned, vec!["x + 1".to_string()]);
+        assert!(args.is_ui_test());
+        assert!(args.expects_error());
+
+        let warn_only: Args = syn::parse_str(r#"should_warn = "unused variable""#).unwrap();
+        assert!(warn_only.is_ui_test());
+        assert!(!warn_only.expects_error());
+
+        // Different expectations yield different crate names (so the check re-runs).
+        let a = internal_crate_name("m", &args, &[], &[]);
+        let b = internal_crate_name("m", &warn_only, &[], &[]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn bare_should_error_and_should_warn_parse_without_a_value() {
+        let args: Args = syn::parse_str("should_error, should_warn").unwrap();
+        assert_eq!(args.ui.should_errors, vec![None]);
+        assert_eq!(args.ui.should_warns, vec![None]);
+        assert!(args.expects_error());
+
+        // Bare and valued forms mix, in any order.
+        let args: Args =
+            syn::parse_str(r#"should_warn, should_error = "boom", should_warn = "slow""#).unwrap();
+        assert_eq!(args.ui.should_errors, vec![Some("boom".to_string())]);
+        assert_eq!(args.ui.should_warns, vec![None, Some("slow".to_string())]);
+
+        // A bare `should_spanned` is rejected: it has nothing to compare.
+        assert!(syn::parse_str::<Args>("should_spanned").is_err());
     }
 }

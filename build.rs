@@ -117,6 +117,7 @@ use safegraph::graph::Graph;
 use safegraph::BTreeGraph;
 use subcrate_core::{
     internal_crate_name, is_subcrate_attr, manifest_line, parse_attr_args, Dependency, ResolvedDep,
+    UiExpectations,
 };
 use syn::{Attribute, Item, Meta};
 use template_quote::quote;
@@ -869,6 +870,7 @@ impl Config {
             proc_macro: sub.proc_macro,
             line_map,
             source_file: sub.source_file.display().to_string(),
+            ui: sub.ui.clone(),
         })))
     }
 
@@ -1123,6 +1125,26 @@ impl Config {
         }
 
         args.extend(self.extra_rustc_args.iter().cloned());
+
+        // A UI test asks rustc for machine-readable diagnostics so the build
+        // helper can check the messages and underlined spans (see `run_ui_check`).
+        // The `rendered` field of each JSON diagnostic still carries the normal
+        // human text, which is what is shown if an expectation is not met.
+        // `--color=never` keeps that text free of ANSI escapes.
+        //
+        // `--cap-lints warn` caps every lint at `warn` for the UI test only, so a
+        // `should_warn` assertion still works when the owner builds with
+        // `-D warnings` (which otherwise promotes the warning to an error and makes
+        // the subcrate fail to compile). It cannot hide a genuine compile error, so
+        // `should_error` assertions are unaffected. Non-UI subcrates keep inheriting
+        // the owner's lint flags, since a real subcrate should honour them.
+        if sub.ui.is_ui_test() {
+            args.push("--error-format=json".into());
+            args.push("--color=never".into());
+            args.push("--cap-lints".into());
+            args.push("warn".into());
+        }
+
         args
     }
 }
@@ -1418,6 +1440,10 @@ struct Subcrate {
     inner_attrs: Vec<Attribute>,
     /// The module body (its items), used as the crate root source.
     items: Vec<Item>,
+    /// UI-test expectations from `#[subcrate(should_error/warn/spanned …)]`. When
+    /// any is set the subcrate is a UI test (`ui.is_ui_test()`; see
+    /// [`run_ui_check`]).
+    ui: UiExpectations,
 }
 
 impl Subcrate {
@@ -1728,6 +1754,7 @@ impl Walker {
                 edition: args.edition,
                 inner_attrs: inner,
                 items: compiled_items,
+                ui: args.ui,
             });
         }
     }
@@ -2419,6 +2446,18 @@ struct CompileJob {
     line_map: Vec<Option<usize>>,
     /// The user's source file the diagnostics are rewritten to name.
     source_file: String,
+    /// UI-test expectations (see [`run_ui_check`]). Empty (`!ui.is_ui_test()`) for
+    /// an ordinary subcrate, which is compiled and reported the plain way.
+    ui: UiExpectations,
+}
+
+impl CompileJob {
+    /// Writes the reuse stamp, so the next build can skip this subcrate while its
+    /// inputs are unchanged. Called once a compile (or UI check) has succeeded.
+    fn write_stamp(&self) -> Result<(), String> {
+        std::fs::write(&self.stamp, &self.fingerprint)
+            .map_err(|e| format!("failed to write stamp `{}`: {}", self.stamp.display(), e))
+    }
 }
 
 /// Runs `rustc` for one prepared subcrate (on a worker thread): feeds the source
@@ -2460,6 +2499,12 @@ fn run_compile_job(job: &CompileJob) -> Result<Option<String>, String> {
         Err(e) => return Err(format!("failed to run `{}`: {}", job.rustc.display(), e)),
     };
 
+    // A UI test checks the diagnostics against its `should_*` expectations rather
+    // than passing or failing on the exit status alone.
+    if job.ui.is_ui_test() {
+        return run_ui_check(job, output.status.success(), &output.stderr);
+    }
+
     if !output.status.success() {
         // Rewrite `<anon>:L:C` to the user's real file:line before reporting.
         let stderr = remap_diagnostics(
@@ -2493,14 +2538,394 @@ fn run_compile_job(job: &CompileJob) -> Result<Option<String>, String> {
         Some(stderr.to_string())
     };
 
-    if let Err(e) = std::fs::write(&job.stamp, &job.fingerprint) {
-        return Err(format!(
-            "failed to write stamp `{}`: {}",
-            job.stamp.display(),
-            e
-        ));
-    }
+    job.write_stamp()?;
     Ok(warnings)
+}
+
+/// Verifies a UI-test subcrate's diagnostics against its `should_*` expectations.
+///
+/// `stderr` is rustc's `--error-format=json` output (one diagnostic object per
+/// line). On a pass, writes the reuse stamp and returns `Ok(None)`: a UI test's
+/// own diagnostics are consumed by the assertions, not forwarded as build
+/// warnings. On a failure, returns a message listing every unmet expectation next
+/// to what actually happened — rustc's own rendered diagnostics, with `<anon>`
+/// locations rewritten to the user's real file (see [`remap_diagnostics`]).
+fn run_ui_check(job: &CompileJob, success: bool, stderr: &[u8]) -> Result<Option<String>, String> {
+    let stderr = String::from_utf8_lossy(stderr);
+    let diags = parse_rustc_json(&stderr);
+    let problems = check_ui(
+        success,
+        &diags,
+        &job.ui.should_errors,
+        &job.ui.should_warns,
+        &job.ui.should_spanned,
+    );
+
+    if problems.is_empty() {
+        job.write_stamp()?;
+        return Ok(None);
+    }
+
+    let human = remap_diagnostics(&diags.rendered, &job.line_map, &job.source_file);
+    let mut message = format!(
+        "subcrate `{}`{} did not match its `#[subcrate(…)]` UI-test expectations:\n{}",
+        job.display_name,
+        if job.proc_macro { " (proc-macro)" } else { "" },
+        indent(&problems.join("\n")),
+    );
+    if human.trim().is_empty() {
+        message.push_str("\n\n(the subcrate compiled with no diagnostics)");
+    } else {
+        message.push_str("\n\nactual diagnostics:\n");
+        message.push_str(&indent(human.trim_end()));
+    }
+    Err(message)
+}
+
+/// Diagnostics parsed from rustc's JSON output, as [`run_ui_check`] needs them.
+struct UiDiagnostics {
+    /// The rendered (human) text of each error-level diagnostic.
+    errors: Vec<String>,
+    /// The rendered (human) text of each warning-level diagnostic.
+    warnings: Vec<String>,
+    /// The code underlined by each span (its fragments joined; see
+    /// [`collect_highlights`]).
+    highlights: Vec<String>,
+    /// Every diagnostic's rendered text joined — i.e. rustc's normal human output.
+    rendered: String,
+}
+
+/// Checks the compile's `success` and parsed `diags` against the expectations,
+/// returning the unmet ones (empty = the UI test passed).
+///
+/// Every expectation must hold (they are ANDed): each `should_error`/`should_warn`
+/// substring must appear in some error/warning diagnostic, and each `should_spanned`
+/// must match some underlined span. A substring may match any single diagnostic;
+/// different substrings need not match the same one.
+fn check_ui(
+    success: bool,
+    diags: &UiDiagnostics,
+    should_errors: &[Option<String>],
+    should_warns: &[Option<String>],
+    should_spanned: &[String],
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let expects_error = !should_errors.is_empty();
+
+    // If the compile went the wrong way, that is the whole story: the message
+    // substring and span checks below would only add misleading noise (an
+    // error-test that compiled has no errors to match, and so on). Report just the
+    // direction; `run_ui_check` appends what the compiler actually said.
+    if expects_error && success {
+        return vec![
+            "expected compilation to fail, but the subcrate compiled successfully".to_string(),
+        ];
+    }
+    if !expects_error && !success {
+        return vec![
+            "expected the subcrate to compile (only `should_warn`/`should_spanned` were given), \
+             but it failed to compile"
+                .to_string(),
+        ];
+    }
+
+    // A bare `should_error` (`None`) is satisfied by the failure already checked
+    // above; only a `Some(substring)` needs a matching error.
+    for want in should_errors.iter().flatten() {
+        if !diags.errors.iter().any(|r| r.contains(want.as_str())) {
+            problems.push(format!("no error diagnostic contained `{}`", want));
+        }
+    }
+    for want in should_warns {
+        match want {
+            Some(want) => {
+                if !diags.warnings.iter().any(|r| r.contains(want.as_str())) {
+                    problems.push(format!("no warning diagnostic contained `{}`", want));
+                }
+            }
+            // A bare `should_warn`: any warning satisfies it.
+            None => {
+                if diags.warnings.is_empty() {
+                    problems
+                        .push("expected at least one warning, but none were emitted".to_string());
+                }
+            }
+        }
+    }
+    for want in should_spanned {
+        let norm = normalize_spanned(want);
+        if !diags
+            .highlights
+            .iter()
+            .any(|h| normalize_spanned(h) == norm)
+        {
+            problems.push(format!("no diagnostic underlined code equal to `{}`", want));
+        }
+    }
+    problems
+}
+
+/// Normalizes code for a `should_spanned` comparison by removing all whitespace,
+/// so differences in spacing, indentation and line breaks between the asserted
+/// code and the underlined code do not matter.
+fn normalize_spanned(code: &str) -> String {
+    code.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Parses rustc's `--error-format=json` stderr into [`UiDiagnostics`].
+///
+/// Each non-empty line is one JSON diagnostic object; a line that does not parse
+/// as an object is skipped, so stray non-JSON output is tolerated. Only top-level
+/// diagnostics carry a non-null `rendered` field, so the error/warning text is
+/// read from there, while the underlined spans are gathered from the whole tree.
+fn parse_rustc_json(stderr: &str) -> UiDiagnostics {
+    let mut diags = UiDiagnostics {
+        errors: Vec::new(),
+        warnings: Vec::new(),
+        highlights: Vec::new(),
+        rendered: String::new(),
+    };
+    for line in stderr.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value = match parse_json(line) {
+            Some(value) => value,
+            None => continue,
+        };
+        let level = value.get("level").and_then(Json::as_str).unwrap_or("");
+        if let Some(rendered) = value.get("rendered").and_then(Json::as_str) {
+            if !diags.rendered.is_empty() {
+                diags.rendered.push('\n');
+            }
+            diags.rendered.push_str(rendered);
+            if level.starts_with("error") {
+                diags.errors.push(rendered.to_string());
+            } else if level.starts_with("warning") {
+                diags.warnings.push(rendered.to_string());
+            }
+        }
+        collect_highlights(&value, &mut diags.highlights);
+    }
+    diags
+}
+
+/// Walks a parsed diagnostic and collects the code underlined by each span.
+///
+/// A span records its underlined source as a `"text"` array of
+/// `{ "text": <source line>, "highlight_start": c, "highlight_end": c }` fragments;
+/// one span's highlighted code is its fragments' `[highlight_start, highlight_end)`
+/// slices (1-based columns) joined. Recurses through `children` and `spans` so a
+/// note's or suggestion's underline is collected too.
+fn collect_highlights(value: &Json, out: &mut Vec<String>) {
+    match value {
+        Json::Obj(fields) => {
+            if let Some(Json::Arr(texts)) = value.get("text") {
+                let mut fragment = String::new();
+                let mut any = false;
+                for text in texts {
+                    let line = text.get("text").and_then(Json::as_str);
+                    let start = text.get("highlight_start").and_then(Json::as_num);
+                    let end = text.get("highlight_end").and_then(Json::as_num);
+                    if let (Some(line), Some(start), Some(end)) = (line, start, end) {
+                        let start = (start as usize).saturating_sub(1);
+                        let end = (end as usize).saturating_sub(1);
+                        if end > start {
+                            fragment.extend(line.chars().skip(start).take(end - start));
+                            any = true;
+                        }
+                    }
+                }
+                if any {
+                    out.push(fragment);
+                }
+            }
+            for (_, child) in fields {
+                collect_highlights(child, out);
+            }
+        }
+        Json::Arr(items) => {
+            for item in items {
+                collect_highlights(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A parsed JSON value — just enough of the data model for rustc's diagnostics.
+/// `true`, `false` and `null` all parse to [`Json::Lit`]: this parser never reads
+/// a boolean or null value, only skips past it to reach the fields it wants.
+enum Json {
+    Lit,
+    Num(f64),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+impl Json {
+    /// The value of object field `key`, if this is an object that has it.
+    fn get(&self, key: &str) -> Option<&Json> {
+        match self {
+            Json::Obj(fields) => fields.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Json::Str(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn as_num(&self) -> Option<f64> {
+        match self {
+            Json::Num(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+/// Parses a single JSON value from `input`, or `None` on malformed input or if
+/// anything but whitespace follows the value. A small hand-written parser keeps
+/// the dependency surface (and MSRV) small; the input is one rustc diagnostic.
+fn parse_json(input: &str) -> Option<Json> {
+    let mut parser = JsonParser {
+        bytes: input.as_bytes(),
+        pos: 0,
+    };
+    parser.skip_ws();
+    let value = parser.value()?;
+    parser.skip_ws();
+    if parser.pos == parser.bytes.len() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl JsonParser<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn bump(&mut self) -> Option<u8> {
+        let b = self.peek()?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(
+            self.peek(),
+            Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        ) {
+            self.pos += 1;
+        }
+    }
+
+    fn value(&mut self) -> Option<Json> {
+        self.skip_ws();
+        match self.peek()? {
+            b'{' => self.object(),
+            b'[' => self.array(),
+            b'"' => self.string().map(Json::Str),
+            b't' => self.literal("true", Json::Lit),
+            b'f' => self.literal("false", Json::Lit),
+            b'n' => self.literal("null", Json::Lit),
+            _ => self.number(),
+        }
+    }
+
+    fn literal(&mut self, word: &str, value: Json) -> Option<Json> {
+        if self.bytes[self.pos..].starts_with(word.as_bytes()) {
+            self.pos += word.len();
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    fn object(&mut self) -> Option<Json> {
+        self.bump(); // '{'
+        let mut fields = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.bump();
+            return Some(Json::Obj(fields));
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return None;
+            }
+            let key = self.string()?;
+            self.skip_ws();
+            if self.bump() != Some(b':') {
+                return None;
+            }
+            let value = self.value()?;
+            fields.push((key, value));
+            self.skip_ws();
+            match self.bump()? {
+                b',' => continue,
+                b'}' => return Some(Json::Obj(fields)),
+                _ => return None,
+            }
+        }
+    }
+
+    fn array(&mut self) -> Option<Json> {
+        self.bump(); // '['
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.bump();
+            return Some(Json::Arr(items));
+        }
+        loop {
+            let value = self.value()?;
+            items.push(value);
+            self.skip_ws();
+            match self.bump()? {
+                b',' => continue,
+                b']' => return Some(Json::Arr(items)),
+                _ => return None,
+            }
+        }
+    }
+
+    /// Reads a string starting at the opening quote, decoding escapes via the
+    /// shared [`json_string`] reader and advancing past the closing quote.
+    fn string(&mut self) -> Option<String> {
+        if self.bump() != Some(b'"') {
+            return None;
+        }
+        let rest = std::str::from_utf8(&self.bytes[self.pos..]).ok()?;
+        let (value, after) = json_string(rest)?;
+        self.pos += rest.len() - after.len();
+        Some(value)
+    }
+
+    fn number(&mut self) -> Option<Json> {
+        let start = self.pos;
+        while matches!(
+            self.peek(),
+            Some(b'0'..=b'9') | Some(b'-') | Some(b'+') | Some(b'.') | Some(b'e') | Some(b'E')
+        ) {
+            self.pos += 1;
+        }
+        let text = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
+        text.parse::<f64>().ok().map(Json::Num)
+    }
 }
 
 /// Reads the package's edition from `Cargo.toml`, following
@@ -3700,6 +4125,7 @@ mod tests {
             edition: None,
             inner_attrs: Vec::new(),
             items: Vec::new(),
+            ui: UiExpectations::default(),
         }
     }
 
@@ -5447,6 +5873,216 @@ path = \"ignored\"
         assert!(json_string_array_field(r#"{"f":1}"#, "g").is_empty());
         // An unterminated string is not a value.
         assert_eq!(json_string(r#"abc"#), None);
+    }
+
+    // --- UI testing (`should_error` / `should_warn` / `should_spanned`) ---
+
+    #[test]
+    fn json_parses_nested_objects_and_escapes() {
+        let value = parse_json(
+            r#"{ "level": "error", "n": 12, "ok": true, "none": null,
+               "nested": {"text": "a\"b\n"}, "arr": [1, "x", false] }"#,
+        )
+        .unwrap();
+        assert_eq!(value.get("level").and_then(Json::as_str), Some("error"));
+        assert_eq!(value.get("n").and_then(Json::as_num), Some(12.0));
+        assert_eq!(
+            value
+                .get("nested")
+                .and_then(|n| n.get("text"))
+                .and_then(Json::as_str),
+            Some("a\"b\n")
+        );
+        assert!(matches!(value.get("arr"), Some(Json::Arr(items)) if items.len() == 3));
+        // Malformed input yields None rather than a panic.
+        assert!(parse_json(r#"{"a":}"#).is_none());
+        assert!(parse_json(r#"{"a":1"#).is_none());
+        assert!(parse_json("not json").is_none());
+    }
+
+    #[test]
+    fn highlights_are_the_underlined_columns_joined() {
+        // One span, one line: columns [16, 19) of the line are `"x"`.
+        let span = parse_json(
+            r#"{"text":[{"text":"fn f() -> u8 { \"x\" }","highlight_start":16,"highlight_end":19}]}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        collect_highlights(&span, &mut out);
+        assert_eq!(out, ["\"x\""]);
+
+        // A multi-line span joins each line's underlined slice.
+        let span = parse_json(concat!(
+            r#"{"text":[{"text":"foo(","highlight_start":1,"highlight_end":5},"#,
+            r#"{"text":"  bar)","highlight_start":1,"highlight_end":7}]}"#,
+        ))
+        .unwrap();
+        let mut out = Vec::new();
+        collect_highlights(&span, &mut out);
+        assert_eq!(out, ["foo(  bar)"]);
+
+        // A zero-width span (highlight_end == highlight_start) underlines nothing.
+        let span = parse_json(r#"{"text":[{"text":"abc","highlight_start":2,"highlight_end":2}]}"#)
+            .unwrap();
+        let mut out = Vec::new();
+        collect_highlights(&span, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn spanned_normalization_ignores_whitespace() {
+        assert_eq!(normalize_spanned("x + 1"), "x+1");
+        assert_eq!(normalize_spanned("  a\n\tb "), "ab");
+        assert_eq!(normalize_spanned("x + 1"), normalize_spanned("x+1"));
+    }
+
+    /// A realistic one-line rustc error diagnostic (`--error-format=json`).
+    const ERROR_JSON: &str = concat!(
+        r#"{"message":"mismatched types","code":{"code":"E0308"},"level":"error","#,
+        r#""spans":[{"file_name":"<anon>","line_start":1,"column_start":16,"column_end":19,"#,
+        r#""is_primary":true,"text":[{"text":"fn f() -> u8 { \"x\" }","highlight_start":16,"#,
+        r#""highlight_end":19}],"label":"expected `u8`, found `&str`"}],"children":[],"#,
+        r#""rendered":"error[E0308]: mismatched types\n --> <anon>:1:16\n"}"#,
+    );
+
+    /// A realistic one-line rustc warning diagnostic.
+    const WARN_JSON: &str = concat!(
+        r#"{"message":"unused variable: `x`","code":{"code":"unused_variables"},"#,
+        r#""level":"warning","spans":[{"file_name":"<anon>","line_start":1,"column_start":14,"#,
+        r#""column_end":15,"is_primary":true,"text":[{"text":"fn f() { let x = 5; }","#,
+        r#""highlight_start":14,"highlight_end":15}],"label":null}],"children":[],"#,
+        r#""rendered":"warning: unused variable: `x`\n --> <anon>:1:14\n"}"#,
+    );
+
+    #[test]
+    fn rustc_json_is_split_into_errors_warnings_and_highlights() {
+        let diags = parse_rustc_json(&format!("{}\n{}\n", ERROR_JSON, WARN_JSON));
+        assert_eq!(diags.errors.len(), 1);
+        assert!(diags.errors[0].contains("mismatched types"));
+        assert_eq!(diags.warnings.len(), 1);
+        assert!(diags.warnings[0].contains("unused variable"));
+        assert!(diags.highlights.contains(&"\"x\"".to_string()));
+        assert!(diags.highlights.contains(&"x".to_string()));
+        assert!(diags.rendered.contains("error[E0308]"));
+        assert!(diags.rendered.contains("warning: unused variable"));
+    }
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn opt_strs(items: &[&str]) -> Vec<Option<String>> {
+        items.iter().map(|s| Some(s.to_string())).collect()
+    }
+
+    #[test]
+    fn error_test_passes_when_the_expected_error_and_span_appear() {
+        let diags = parse_rustc_json(ERROR_JSON);
+        // Compilation failed (success = false) with the expected error and span.
+        let problems = check_ui(
+            false,
+            &diags,
+            &opt_strs(&["mismatched types"]),
+            &[],
+            &strs(&["\"x\""]),
+        );
+        assert!(problems.is_empty(), "{:?}", problems);
+    }
+
+    #[test]
+    fn error_test_fails_when_compilation_unexpectedly_succeeds() {
+        let diags = parse_rustc_json("");
+        let problems = check_ui(true, &diags, &opt_strs(&["mismatched types"]), &[], &[]);
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("expected compilation to fail")));
+    }
+
+    #[test]
+    fn error_test_fails_when_the_message_or_span_is_absent() {
+        let diags = parse_rustc_json(ERROR_JSON);
+        let problems = check_ui(
+            false,
+            &diags,
+            &opt_strs(&["some other error"]),
+            &[],
+            &strs(&["not underlined"]),
+        );
+        assert!(problems.iter().any(|p| p.contains("some other error")));
+        assert!(problems.iter().any(|p| p.contains("not underlined")));
+    }
+
+    #[test]
+    fn multiple_non_bare_expectations_are_anded() {
+        let diags = parse_rustc_json(ERROR_JSON);
+        // Both substrings are present (in the one error) → all hold → pass.
+        assert!(check_ui(
+            false,
+            &diags,
+            &opt_strs(&["mismatched types", "E0308"]),
+            &[],
+            &[]
+        )
+        .is_empty());
+        // One present, one absent → AND fails (it is not OR, which would pass here).
+        let problems = check_ui(
+            false,
+            &diags,
+            &opt_strs(&["mismatched types", "nowhere in the output"]),
+            &[],
+            &[],
+        );
+        assert!(problems.iter().any(|p| p.contains("nowhere in the output")));
+        assert!(!problems.iter().any(|p| p.contains("mismatched types")));
+    }
+
+    #[test]
+    fn warn_test_passes_on_a_clean_compile_with_the_expected_warning() {
+        let diags = parse_rustc_json(WARN_JSON);
+        // No `should_error`, compilation succeeded (success = true).
+        let problems = check_ui(
+            true,
+            &diags,
+            &[],
+            &opt_strs(&["unused variable"]),
+            // The span is written with different spacing; normalization matches it.
+            &strs(&[" x "]),
+        );
+        assert!(problems.is_empty(), "{:?}", problems);
+    }
+
+    #[test]
+    fn bare_should_error_asserts_only_that_compilation_fails() {
+        // Bare `should_error` (no substring): a failed compile passes...
+        let diags = parse_rustc_json(ERROR_JSON);
+        assert!(check_ui(false, &diags, &[None], &[], &[]).is_empty());
+        // ...and a successful compile fails the direction check.
+        let empty = parse_rustc_json("");
+        let problems = check_ui(true, &empty, &[None], &[], &[]);
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("expected compilation to fail")));
+    }
+
+    #[test]
+    fn bare_should_warn_requires_any_warning() {
+        // Bare `should_warn`: a clean compile with a warning passes...
+        let warn = parse_rustc_json(WARN_JSON);
+        assert!(check_ui(true, &warn, &[], &[None], &[]).is_empty());
+        // ...but a clean compile with no warnings does not.
+        let clean = parse_rustc_json("");
+        let problems = check_ui(true, &clean, &[], &[None], &[]);
+        assert!(problems.iter().any(|p| p.contains("at least one warning")));
+    }
+
+    #[test]
+    fn warn_test_fails_when_compilation_unexpectedly_fails() {
+        let diags = parse_rustc_json(ERROR_JSON);
+        // A warn-test (no `should_error`) whose subcrate failed to compile.
+        let problems = check_ui(false, &diags, &[], &opt_strs(&["unused variable"]), &[]);
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("expected the subcrate to compile")));
     }
 
     #[test]

@@ -62,6 +62,18 @@ fn expand(args: Args, item_mod: ItemMod) -> syn::Result<proc_macro2::TokenStream
         }
     };
 
+    // A UI error-test (`#[subcrate(should_error = "…")]`) is expected to fail to
+    // compile, so the build helper produced no artifact to bind. If the build got
+    // far enough to run this macro, the expectation held (otherwise the build
+    // helper would have failed the build). Expand to an empty module that keeps the
+    // name, visibility and outer attributes in place.
+    if args.expects_error() {
+        return Ok(quote! {
+            #(#outer_attrs)*
+            #vis mod #ident {}
+        });
+    }
+
     let internal_ident = Ident::new(&internal, Span::call_site());
 
     // Build (`cfg(not(doc))`): bind the name to the real, separately compiled
