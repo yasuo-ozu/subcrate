@@ -49,6 +49,19 @@
 //! Cargo resolve the same versions and features as the outer build, so a type
 //! from, say, `serde` means the same thing in the subcrate and in the owner.
 //!
+//! The owner itself (`-p <this package>`) joins that selection whenever a subcrate
+//! uses the owner crate, and whenever it uses a dependency given by **path** — one
+//! that might be a member of the same workspace. Under resolver 2, `cargo build -p
+//! <dep>` resolves features for the selected packages alone, so for a workspace
+//! member it would leave the owner out and drop any feature only the owner's graph
+//! turns on (its build-dependencies — this crate enables `proc-macro2/span-locations`
+//! — or, under `cargo test`, its dev-dependencies). The member would then be built
+//! with a different hash than the main build's copy, and a type would not match
+//! across the subcrate boundary (E0277). Selecting the owner unifies the two. A
+//! registry dependency is never a member and is already resolved in the owner's
+//! context, so it is not selected; a path dependency that turns out not to be a
+//! member only costs a second build of the owner's library, never correctness.
+//!
 //! That directory, `subcrate-owner-deps/<package>/<compiler>`, is shared by every
 //! configuration of the package (each has its own `OUT_DIR`), so the crates are
 //! built once. It would otherwise duplicate the owner's dependency chain already in
@@ -75,13 +88,28 @@
 //! (Cargo pipelines compilation, so an rlib alone is only a metadata stub), with
 //! `-L` for the directories holding them — the same copies the package itself links
 //! against under `cargo build`/`test`. (`cargo check` and clippy build other
-//! copies; see the limitations below.)
+//! copies; see the limitations below.) A library crate is bound with `pub extern
+//! crate`, so a subcrate can re-export it (`pub use <alias>;`); a proc-macro crate,
+//! which may export only its macros, is bound privately.
 //!
-//! Using the owner crate builds the package's library a second time, re-running
-//! this build script with `SUBCRATE_NESTED` set so it compiles only the library's
-//! subcrates and starts no further owner build. A subcrate in the library can't use
-//! the owner crate (it would depend on itself); ones in `tests/`, `src/main.rs`,
-//! `src/bin/`, `examples/` and `benches/` can.
+//! Selecting the owner re-runs this build script inside that nested build, with
+//! `SUBCRATE_NESTED` set. There are two reasons the owner is selected, handled
+//! differently:
+//!
+//! - **Only to unify a path dependency's features.** The owner's library is not
+//!   wanted — just the dependency, built with the owner in the resolution — so the
+//!   re-run does nothing, the throwaway library fails harmlessly at the
+//!   `#[subcrate]` macro, and the dependency is read back from this `cargo build`'s
+//!   JSON (exact path, resolved features, conflicts detected), not reconstructed
+//!   from the file system.
+//! - **Because a subcrate uses the owner crate (`::owner`).** The owner's library
+//!   must compile, so the re-run compiles its subcrates and links *their* owner
+//!   dependencies against the copies the enclosing build already placed under its
+//!   profile directory, rather than starting a further nested build — one without
+//!   the owner would undo the feature unification, one with it would not terminate.
+//!
+//! A subcrate in the library can't use the owner crate (it would depend on itself);
+//! ones in `tests/`, `src/main.rs`, `src/bin/`, `examples/` and `benches/` can.
 //!
 //! # Limitations of `::name`
 //!
@@ -100,9 +128,27 @@
 //! - Under `cargo check` and clippy the dependency copies differ from
 //!   `cargo build`'s, so a value of such a type crosses the subcrate boundary under
 //!   `cargo build`/`test` but not under `cargo check`.
+//! - A workspace member linked by `::name` is matched to the copy the owner's own
+//!   build produces (the owner joins the nested selection, above). That is the main
+//!   build's copy when the owner's graph alone sets the member's features — building
+//!   the owner, or the whole workspace when no *other* member adds to that member's
+//!   graph. If a sibling member turns on a feature in the member's graph that the
+//!   owner's does not, a whole-workspace `cargo build` unifies it into the member
+//!   while the nested build (owner plus the member) does not, and the copies differ
+//!   again. Building the owner package on its own avoids this.
 //! - If two versions of a crate (or two same-name, same-version crates from
 //!   different sources) can't be told apart, the lock file can't say which `::name`
 //!   means, and the build errors.
+//! - When Cargo builds one `::name` twice with incompatible features (resolver 2,
+//!   the normal and build/proc-macro graphs disagree), linking it is an error. This
+//!   is reported clearly everywhere except one corner: a subcrate in the owner's
+//!   *library* that links such a crate while *another* subcrate uses the owner crate
+//!   (`::owner`). The owner's library is then recompiled in the nested build, where
+//!   that library's own dependencies are matched from disk rather than from Cargo's
+//!   feature metadata, so the (unavoidable) failure can surface as the nested
+//!   build's diagnostic instead of the clearer "built more than once with
+//!   incompatible features" message. Without a `::owner` in the package, the
+//!   dependency is read from Cargo's JSON and the clear message is kept.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsString;
@@ -180,6 +226,11 @@ pub struct Config {
     /// Whether this build script runs inside the nested Cargo build of another
     /// `subcrate` build script (`SUBCRATE_NESTED` is set).
     nested: bool,
+    /// Whether that nested build selected the owner only to unify a path
+    /// dependency's features (`SUBCRATE_HARVEST_ONLY` is set): the owner's own
+    /// library need not compile here, so this run does nothing and lets it fail
+    /// harmlessly. See [`build_owner_deps`](Self::build_owner_deps).
+    harvest_only: bool,
     /// An opt-in key that replaces the package name in the nested owner-dependency
     /// target directory, so the packages of a workspace can share one such build
     /// instead of each rebuilding the owner's dependencies (`SUBCRATE_OWNER_DEPS_KEY`,
@@ -193,6 +244,11 @@ pub struct Config {
 /// Environment variable set on the nested Cargo build of the owner's
 /// dependencies, so a `subcrate` build script running inside it can tell.
 const NESTED_ENV: &str = "SUBCRATE_NESTED";
+
+/// Environment variable set on the nested build when the owner was selected only to
+/// unify a path dependency's features, so the re-entered build script knows its
+/// owner library is throwaway and does nothing. See [`Config::build_owner_deps`].
+const HARVEST_ONLY_ENV: &str = "SUBCRATE_HARVEST_ONLY";
 
 impl Config {
     /// Builds a [`Config`] from the environment variables Cargo sets for build
@@ -209,6 +265,7 @@ impl Config {
         let cargo = PathBuf::from(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
         let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
         let nested = std::env::var_os(NESTED_ENV).is_some();
+        let harvest_only = std::env::var_os(HARVEST_ONLY_ENV).is_some();
 
         let target = std::env::var("TARGET").ok();
         let host = std::env::var("HOST").ok();
@@ -247,6 +304,7 @@ impl Config {
             package,
             profile,
             nested,
+            harvest_only,
             owner_deps_key,
             owner_deps: OwnerDeps::default(),
         })
@@ -283,6 +341,16 @@ impl Config {
 
     /// Runs discovery and compilation, emitting the necessary Cargo directives.
     pub fn run(mut self) -> Result<(), Error> {
+        // This run is the owner's library being compiled inside a nested build that
+        // selected the owner only to unify a path dependency's features. That copy
+        // of the library is thrown away — the enclosing build harvests the
+        // dependency from Cargo's JSON, not from here — so do nothing. Emitting no
+        // manifest makes the library's `#[subcrate]` macro fail, which is expected
+        // and ignored. See [`build_owner_deps`](Self::build_owner_deps).
+        if self.harvest_only {
+            return Ok(());
+        }
+
         let subcrates_dir = self.out_dir.join("subcrates");
         std::fs::create_dir_all(&subcrates_dir)?;
 
@@ -573,8 +641,11 @@ impl Config {
             .unwrap_or_default();
         let mut packages: Vec<String> = Vec::new();
         let mut crates: BTreeMap<String, ExternalCrate> = BTreeMap::new();
+        let mut links_local_dep = false;
         for (name, user) in &externals {
-            let package = find_declared(&declared, name).map(|dep| self.declared(dep));
+            let declared_dep = find_declared(&declared, name);
+            links_local_dep |= declared_dep.map_or(false, |dep| self.is_local_dep(dep));
+            let package = declared_dep.map(|dep| self.declared(dep));
             let resolved =
                 owner_package(name, package.as_ref(), locked.as_deref()).map_err(|reason| {
                     Error::new(format!(
@@ -594,9 +665,47 @@ impl Config {
                 },
             );
         }
-        if owner_user.is_some() {
+        // A nested run that reaches here is building the owner's library because a
+        // subcrate uses the *owner crate* (`::owner`): the harvest-only nested build,
+        // which selects the owner merely to unify a dependency's features, returned
+        // from `run` before this. The enclosing build already compiled every crate
+        // this library's subcrates need — with the owner's feature unification, so
+        // the copies match the main build — into its own deps directory, this run's
+        // `main_profile_dir()`. Link those rather than launch another nested build:
+        // one selecting the dependency without the owner would bring back the
+        // mismatched hash, and one selecting the owner again would recurse forever.
+        if self.nested {
+            return self.owner_deps_from_enclosing(&crates);
+        }
+
+        // Put the owner package itself in the nested selection when a dependency it
+        // links is given by path, and so might be a member of the same workspace.
+        // Under resolver 2, `cargo build -p <dep>` resolves features for the selected
+        // packages alone. For a workspace member that leaves the owner out of the
+        // resolution, dropping any feature only the owner's graph turns on — its
+        // build-dependencies (`subcrate` enables `proc-macro2/span-locations`), or
+        // under `cargo test` its dev-dependencies. The member is then built with a
+        // different feature set, and so a different metadata hash, than the main
+        // build's copy, and a type crossing the subcrate boundary does not match it
+        // (E0277, "there are multiple different versions of crate `…`"). Selecting
+        // the owner too unifies features across both, so the member gets the main
+        // build's copy. A registry dependency is never a member and is already
+        // resolved with the owner's graph, so it is left alone; keying on `path`
+        // rather than true membership may still include a path dependency that is not
+        // a member, which only costs the harvest below for nothing — never wrong.
+        if (owner_user.is_some() || links_local_dep) && !packages.contains(&self.package) {
             packages.push(self.package.clone());
         }
+
+        // When the owner is in the selection *only* for that feature unification —
+        // no subcrate uses the owner crate itself — its own library need not compile
+        // here. Tell the nested run so (it then does nothing and the library fails
+        // harmlessly at the `#[subcrate]` macro); the dependency is read back from
+        // this build's JSON below, with its copy and features decided by Cargo's
+        // resolution rather than guessed from the file system. With `::owner` in play
+        // the library must build, so this stays off and the re-entry links the
+        // copies from disk (`owner_deps_from_enclosing`, above).
+        let harvest_only = links_local_dep && owner_user.is_none();
 
         let target_dir = self.owner_deps_target_dir();
         let args = self.cargo_args(&packages, &target_dir);
@@ -605,6 +714,9 @@ impl Config {
             .current_dir(&self.manifest_dir)
             .env(NESTED_ENV, "1")
             .stdin(Stdio::null());
+        if harvest_only {
+            cmd.env(HARVEST_ONLY_ENV, "1");
+        }
         // Cargo sets these for *this* build script only. Left in place they would
         // leak into the build scripts of the packages built below, which then
         // see this package's features and cfgs as their own.
@@ -624,7 +736,16 @@ impl Config {
                 e
             ))
         })?;
-        if !output.status.success() {
+        let mut deps = parse_artifacts(&String::from_utf8_lossy(&output.stdout));
+        // A harvest-only build deliberately leaves the owner's own library
+        // uncompiled, so Cargo exits non-zero; that is expected as long as every
+        // crate the subcrates link was built (each is reported before the owner's
+        // library, which depends on it, so it is in the output here). Any other
+        // failure — or a dependency that genuinely did not build — is a real error.
+        let all_built = crates
+            .values()
+            .all(|external| deps.crates.contains_key(&external.crate_name));
+        if !output.status.success() && !(harvest_only && all_built) {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let args: Vec<String> = args
                 .iter()
@@ -658,7 +779,6 @@ impl Config {
             dedup_against_main(&target_dir, &main);
         }
 
-        let mut deps = parse_artifacts(&String::from_utf8_lossy(&output.stdout));
         deps.externals = crates;
         // Rebuild the subcrates when the crates they link against change. Cargo
         // does not rerun this build script for that on its own: it only watches
@@ -672,6 +792,100 @@ impl Config {
             rerun_if_changed(path);
         }
         Ok(deps)
+    }
+
+    /// Links the owner dependencies of a *nested* run against the copies the
+    /// enclosing owner-dependency build already placed under this run's profile
+    /// directory (`main_profile_dir()`), instead of building them again.
+    ///
+    /// This is the `::owner` path: a subcrate uses the owner crate, so the owner's
+    /// library must compile here and its own library subcrates need their owner
+    /// dependencies. (A run selected only to unify a path dependency's features
+    /// returns earlier from [`run`](Self::run) without reaching this.)
+    ///
+    /// The enclosing build selects both the dependency and the owner
+    /// (see [`build_owner_deps`](Self::build_owner_deps)), so every crate here was
+    /// compiled with the owner's feature unification — the same copies the owner's
+    /// own library, built in that same enclosing pass, links against. Reusing them
+    /// is what keeps a type consistent across the subcrate boundary; building fresh
+    /// copies here is exactly what used to reintroduce the mismatch.
+    ///
+    /// The copies are found by scanning the profile tree rather than a fixed `deps/`,
+    /// because Cargo's layout varies — a stable toolchain writes
+    /// `deps/lib<crate>-<hash>.rlib`, a recent nightly `build/<pkg>/<hash>/out/…`.
+    ///
+    /// `crates` maps each `::name` to the library crate it stands for.
+    fn owner_deps_from_enclosing(
+        &self,
+        crates: &BTreeMap<String, ExternalCrate>,
+    ) -> Result<OwnerDeps, Error> {
+        let base = self.main_profile_dir().ok_or_else(|| {
+            Error::new(
+                "a subcrate's owner dependency is built as part of the owner's own library, \
+                 but the build directory could not be located to link it"
+                    .to_string(),
+            )
+        })?;
+        // The enclosing build compiles these crates as selected packages, so Cargo
+        // schedules them before the owner's build script (this run). Poll briefly:
+        // under parallelism an artifact may not be flushed the instant we look, and
+        // it is then being compiled on another job, so the wait is bounded by that
+        // compile, never a deadlock.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (rlibs, dirs) = loop {
+            let (rlibs, dirs) = scan_build_artifacts(&base);
+            let missing = crates
+                .values()
+                .map(|external| external.crate_name.as_str())
+                .find(|name| !rlibs.contains_key(*name));
+            match missing {
+                None => break (rlibs, dirs),
+                Some(name) if Instant::now() >= deadline => {
+                    return Err(Error::new(format!(
+                        "could not find the owner dependency `{}` under `{}`: it is linked from \
+                         the copy the enclosing build compiles, which was expected there",
+                        name,
+                        base.display()
+                    )));
+                }
+                Some(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        let mut deps = OwnerDeps {
+            externals: crates.clone(),
+            lib_dirs: dirs,
+            ..OwnerDeps::default()
+        };
+        for external in crates.values() {
+            let rlib = rlibs[&external.crate_name].clone();
+            let rmeta = rlib.with_extension("rmeta");
+            let krate = OwnerCrate {
+                rmeta: rmeta.is_file().then(|| rmeta),
+                rlib: Some(rlib),
+                features: Vec::new(),
+                conflict: None,
+            };
+            deps.crates
+                .insert(external.crate_name.clone(), krate.clone());
+            if let Some(version) = &external.version {
+                deps.versions
+                    .insert((external.crate_name.clone(), version.clone()), krate);
+            }
+        }
+        Ok(deps)
+    }
+
+    /// Whether a declared dependency is given by path — directly, or inherited from
+    /// the workspace — and so may be a member of this package's workspace, the case
+    /// that needs the owner in the nested selection (see
+    /// [`build_owner_deps`](Self::build_owner_deps)). A registry dependency never is.
+    fn is_local_dep(&self, dep: &DeclaredDep) -> bool {
+        if dep.path.is_some() {
+            return true;
+        }
+        dep.workspace
+            && workspace_dependency(&self.manifest_dir, &dep.key)
+                .map_or(false, |inherited| inherited.path.is_some())
     }
 
     /// What the manifest says a declared dependency `dep` is. The real package is
@@ -813,8 +1027,13 @@ impl Config {
         let args = self.rustc_args(sub, deps, out_dir);
         // `mappable` off for a body inlined from several files (`mod foo;`): its
         // tokens span more than `source_file`, so leave diagnostics as `<anon>`.
-        let (source, line_map) =
-            render_source(&sub.inner_attrs, deps, &sub.items, !sub.inlined_files);
+        let (source, line_map) = render_source(
+            &sub.inner_attrs,
+            deps,
+            &sub.items,
+            !sub.inlined_files,
+            sub.proc_macro,
+        );
 
         // Reuse decision. The crate *name* is already a hash of the body as
         // written. The stamp records more: the exact `rustc` configuration, and
@@ -2236,13 +2455,14 @@ fn path_attr_value(attr: &Attribute) -> Option<String> {
 /// attributes first (they must lead the crate root), then the import of each
 /// linked dependency under its alias, then the items.
 ///
-/// The import is `extern crate <internal name> as <alias>;`. This binds `alias`
-/// into the subcrate's *extern prelude* (on every edition), so the body can reach
-/// the dependency as `::<alias>` and re-export it with `pub use <alias>::…;`, not
-/// just as a plain `use` alias. It is an injected render-time detail and is not
-/// part of the subcrate's content-addressed name (the dependency *list* in the
-/// arguments is). It sits at the crate root, so nested modules reach the alias as
-/// `crate::<alias>` or `super::<alias>`.
+/// The import is `pub extern crate <internal name> as <alias>;`. This binds
+/// `alias` into the subcrate's *extern prelude* (on every edition), so the body can
+/// reach the dependency as `::<alias>` and, because it is `pub`, re-export the crate
+/// itself with `pub use <alias>;` (a private `extern crate` cannot be re-exported —
+/// E0365) as well as its items with `pub use <alias>::…;`. It is an injected
+/// render-time detail and is not part of the subcrate's content-addressed name (the
+/// dependency *list* in the arguments is). It sits at the crate root, so nested
+/// modules reach the alias as `crate::<alias>` or `super::<alias>`.
 /// Renders a subcrate's source, and a map from each generated line (1-based) to
 /// the original source line it came from — used to rewrite `rustc`'s `<anon>:L:C`
 /// diagnostics to the user's real file and line. The map is empty (so diagnostics
@@ -2254,14 +2474,22 @@ fn render_source(
     deps: &[ExternDep],
     items: &[Item],
     mappable: bool,
+    proc_macro: bool,
 ) -> (String, Vec<Option<usize>>) {
     let attrs = quote! { #(#inner_attrs)* }.to_string();
     let mut imports = String::new();
     for dep in deps {
-        // `unused_extern_crates` is allowed: a dependency need not be used.
+        // `pub` (for a library) so the body can re-export the dependency
+        // (`pub use <alias>;`): a plain `extern crate` is private, and re-exporting
+        // a private one is an error (E0365). It only makes the alias re-exportable;
+        // the body still has to opt in. A proc-macro crate may export nothing but
+        // its macros, so there the `extern crate` stays private (re-export would be
+        // both impossible and pointless). `unused_extern_crates` is allowed: a
+        // dependency need not be used.
+        let vis = if proc_macro { "" } else { "pub " };
         imports.push_str(&format!(
-            "#[allow(unused_extern_crates)] extern crate {} as {};\n",
-            dep.internal, dep.alias
+            "#[allow(unused_extern_crates)] {}extern crate {} as {};\n",
+            vis, dep.internal, dep.alias
         ));
     }
     let items = quote! { #(#items)* };
@@ -3530,6 +3758,85 @@ struct ExternalCrate {
     version: Option<String>,
 }
 
+/// Scans the build-output tree under `base` for library artifacts, for a nested run
+/// reusing the enclosing build's copies (see [`Config::owner_deps_from_enclosing`]).
+/// Returns the newest `lib<crate>-<hash>.rlib` by crate name, and every directory
+/// holding an artifact (the `-L` search paths for those crates' own dependencies).
+///
+/// It walks rather than reads one fixed directory because Cargo's layout varies: a
+/// stable toolchain puts a crate's own file in `deps/lib<crate>-<hash>.rlib`, a
+/// recent nightly under `build/<pkg>/<hash>/out/`. The crate name runs up to the
+/// last `-` (a crate name has no `-`, a hash is hex); should several builds of one
+/// crate be left over, the newest is the one Cargo's own linking would pick.
+fn scan_build_artifacts(base: &Path) -> (BTreeMap<String, PathBuf>, BTreeSet<PathBuf>) {
+    let mut rlibs: BTreeMap<String, (std::time::SystemTime, PathBuf)> = BTreeMap::new();
+    let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut stack = vec![base.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                // Skip trees that never hold a linkable artifact.
+                match entry.file_name().to_str() {
+                    Some("incremental") | Some(".fingerprint") => {}
+                    _ => stack.push(entry.path()),
+                }
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            match Path::new(&*name).extension().and_then(|ext| ext.to_str()) {
+                Some("rlib") | Some("rmeta") | Some("so") | Some("dylib") | Some("dll") => {
+                    dirs.insert(dir.clone());
+                }
+                _ => continue,
+            }
+            let stem = match name
+                .strip_prefix("lib")
+                .and_then(|s| s.strip_suffix(".rlib"))
+            {
+                Some(stem) => stem,
+                None => continue,
+            };
+            let cut = match stem.rfind('-') {
+                Some(cut) => cut,
+                None => continue,
+            };
+            let (crate_name, hash) = (&stem[..cut], &stem[cut + 1..]);
+            if crate_name.is_empty()
+                || hash.is_empty()
+                || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                continue;
+            }
+            let mtime = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if rlibs
+                .get(crate_name)
+                .map_or(true, |(best, _)| mtime >= *best)
+            {
+                rlibs.insert(crate_name.to_string(), (mtime, entry.path()));
+            }
+        }
+    }
+    (
+        rlibs
+            .into_iter()
+            .map(|(name, (_, path))| (name, path))
+            .collect(),
+        dirs,
+    )
+}
+
 /// Reads the artifacts out of the JSON messages of a `cargo build
 /// --message-format=json`. Each `compiler-artifact` message names the crate
 /// (`"target":{…"name":"…"…}`) and lists its files (`"filenames":[…]`), for the
@@ -4361,6 +4668,7 @@ mod tests {
             package: "owner".to_string(),
             profile: "debug".to_string(),
             nested: false,
+            harvest_only: false,
             owner_deps_key: None,
             owner_deps: OwnerDeps::default(),
         }
@@ -4386,16 +4694,16 @@ mod tests {
         assert!(args.contains(&"__subcrate_c_2=out/subcrates/lib__subcrate_c_2.rlib".to_string()));
         assert!(args.contains(&"dependency=out/subcrates".to_string()));
 
-        let (source, _) = render_source(&[], &deps, &[], true);
-        // `extern crate … as …;` (not `use`) so the alias lands in the extern
-        // prelude: the subcrate can write `::a` and `pub use a::…;`.
+        let (source, _) = render_source(&[], &deps, &[], true, false);
+        // `pub extern crate … as …;` (not `use`) so the alias lands in the extern
+        // prelude: the subcrate can write `::a` and re-export it with `pub use a;`.
         assert!(
-            source.contains("extern crate __subcrate_a_1 as a;"),
+            source.contains("pub extern crate __subcrate_a_1 as a;"),
             "{}",
             source
         );
         assert!(
-            source.contains("extern crate __subcrate_c_2 as z;"),
+            source.contains("pub extern crate __subcrate_c_2 as z;"),
             "{}",
             source
         );
@@ -4403,13 +4711,28 @@ mod tests {
     }
 
     #[test]
+    fn a_proc_macro_subcrate_keeps_its_imports_private() {
+        // A proc-macro crate may export only its macros, so a `pub extern crate`
+        // there is a hard error; the import stays private (a proc-macro crate has
+        // nothing to re-export anyway).
+        let deps = [linked("__subcrate_a_1", "a")];
+        let (source, _) = render_source(&[], &deps, &[], true, true);
+        assert!(
+            source.contains("extern crate __subcrate_a_1 as a;"),
+            "{}",
+            source
+        );
+        assert!(!source.contains("pub extern crate"), "{}", source);
+    }
+
+    #[test]
     fn a_crate_under_two_aliases_is_linked_once() {
         let deps = [linked("__subcrate_a_1", "x"), linked("__subcrate_a_1", "y")];
         let args = config().rustc_args(&top("b", vec![]), &deps, Path::new("out/subcrates"));
         assert_eq!(args.iter().filter(|a| *a == "--extern").count(), 1);
-        let (source, _) = render_source(&[], &deps, &[], true);
-        assert!(source.contains("extern crate __subcrate_a_1 as x;"));
-        assert!(source.contains("extern crate __subcrate_a_1 as y;"));
+        let (source, _) = render_source(&[], &deps, &[], true, false);
+        assert!(source.contains("pub extern crate __subcrate_a_1 as x;"));
+        assert!(source.contains("pub extern crate __subcrate_a_1 as y;"));
     }
 
     #[test]
@@ -4420,9 +4743,10 @@ mod tests {
             &[linked("__subcrate_a_1", "a")],
             &file.items,
             true,
+            false,
         );
         let attr = source.find("allow").unwrap();
-        let import = source.find("extern crate __subcrate_a_1").unwrap();
+        let import = source.find("pub extern crate __subcrate_a_1").unwrap();
         let item = source.find("fn f").unwrap();
         assert!(attr < import && import < item, "{}", source);
     }
@@ -4434,7 +4758,7 @@ mod tests {
         let file =
             syn::parse_file("pub fn f() -> usize { let x = 1; x + 2 }\npub struct S { a: u32 }")
                 .unwrap();
-        let (source, _) = render_source(&[], &[], &file.items, true);
+        let (source, _) = render_source(&[], &[], &file.items, true, false);
         assert!(
             source.lines().count() > 3,
             "expected multi-line source, got:\n{}",
@@ -4449,7 +4773,7 @@ mod tests {
         let args = config().rustc_args(&top("b", vec![]), &[], Path::new("out/subcrates"));
         assert!(!args.contains(&"--extern".to_string()));
         assert!(!args.contains(&"-L".to_string()));
-        assert!(!render_source(&[], &[], &[], true)
+        assert!(!render_source(&[], &[], &[], true, false)
             .0
             .contains("extern crate"));
     }
@@ -4658,8 +4982,8 @@ mod tests {
         assert!(args.contains(&"dependency=t/debug".to_string()));
         assert!(args.contains(&"dependency=t/debug/build/leaf/h/out".to_string()));
 
-        let (source, _) = render_source(&[], &deps, &[], true);
-        assert!(source.contains("extern crate leaf as l;"), "{}", source);
+        let (source, _) = render_source(&[], &deps, &[], true, false);
+        assert!(source.contains("pub extern crate leaf as l;"), "{}", source);
     }
 
     #[test]
@@ -4824,9 +5148,11 @@ mod tests {
         let subs = [top("a", vec![ext("dup"), ext("myleaf"), ext("leaf")])];
         let (result, args, dir) = nested_build("rename", manifest, MULTI_LOCK, &messages, &subs);
         let deps = result.unwrap();
-        assert_eq!(packages_asked_for(&args), ["dup:2.0.0", "leaf"]);
-        // Nothing else: not the owner itself.
-        assert_eq!(args.iter().filter(|arg| *arg == "-p").count(), 2);
+        // The owner joins the selection because `myleaf`/`mid` are path dependencies
+        // (so possibly workspace members); the resolved dependency specs are the point
+        // here.
+        assert_eq!(packages_asked_for(&args), ["dup:2.0.0", "leaf", "owner"]);
+        assert_eq!(args.iter().filter(|arg| *arg == "-p").count(), 3);
 
         // Each name is tied to its crate, and the version to pick.
         let external = |name: &str| {
@@ -4854,8 +5180,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_nested_build_includes_the_owner_only_when_a_subcrate_uses_it() {
-        let manifest = "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n";
+    fn the_nested_build_includes_the_owner_for_the_owner_crate_or_a_path_dependency() {
+        // A registry dependency (`leaf = "1"`) is never a workspace member, so the
+        // owner is left out — unless a subcrate also uses the owner crate itself.
+        let registry = "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n";
         let leaf = |is_owner: bool| {
             if is_owner {
                 sub("tests/t.rs", &["user"], vec![ext("leaf"), ext("owner")])
@@ -4863,11 +5191,20 @@ mod tests {
                 sub("tests/t.rs", &["user"], vec![ext("leaf")])
             }
         };
-        let (result, args, _) = nested_build("no-owner", manifest, MULTI_LOCK, "", &[leaf(false)]);
+        let (result, args, _) = nested_build("no-owner", registry, MULTI_LOCK, "", &[leaf(false)]);
         result.unwrap();
         assert_eq!(packages_asked_for(&args), ["leaf"]);
 
-        let (result, args, _) = nested_build("owner", manifest, MULTI_LOCK, "", &[leaf(true)]);
+        let (result, args, _) = nested_build("owner", registry, MULTI_LOCK, "", &[leaf(true)]);
+        result.unwrap();
+        assert_eq!(packages_asked_for(&args), ["leaf", "owner"]);
+
+        // A path dependency may be a workspace member, so the owner joins the
+        // selection to unify its features with the main build's (see
+        // `build_owner_deps`).
+        let path = "[package]\nname = \"owner\"\n\n[dependencies]\n\
+                    leaf = { path = \"../leaf\" }\n";
+        let (result, args, _) = nested_build("path", path, MULTI_LOCK, "", &[leaf(false)]);
         result.unwrap();
         assert_eq!(packages_asked_for(&args), ["leaf", "owner"]);
     }
@@ -6215,7 +6552,7 @@ path = \"ignored\"
         // `BADTOKEN` is on source line 3.
         let src = "fn f() -> u8 {\n    let x = 1;\n    BADTOKEN\n}\n";
         let items = syn::parse_file(src).unwrap().items;
-        let (source, map) = render_source(&[], &[], &items, true);
+        let (source, map) = render_source(&[], &[], &items, true, false);
         assert!(!map.is_empty());
         let gline = source[..source.find("BADTOKEN").unwrap()]
             .matches('\n')
