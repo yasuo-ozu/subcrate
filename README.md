@@ -176,6 +176,20 @@ forwarded as build warnings. A UI-test subcrate is compiled with its lints cappe
 `warn`, so a `should_warn` keeps working even when the rest of the build runs under
 `-D warnings` (which would otherwise turn the warning into a hard error).
 
+Because the checks run at build time rather than from a separate test, the warm
+edit/run loop is quicker than [`trybuild`] on the same compile-fail cases (24 cases,
+`rustc 1.101.0-nightly`; machine-dependent, so the ratios are the point — [details][bench]):
+
+| scenario (seconds)                | subcrate    | trybuild    |
+|-----------------------------------|-------------|-------------|
+| cold (incl. framework build)      | 22.25       | 22.97       |
+| no-op re-run (min / mean)         | 0.38 / 0.39 | 1.79 / 1.87 |
+| one case edited (min / mean)      | 0.96 / 1.09 | 1.70 / 1.72 |
+| all 24 cases rebuilt (min / mean) | 1.56 / 1.71 | 1.61 / 1.65 |
+
+[`trybuild`]: https://crates.io/crates/trybuild
+[bench]: https://github.com/yasuo-ozu/subcrate/tree/main/benchmarks
+
 ## Known limitations
 
 - `cargo doc` on the defining crate works. But a *downstream* crate's `cargo doc`
