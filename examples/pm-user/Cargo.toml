@@ -1,0 +1,13 @@
+[package]
+name = "pm-user"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.56"
+publish = false
+description = "Test fixture: a workspace member whose graph a proc-macro (so proc-macro2) perturbs."
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+pm = { path = "../pm" }

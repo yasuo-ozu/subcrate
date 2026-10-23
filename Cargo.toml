@@ -12,7 +12,7 @@ build = false
 # Integration tests are their own package (`subcrate-tests`, ./tests).
 autotests = false
 # Nested test/benchmark packages (and the `tests` symlink) are not published.
-exclude = ["/tests", "/benchmarks"]
+exclude = ["/tests", "/benchmarks", "/member-test"]
 
 [lib]
 path = "lib.rs"
@@ -41,10 +41,13 @@ members = [
     "core",
     "macro",
     "tests",
+    "member-test",
     "examples/custom-layout",
     "examples/leaf",
     "examples/leaf-alt",
     "examples/leaf-base",
+    "examples/pm",
+    "examples/pm-user",
 ]
 # Bare `cargo test`/`build` at the root fans out to every member (`.` is `subcrate`).
 default-members = [
@@ -52,10 +55,13 @@ default-members = [
     "core",
     "macro",
     "tests",
+    "member-test",
     "examples/custom-layout",
     "examples/leaf",
     "examples/leaf-alt",
     "examples/leaf-base",
+    "examples/pm",
+    "examples/pm-user",
 ]
 # Its own workspace: keeps trybuild out of the MSRV-locked `Cargo.lock`.
 exclude = ["benchmarks"]

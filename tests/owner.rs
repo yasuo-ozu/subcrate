@@ -141,6 +141,14 @@ fn an_owner_dependency_can_be_renamed_and_reexported() {
     assert_eq!(renamed::marker_type(), TypeId::of::<leaf::Marker>());
 }
 
+#[test]
+fn an_owner_dependency_crate_is_itself_re_exported_from_the_subcrate() {
+    // The dependency is bound with `pub extern crate`, so the crate itself — not
+    // only its items — is reachable through the subcrate's public path (`renamed::l`
+    // is `leaf`). A private `extern crate` could not be re-exported this way.
+    assert_eq!(renamed::l::value(), leaf::value());
+}
+
 // In edition 2015 the import is `extern crate … as …;` rather than a `use`.
 #[subcrate(edition = "2015", ::leaf)]
 pub mod legacy {

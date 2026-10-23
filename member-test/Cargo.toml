@@ -1,0 +1,20 @@
+[package]
+name = "member-test"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.56"
+publish = false
+# Runs `subcrate::build::compile()`; the subcrate in `src/lib.rs` links the
+# workspace member `pm-user`.
+build = "build.rs"
+
+[dependencies]
+subcrate = { path = ".." }
+# A workspace member whose graph carries a proc-macro (so proc-macro2). This
+# package links it with `#[subcrate(::pm_user)]` and does *not* use the owner
+# crate, so the owner joins the nested selection only through the path-dependency
+# gate — the behaviour this package guards.
+pm-user = { path = "../examples/pm-user" }
+
+[build-dependencies]
+subcrate = { path = ".." }
