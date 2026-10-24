@@ -455,7 +455,13 @@ impl Config {
             .unwrap_or_else(|| self.manifest_dir.join("src").join("lib.rs"));
         Owner {
             name: self.owner_crate_name(),
-            lib: if lib.is_file() { Some(lib) } else { None },
+            // Canonical, to match a library subcrate's (canonical) crate root even
+            // when the `[lib] path` and the discovered path are spelled differently.
+            lib: if lib.is_file() {
+                Some(canonical_path(&lib))
+            } else {
+                None
+            },
         }
     }
 
@@ -1699,10 +1705,23 @@ struct Discovered {
 fn discover(manifest_dir: &Path) -> Discovered {
     let mut walker = Walker::default();
     for (file, mod_dir) in crate_roots(manifest_dir) {
-        walker.root = file.clone();
+        // Canonical so a subcrate's crate root compares equal to the owner's library
+        // and to its siblings however each was spelled (see [`canonical_path`]).
+        walker.root = canonical_path(&file);
         walker.walk_file(&file, &mod_dir);
     }
     walker.out
+}
+
+/// A path in canonical form for comparison — symlinks resolved, `.`/`..` collapsed —
+/// falling back to the path as given when it cannot be resolved (e.g. it does not
+/// exist). Crate roots reach discovery spelled several ways: the default location, a
+/// `[lib]`/`[[test]]`/… `path`, or through a symlinked directory. Comparing them
+/// (library vs. subcrate root, or sibling roots) by their canonical form keeps those
+/// spellings of one file equal, so a library subcrate is not mistaken for a test's,
+/// nor two siblings for strangers.
+fn canonical_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Enumerates the crate-root files and the directory their top-level modules
@@ -1843,7 +1862,7 @@ struct Walker {
 
 impl Walker {
     fn walk_file(&mut self, path: &Path, mod_dir: &Path) {
-        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let key = canonical_path(path);
         if !self.visited.insert(key) {
             return;
         }
@@ -4876,12 +4895,48 @@ mod tests {
         let without = config.owner();
         std::fs::write(dir.join("src").join("lib.rs"), "").unwrap();
         let with = config.owner();
+        // `owner()` returns the canonical path; resolve the expectation the same way
+        // while the file still exists (temp dirs are symlinked on some platforms).
+        let expected_lib = std::fs::canonicalize(dir.join("src").join("lib.rs")).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(without.name, "my_package");
         assert_eq!(without.lib, None);
         assert_eq!(with.name, "my_package");
-        assert_eq!(with.lib, Some(dir.join("src").join("lib.rs")));
+        assert_eq!(with.lib, Some(expected_lib));
+    }
+
+    #[test]
+    fn a_library_subcrate_matches_the_owner_despite_an_odd_lib_path() {
+        // A `[lib] path` can spell the library file differently from where discovery
+        // scans it (here via `..`; a symlinked directory does the same). Both the
+        // owner's library and the discovered crate root are canonicalized, so the
+        // library subcrate is still recognized as the library's — the comparison
+        // `needed_by_lib`/`compile_deps` rely on — rather than mistaken for a test's.
+        let dir = std::env::temp_dir().join(format!("subcrate-canon-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"p\"\n\n[lib]\npath = \"src/../src/lib.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src").join("lib.rs"),
+            "#[subcrate] mod libsub {}\n",
+        )
+        .unwrap();
+
+        let discovered = discover(&dir);
+        let mut config = config();
+        config.manifest_dir = dir.clone();
+        let owner = config.owner();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(discovered.subcrates.len(), 1);
+        assert_eq!(
+            owner.lib.as_deref(),
+            Some(discovered.subcrates[0].root.as_path())
+        );
     }
 
     #[test]
