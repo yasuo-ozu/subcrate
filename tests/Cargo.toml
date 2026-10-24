@@ -14,6 +14,9 @@ subcrate = { path = ".." }
 leaf = { path = "../examples/leaf" }
 leaf-base = { path = "../examples/leaf-base" }
 alt = { package = "leaf-alt", path = "../examples/leaf-alt" }
+# Toolchain-conditional subcrates (rustversion_gate.rs): the `#[rustversion::…]`
+# attribute that gates a `#[subcrate]` module in the parent crate.
+rustversion = "1"
 
 [build-dependencies]
 subcrate = { path = ".." }

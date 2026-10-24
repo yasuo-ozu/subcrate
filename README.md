@@ -145,6 +145,31 @@ machinery out of its own build with `default-features = false`.
   This needs **nightly** Rust (`mod foo;` in proc-macro input is unstable, `E0658`,
   on stable); inline `mod foo { … }` works everywhere.
 
+### Toolchain-conditional subcrates
+
+Put a [`rustversion`] selector *above* `#[subcrate]` to make a subcrate available
+only on toolchains that satisfy it:
+
+```rust ignore
+#[rustversion::nightly]
+#[subcrate]
+mod nightly_only {
+    #![feature(portable_simd)]
+    // …nightly-only code…
+}
+```
+
+`rustversion` removes the module on a non-matching toolchain, so it is simply
+absent there — guard your uses of it the same way (with `#[rustversion::…]` or
+`#[cfg(…)]`). The build helper does not read the selector: it builds every
+subcrate, and a *gated* one that fails to compile is taken to mean "not for this
+toolchain" and **skipped**, so a non-matching toolchain never fails the build. (A
+gated subcrate that fails on a toolchain where the gate *keeps* it still reports
+the compiler's error, so genuine mistakes aren't hidden.) Place the selector above
+`#[subcrate]`, not below it.
+
+[`rustversion`]: https://crates.io/crates/rustversion
+
 ### UI testing
 
 A subcrate can assert what the compiler says about it. Pass `#[subcrate(...)]` one
