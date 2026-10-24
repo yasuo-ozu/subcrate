@@ -2877,16 +2877,29 @@ fn check_ui(
     }
 
     // A bare `should_error` (`None`) is satisfied by the failure already checked
-    // above; only a `Some(substring)` needs a matching error.
+    // above; only a `Some(substring)` needs a matching error. The substring is
+    // matched with whitespace collapsed on both sides (see [`collapse_whitespace`]),
+    // so a one-line expectation still matches a message `rustc` hard-wrapped across
+    // lines; the author's original spelling is kept for the report.
     for want in should_errors.iter().flatten() {
-        if !diags.errors.iter().any(|r| r.contains(want.as_str())) {
+        let needle = collapse_whitespace(want);
+        if !diags
+            .errors
+            .iter()
+            .any(|r| collapse_whitespace(r).contains(&needle))
+        {
             problems.push(format!("no error diagnostic contained `{}`", want));
         }
     }
     for want in should_warns {
         match want {
             Some(want) => {
-                if !diags.warnings.iter().any(|r| r.contains(want.as_str())) {
+                let needle = collapse_whitespace(want);
+                if !diags
+                    .warnings
+                    .iter()
+                    .any(|r| collapse_whitespace(r).contains(&needle))
+                {
                     problems.push(format!("no warning diagnostic contained `{}`", want));
                 }
             }
@@ -2917,6 +2930,16 @@ fn check_ui(
 /// code and the underlined code do not matter.
 fn normalize_spanned(code: &str) -> String {
     code.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Collapses every run of whitespace (spaces, tabs and line breaks) to a single
+/// space and trims the ends, for the `should_error`/`should_warn` substring match.
+/// `rustc` hard-wraps long messages, so a line break can fall in the middle of a
+/// sentence; collapsing both the diagnostic and the expected string makes a
+/// one-line expectation match across such a wrap. Unlike [`normalize_spanned`] it
+/// keeps single spaces, so word boundaries in the message are preserved.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Parses rustc's `--error-format=json` stderr into [`UiDiagnostics`].
@@ -6350,6 +6373,17 @@ path = \"ignored\"
         assert_eq!(normalize_spanned("x + 1"), normalize_spanned("x+1"));
     }
 
+    #[test]
+    fn whitespace_collapse_folds_runs_but_keeps_word_boundaries() {
+        assert_eq!(collapse_whitespace("a  b\n c\t\td"), "a b c d");
+        assert_eq!(collapse_whitespace("  trim  me  "), "trim me");
+        // A line break inside a sentence becomes a single space.
+        assert_eq!(
+            collapse_whitespace("versions\nof crate"),
+            "versions of crate"
+        );
+    }
+
     /// A realistic one-line rustc error diagnostic (`--error-format=json`).
     const ERROR_JSON: &str = concat!(
         r#"{"message":"mismatched types","code":{"code":"E0308"},"level":"error","#,
@@ -6424,6 +6458,38 @@ path = \"ignored\"
         );
         assert!(problems.iter().any(|p| p.contains("some other error")));
         assert!(problems.iter().any(|p| p.contains("not underlined")));
+    }
+
+    #[test]
+    fn message_match_ignores_rustc_line_wrapping() {
+        // `rustc` hard-wraps long messages, so `rendered` can break a sentence across
+        // lines (here `versions\nof`). A one-line expectation that spans the break
+        // still matches, on both errors and warnings.
+        let diags = parse_rustc_json(concat!(
+            r#"{"level":"error","spans":[],"children":[],"#,
+            r#""rendered":"error: there are multiple different versions\nof crate `foo` in the dependency graph\n"}"#,
+            "\n",
+            r#"{"level":"warning","spans":[],"children":[],"#,
+            r#""rendered":"warning: this is a rather long\nwarning message about something\n"}"#,
+        ));
+        let problems = check_ui(
+            false,
+            &diags,
+            &opt_strs(&["multiple different versions of crate `foo`"]),
+            &opt_strs(&["long warning message about"]),
+            &[],
+        );
+        assert!(problems.is_empty(), "{:?}", problems);
+
+        // A genuinely absent substring still fails (collapsing does not invent text).
+        let problems = check_ui(
+            false,
+            &diags,
+            &opt_strs(&["no such text anywhere"]),
+            &[],
+            &[],
+        );
+        assert!(problems.iter().any(|p| p.contains("no such text anywhere")));
     }
 
     #[test]
