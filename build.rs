@@ -39,6 +39,20 @@
 //! a build-script link path to dependent packages too, so publicly exported
 //! subcrates resolve downstream with no extra wiring.
 //!
+//! # Toolchain-conditional subcrates
+//!
+//! A `#[subcrate]` module may also carry a `rustversion` gate (`#[rustversion::nightly]`,
+//! `#[rustversion::since(1.70)]`, …), which the `rustversion` crate uses to remove the
+//! module from the *owner* crate on a non-matching toolchain. The helper does not
+//! evaluate the gate — it only notices one is present (`is_rustversion_gate`) — and
+//! treats a *gated* subcrate that fails to compile as "not available on this
+//! toolchain": it is skipped rather than failing the build, and recorded as skipped
+//! in the manifest so the macro expands it away. The compiler is thus the oracle; the
+//! helper never has to agree with `rustversion` on what the current toolchain is. A
+//! gated subcrate that fails where its gate *keeps* it still surfaces the compiler's
+//! error (captured to `<internal>.skipreason` and shown by the macro). See
+//! `Config::compile_all`.
+//!
 //! # Owner dependencies
 //!
 //! A subcrate is compiled *before* Cargo builds the package's own dependencies. So
@@ -162,8 +176,8 @@ use safegraph::algo::toposort::toposort;
 use safegraph::graph::Graph;
 use safegraph::BTreeGraph;
 use subcrate_core::{
-    internal_crate_name, is_subcrate_attr, manifest_line, parse_attr_args, Dependency, ResolvedDep,
-    UiExpectations,
+    internal_crate_name, is_subcrate_attr, manifest_line, parse_attr_args, skipped_manifest_line,
+    Dependency, ResolvedDep, UiExpectations,
 };
 use syn::{Attribute, Item, Meta};
 use template_quote::quote;
@@ -396,7 +410,10 @@ impl Config {
         self.owner_deps = self.build_owner_deps(subcrates, &links, &wanted)?;
 
         let owner_linked = owner_linked(&links, &order);
-        self.compile_all(
+        // `gate_skipped[ix]`: the subcrate carries a `#[rustversion]` gate and did
+        // not build on this toolchain, so it is recorded as skipped below rather
+        // than linked (see [`Config::compile_all`]).
+        let gate_skipped = self.compile_all(
             subcrates,
             &links,
             &needs,
@@ -428,10 +445,16 @@ impl Config {
         let manifest = self.out_dir.join(MANIFEST_FILE);
         let mut body = String::new();
         for (ix, sub) in subcrates.iter().enumerate() {
-            body.push_str(&manifest_line(
-                &sub.internal,
-                &doc_deps(subcrates, ix, &links[ix]),
-            ));
+            if gate_skipped[ix] {
+                // No artifact exists; the macro expands this subcrate away (and
+                // reads `<internal>.skipreason` if it still reaches the module).
+                body.push_str(&skipped_manifest_line(&sub.internal));
+            } else {
+                body.push_str(&manifest_line(
+                    &sub.internal,
+                    &doc_deps(subcrates, ix, &links[ix]),
+                ));
+            }
             body.push('\n');
         }
         std::fs::write(&manifest, body)?;
@@ -1114,17 +1137,15 @@ impl Config {
         wanted: &[bool],
         subcrates_dir: &Path,
         owner_linked: &[bool],
-    ) -> Result<(), Error> {
-        #[derive(Clone, Copy, PartialEq)]
-        enum Status {
-            Pending,
-            Done,
-            Failed,
-        }
+    ) -> Result<Vec<bool>, Error> {
         let n = subcrates.len();
         let mut status = vec![Status::Pending; n];
         let mut errors: Vec<String> = Vec::new();
         let mut skipped: Vec<usize> = Vec::new();
+        // One flag per subcrate: skipped because its `#[rustversion]` gate did not
+        // build on this toolchain. Returned so the manifest records it as skipped
+        // (the macro then expands it away). See [`is_rustversion_gate`].
+        let mut gate_skipped = vec![false; n];
         let jobs = std::env::var("NUM_JOBS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -1147,6 +1168,45 @@ impl Config {
                 {
                     status[ix] = Status::Failed;
                     skipped.push(ix);
+                    progressed = true;
+                }
+            }
+
+            // A subcrate that needs a gate-skipped dependency can't build on this
+            // toolchain either. If it is itself gated, skip it too (quietly); if
+            // not, it is a configuration error — it must be gated the same way, or
+            // not depend on a gated subcrate. (The `Failed` sweep above runs first,
+            // so a real dependency error always wins over this.)
+            for ix in 0..n {
+                if !wanted[ix] || status[ix] != Status::Pending {
+                    continue;
+                }
+                if let Some(&d) = needs[ix]
+                    .iter()
+                    .find(|&&d| wanted[d] && status[d] == Status::Skipped)
+                {
+                    if subcrates[ix].gated {
+                        status[ix] = Status::Skipped;
+                        gate_skipped[ix] = true;
+                        write_skip_reason(
+                            &self.out_dir,
+                            &subcrates[ix].internal,
+                            &format!(
+                                "depends on `{}`, which was skipped on this toolchain",
+                                subcrates[d].display_name()
+                            ),
+                        );
+                    } else {
+                        status[ix] = Status::Failed;
+                        errors.push(format!(
+                            "`{}` depends on `{}`, which carries a `#[rustversion]` gate \
+                             and was not built on this toolchain. Gate `{}` the same way, \
+                             or drop the dependency.",
+                            subcrates[ix].display_name(),
+                            subcrates[d].display_name(),
+                            subcrates[ix].display_name(),
+                        ));
+                    }
                     progressed = true;
                 }
             }
@@ -1185,8 +1245,13 @@ impl Config {
                 ) {
                     Ok(deps) => deps,
                     Err(e) => {
-                        status[ix] = Status::Failed;
-                        errors.push(e.to_string());
+                        self.note_compile_failure(
+                            &subcrates[ix],
+                            e.to_string(),
+                            &mut status[ix],
+                            &mut errors,
+                            &mut gate_skipped[ix],
+                        );
                         continue;
                     }
                 };
@@ -1199,8 +1264,13 @@ impl Config {
                     }
                     Ok(Prepared::Compile(job)) => batch.push((ix, *job)),
                     Err(e) => {
-                        status[ix] = Status::Failed;
-                        errors.push(e.to_string());
+                        self.note_compile_failure(
+                            &subcrates[ix],
+                            e.to_string(),
+                            &mut status[ix],
+                            &mut errors,
+                            &mut gate_skipped[ix],
+                        );
                     }
                 }
             }
@@ -1229,8 +1299,13 @@ impl Config {
                             status[ix] = Status::Done;
                         }
                         Err(message) => {
-                            status[ix] = Status::Failed;
-                            errors.push(message);
+                            self.note_compile_failure(
+                                &subcrates[ix],
+                                message,
+                                &mut status[ix],
+                                &mut errors,
+                                &mut gate_skipped[ix],
+                            );
                         }
                     }
                 }
@@ -1238,7 +1313,7 @@ impl Config {
         }
 
         if errors.is_empty() {
-            return Ok(());
+            return Ok(gate_skipped);
         }
         let mut message = if errors.len() == 1 {
             errors.remove(0)
@@ -1260,6 +1335,29 @@ impl Config {
             ));
         }
         Err(Error::new(message))
+    }
+
+    /// Records that compiling `sub` failed. For a `#[rustversion]`-gated subcrate
+    /// this is "not available on this toolchain": it becomes [`Status::Skipped`],
+    /// the compiler's error is kept for the macro (see [`write_skip_reason`]), and
+    /// the build does not fail on its account. For any other subcrate it is a real
+    /// error, added to `errors`, and the subcrate is [`Status::Failed`].
+    fn note_compile_failure(
+        &self,
+        sub: &Subcrate,
+        error: String,
+        status: &mut Status,
+        errors: &mut Vec<String>,
+        gate_skipped: &mut bool,
+    ) {
+        if sub.gated {
+            *status = Status::Skipped;
+            *gate_skipped = true;
+            write_skip_reason(&self.out_dir, &sub.internal, &error);
+        } else {
+            *status = Status::Failed;
+            errors.push(error);
+        }
     }
 
     /// Builds the `rustc` argument list (everything except the `-` input and
@@ -1669,6 +1767,11 @@ struct Subcrate {
     /// any is set the subcrate is a UI test (`ui.is_ui_test()`; see
     /// [`run_ui_check`]).
     ui: UiExpectations,
+    /// Whether the module also carries a `#[rustversion::…]` gate (see
+    /// [`is_rustversion_gate`]). When it does, a failure to compile is treated as
+    /// "not available on this toolchain" and the subcrate is skipped rather than
+    /// failing the build — matching rustversion's own removal of the module.
+    gated: bool,
 }
 
 impl Subcrate {
@@ -1980,6 +2083,7 @@ impl Walker {
         let inlined_files = !extra_files.is_empty();
         self.out.files.extend(extra_files);
 
+        let gated = module.attrs.iter().any(is_rustversion_gate);
         if self.seen_internal.insert(internal.clone()) {
             self.out.subcrates.push(Subcrate {
                 module_path,
@@ -1993,6 +2097,7 @@ impl Walker {
                 inner_attrs: inner,
                 items: compiled_items,
                 ui: args.ui,
+                gated,
             });
         }
     }
@@ -2454,6 +2559,27 @@ fn resolve_module_file(
 }
 
 /// Extracts the string value of a `#[path = "…"]` attribute.
+/// Whether `attr` is a `#[rustversion::<selector>]` gate — one of rustversion's
+/// *conditional-compilation* selectors, which keep or remove the item they are on.
+///
+/// Matched by path (`rustversion :: <selector>`), so detection needs no toolchain
+/// knowledge: when a `#[subcrate]` module carries one, the build helper treats a
+/// failure to compile as "not available on this toolchain" and skips it (see
+/// [`Config::compile_all`]). `rustversion::attr(…)` is *not* a gate — it adds an
+/// attribute rather than removing the item — so it is excluded.
+fn is_rustversion_gate(attr: &Attribute) -> bool {
+    let path = attr.path();
+    let first = path.segments.first();
+    let last = path.segments.last();
+    match (first, last) {
+        (Some(first), Some(last)) if first.ident == "rustversion" => matches!(
+            last.ident.to_string().as_str(),
+            "stable" | "beta" | "nightly" | "since" | "before" | "not" | "any" | "all"
+        ),
+        _ => false,
+    }
+}
+
 fn path_attr_value(attr: &Attribute) -> Option<String> {
     if !attr.path().is_ident("path") {
         return None;
@@ -2669,6 +2795,28 @@ enum Prepared {
     Reused(Option<String>),
     /// A job to run on a worker thread.
     Compile(Box<CompileJob>),
+}
+
+/// A subcrate's state while [`Config::compile_all`] works through the dependency
+/// order.
+#[derive(Clone, Copy, PartialEq)]
+enum Status {
+    Pending,
+    Done,
+    Failed,
+    /// A `#[rustversion]`-gated subcrate that did not build on this toolchain (or
+    /// depends on one that did not): not an error, but no artifact exists. Recorded
+    /// in `compile_all`'s `gate_skipped` mask. See [`is_rustversion_gate`].
+    Skipped,
+}
+
+/// Writes the compiler error that made a `#[rustversion]`-gated subcrate fail to
+/// build, so the attribute macro can show it. The macro reads
+/// `<OUT_DIR>/<internal>.skipreason` when the manifest marks the subcrate skipped
+/// (see `subcrate_core::ManifestEntry::Skipped`); a write failure only costs that
+/// detail, so it is ignored.
+fn write_skip_reason(out_dir: &Path, internal: &str, reason: &str) {
+    let _ = std::fs::write(out_dir.join(format!("{}.skipreason", internal)), reason);
 }
 
 /// A spawned compile: the worker returns the warnings to emit (`None` if none) or
@@ -4497,6 +4645,7 @@ mod tests {
             inner_attrs: Vec::new(),
             items: Vec::new(),
             ui: UiExpectations::default(),
+            gated: false,
         }
     }
 
@@ -6686,5 +6835,41 @@ path = \"ignored\"
             source,
             map
         );
+    }
+
+    fn is_gate(module_src: &str) -> bool {
+        let m: syn::ItemMod = syn::parse_str(module_src).unwrap();
+        m.attrs.iter().any(is_rustversion_gate)
+    }
+
+    #[test]
+    fn rustversion_selectors_are_recognized_as_gates() {
+        for src in [
+            "#[rustversion::nightly] mod x {}",
+            "#[rustversion::stable] mod x {}",
+            "#[rustversion::stable(1.34)] mod x {}",
+            "#[rustversion::beta] mod x {}",
+            "#[rustversion::since(1.70)] mod x {}",
+            "#[rustversion::before(1.70)] mod x {}",
+            "#[rustversion::not(nightly)] mod x {}",
+            "#[rustversion::any(stable, beta)] mod x {}",
+            "#[rustversion::all(since(1.31), before(1.34))] mod x {}",
+        ] {
+            assert!(is_gate(src), "should be a gate: {}", src);
+        }
+    }
+
+    #[test]
+    fn non_gate_attributes_are_not_rustversion_gates() {
+        // `attr(...)` adds an attribute rather than removing the item, so it is not
+        // a gate; neither is `#[cfg]`, nor a bare `#[nightly]` without the path.
+        for src in [
+            "#[rustversion::attr(nightly, repr(packed))] mod x {}",
+            "#[cfg(test)] mod x {}",
+            "#[nightly] mod x {}",
+            "#[subcrate] mod x {}",
+        ] {
+            assert!(!is_gate(src), "should not be a gate: {}", src);
+        }
     }
 }

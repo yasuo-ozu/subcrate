@@ -51,7 +51,31 @@ fn expand(args: Args, item_mod: ItemMod) -> syn::Result<proc_macro2::TokenStream
     // module. If it did not, produce a clear, actionable error instead of a
     // cryptic "can't find crate" from the linker.
     let doc_deps = match verify_built(&internal) {
-        Ok(deps) => deps,
+        Ok(Verdict::Built(deps)) => deps,
+        Ok(Verdict::Skipped(reason)) => {
+            // The build helper skipped this subcrate because its `#[rustversion]`
+            // gate did not build on the current toolchain. If this macro is
+            // expanding at all, the gate kept the module — either `#[rustversion::…]`
+            // is below `#[subcrate]` (so it is still attached here, and will delete
+            // this expansion on a non-matching toolchain), or the toolchain actually
+            // matches and the body has a real error. Reporting the captured compiler
+            // error is right in both cases: it is shown when the module is meant to
+            // build here, and removed with the module when it is not.
+            let message = format!(
+                "the `#[subcrate]` module `{}` carries a `#[rustversion]` gate and \
+                 did not build on the current toolchain.\n\n\
+                 If it is meant to build here, fix the error below. If it is only for \
+                 other toolchains, place `#[rustversion::\u{2026}]` *above* `#[subcrate]` \
+                 so the module is removed here instead of reported.\n\n{}",
+                ident, reason
+            );
+            return Ok(quote! {
+                #(#outer_attrs)*
+                #vis mod #ident {
+                    ::core::compile_error!(#message);
+                }
+            });
+        }
         Err(message) => {
             return Ok(quote! {
                 #(#outer_attrs)*
@@ -196,7 +220,17 @@ fn proc_macro_doc_surface(items: &[syn::Item], internal: &str) -> proc_macro2::T
 ///
 /// Returns `Err(message)` describing the problem when the build helper was not
 /// invoked or did not pick up this module.
-fn verify_built(internal: &str) -> Result<Vec<subcrate_core::ResolvedDep>, String> {
+/// What the build helper did with a `#[subcrate]` module, read back from its
+/// manifest (see [`verify_built`]).
+enum Verdict {
+    /// Compiled; these are its resolved dependencies.
+    Built(Vec<subcrate_core::ResolvedDep>),
+    /// Skipped because its `#[rustversion]` gate did not build on this toolchain.
+    /// The string is the compiler's error, captured by the build helper.
+    Skipped(String),
+}
+
+fn verify_built(internal: &str) -> Result<Verdict, String> {
     let dir = match manifest_dir() {
         Some(dir) => dir,
         None => return Err(MISSING_BUILD.to_string()),
@@ -209,7 +243,16 @@ fn verify_built(internal: &str) -> Result<Vec<subcrate_core::ResolvedDep>, Strin
     };
 
     match subcrate_core::manifest_lookup(&contents, internal) {
-        Some(deps) => Ok(deps),
+        Some(subcrate_core::ManifestEntry::Built(deps)) => Ok(Verdict::Built(deps)),
+        Some(subcrate_core::ManifestEntry::Skipped) => {
+            // The compiler error the helper captured when the gated subcrate failed
+            // to build; empty if the file is somehow missing.
+            let reason = std::fs::read_to_string(
+                std::path::Path::new(&dir).join(format!("{}.skipreason", internal)),
+            )
+            .unwrap_or_default();
+            Ok(Verdict::Skipped(reason))
+        }
         None => Err(format!(
             "this `#[subcrate]` module was not discovered by `subcrate::build::compile()`.\n\
              The build helper scans `src/lib.rs`, `src/main.rs`, `src/bin/*.rs`, `tests/*.rs`, \

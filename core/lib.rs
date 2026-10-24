@@ -385,6 +385,23 @@ pub fn parse_attr_args(attr: &Attribute) -> syn::Result<Args> {
 /// (the alias) and its module path from that root.
 pub type ResolvedDep = (String, Vec<String>);
 
+/// The reserved first field marking a manifest line as a skipped subcrate (one
+/// whose `#[rustversion]` gate kept it from building on the current toolchain).
+/// A real dependency field is always `alias=path`, and an alias is an identifier,
+/// so this `!`-prefixed token can never collide with one.
+pub const SKIPPED_MARKER: &str = "!skipped";
+
+/// What the build helper recorded for a subcrate in its manifest.
+pub enum ManifestEntry {
+    /// The subcrate was compiled; these are its resolved dependencies (used to
+    /// give its `cfg(doc)` stand-in the same names the real crate gets).
+    Built(Vec<ResolvedDep>),
+    /// The subcrate carries a `#[rustversion]` gate and did not build on the
+    /// current toolchain, so no artifact exists. The macro expands it away. See
+    /// `subcrate::build::compile`'s handling of rustversion-gated subcrates.
+    Skipped,
+}
+
 /// Renders one line of the build helper's manifest: the subcrate's internal name,
 /// then one tab-separated `alias=path::to::dep` per resolved dependency.
 ///
@@ -401,23 +418,34 @@ pub fn manifest_line(internal: &str, deps: &[ResolvedDep]) -> String {
     line
 }
 
-/// Finds the manifest line for `internal` (see [`manifest_line`]) and returns its
-/// resolved dependencies, or `None` if the subcrate is not listed.
-pub fn manifest_lookup(manifest: &str, internal: &str) -> Option<Vec<ResolvedDep>> {
+/// Renders the manifest line for a subcrate the helper skipped because its
+/// `#[rustversion]` gate did not build on the current toolchain (see
+/// [`ManifestEntry::Skipped`]).
+pub fn skipped_manifest_line(internal: &str) -> String {
+    format!("{}\t{}", internal, SKIPPED_MARKER)
+}
+
+/// Finds the manifest line for `internal` (see [`manifest_line`]) and returns what
+/// the helper recorded for it, or `None` if the subcrate is not listed.
+pub fn manifest_lookup(manifest: &str, internal: &str) -> Option<ManifestEntry> {
     manifest.lines().find_map(|line| {
         let mut fields = line.trim().split('\t');
         if fields.next()? != internal {
             return None;
         }
-        Some(
-            fields
+        let rest = fields.collect::<Vec<&str>>();
+        if rest.first() == Some(&SKIPPED_MARKER) {
+            return Some(ManifestEntry::Skipped);
+        }
+        Some(ManifestEntry::Built(
+            rest.into_iter()
                 .filter_map(|field| {
                     let (alias, path) = field.split_once('=')?;
                     let path = path.split("::").map(str::to_string).collect();
                     Some((alias.to_string(), path))
                 })
                 .collect(),
-        )
+        ))
     })
 }
 
@@ -603,5 +631,33 @@ mod tests {
             internal_crate_name("m", &Args::default(), &[], std::slice::from_ref(&raw)),
             internal_crate_name("m", &Args::default(), &[], std::slice::from_ref(&escaped)),
         );
+    }
+
+    // A skipped subcrate (its `#[rustversion]` gate kept it from building on this
+    // toolchain) is recorded distinctly from a built one, and the marker can never
+    // be confused with a dependency field (which is always `alias=path`).
+    #[test]
+    fn a_skipped_subcrate_round_trips_through_the_manifest() {
+        let built = manifest_line(
+            "__subcrate_a",
+            &[("dep".into(), vec!["x".into(), "y".into()])],
+        );
+        let skipped = skipped_manifest_line("__subcrate_b");
+        let manifest = format!("{}\n{}\n", built, skipped);
+
+        match manifest_lookup(&manifest, "__subcrate_a") {
+            Some(ManifestEntry::Built(deps)) => {
+                assert_eq!(
+                    deps,
+                    vec![("dep".to_string(), vec!["x".to_string(), "y".to_string()])]
+                );
+            }
+            _ => panic!("expected a built entry"),
+        }
+        assert!(matches!(
+            manifest_lookup(&manifest, "__subcrate_b"),
+            Some(ManifestEntry::Skipped)
+        ));
+        assert!(manifest_lookup(&manifest, "__subcrate_missing").is_none());
     }
 }
