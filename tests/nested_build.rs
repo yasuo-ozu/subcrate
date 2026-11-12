@@ -355,6 +355,70 @@ fn a_packaged_crates_own_lock_file_is_neither_used_nor_rewritten() {
     );
 }
 
+const SELF_USE_MANIFEST: &str = r#"
+[package]
+name = "nested-packaged-self"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+subcrate = { path = '{SUBCRATE}' }
+
+[build-dependencies]
+subcrate = { path = '{SUBCRATE}' }
+"#;
+
+#[test]
+fn a_packaged_crate_is_the_package_its_own_build_script_takes_the_nested_build_for() {
+    // A subcrate in `tests/` that uses the package's own library (`::nested_packaged_self`):
+    // the package is built in the nested build too, and its build script, re-entered
+    // there, must know that build is its own (`SUBCRATE_NESTED`) — or it would start a
+    // nested build of its own, and so on. The nested build runs in the private
+    // workspace, where the package is a symbolic link, so it is the link that Cargo
+    // names as the package's directory, not the directory itself.
+    let dir = fresh("packaged-self");
+    let package = packaged_package(
+        &dir,
+        "nested-packaged-self-0.1.0",
+        SELF_USE_MANIFEST,
+        "",
+        "pub fn text() -> &'static str {\n    \"owner\"\n}\n",
+    );
+    write(
+        &package,
+        "tests/uses_owner.rs",
+        r#"
+use subcrate::subcrate;
+
+#[subcrate(::nested_packaged_self)]
+mod uses_owner {
+    pub fn text() -> &'static str {
+        nested_packaged_self::text()
+    }
+}
+"#,
+    );
+    let down = dir.join("down");
+    write(
+        &down,
+        "Cargo.toml",
+        &format!(
+            "[package]\nname = \"down\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n\n\
+             [dependencies]\nnested-packaged-self = {{ path = '{}' }}\n",
+            package.display()
+        ),
+    );
+    write(
+        &down,
+        "src/lib.rs",
+        "pub fn text() -> &'static str { nested_packaged_self::text() }\n",
+    );
+    let offline = lock_like_the_workspace(&down);
+
+    let output = cargo_build(&down, offline, &[]);
+    assert_built(&output);
+}
+
 // -- `cargo package` verifying several packages ------------------------------------
 
 const OVERLAY_B_MANIFEST: &str = r#"

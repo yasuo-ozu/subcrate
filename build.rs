@@ -158,7 +158,8 @@
 //! for (`cargo:rustc-link-search`, read from the `build-script-executed` messages),
 //! as far as they are in the nested build's own directory, go to every subcrate built
 //! on owner dependencies — the place Cargo gives those paths to its own
-//! compilations, but not to these.
+//! compilations, but not to these. (When cross-compiling, those of both nested builds,
+//! the host's included: see below.)
 //!
 //! # Cross-compiling
 //!
@@ -170,7 +171,8 @@
 //! while the library subcrates' crates keep coming from the build for the target. A
 //! crate used by both kinds is built twice. So a `#![no_std]` library for a bare-metal
 //! target can have a proc-macro subcrate on `::syn`, a crate that could never be built
-//! for that target.
+//! for that target. The host build is a nested build like the other: its crates' search
+//! paths are forwarded as above, and a subcrate built on either build is given both.
 //!
 //! What this needs of the declaration of the crate in `Cargo.toml`: Cargo builds `-p
 //! <dep>` only for a *normal dependency of the package that its resolution switches on
@@ -6629,7 +6631,8 @@ mod tests {
 
     /// Runs `build_host_deps` for `subs` (all wanted) on a cross-compiling `config` with
     /// the stand-in for Cargo of [`nested_build`], returning what it built, the
-    /// arguments it was given and its own directory (removed).
+    /// arguments it was given (followed by the three environment lines, as there) and
+    /// its own directory (removed).
     #[cfg(unix)]
     fn nested_host_build(
         test: &str,
@@ -6646,7 +6649,9 @@ mod tests {
         std::fs::write(dir.join("messages.txt"), messages).unwrap();
         std::fs::write(
             dir.join("build"),
-            "printf '%s\\n' \"$@\" > args.txt\ncat messages.txt\n",
+            "printf '%s\\n' \"$@\" \"SUBCRATE_NESTED=${SUBCRATE_NESTED-unset}\" \
+             \"SUBCRATE_HARVEST_ONLY=${SUBCRATE_HARVEST_ONLY-unset}\" \"PWD=$(pwd -P)\" > args.txt\n\
+             cat messages.txt\n",
         )
         .unwrap();
         let mut config = cross_config();
@@ -7203,6 +7208,24 @@ checksum = \"11\"
         assert_eq!(line(&args, NESTED_ENV), this);
         assert_eq!(line(&args, HARVEST_ONLY_ENV), "unset");
 
+        // The build for the host, of the crates a proc-macro subcrate uses, is the same
+        // nested build of this package.
+        let host = |manifest: &str| {
+            let mut proc_macro = top("a", vec![ext("leaf")]);
+            proc_macro.proc_macro = true;
+            nested_host_build("scope", manifest, MULTI_LOCK, "", &[proc_macro])
+        };
+        let (result, args, _) = host(path);
+        result.unwrap();
+        let this = line(&args, "PWD");
+        assert_eq!(line(&args, NESTED_ENV), this);
+        assert_eq!(line(&args, HARVEST_ONLY_ENV), this);
+        let (result, args, _) = host(registry);
+        result.unwrap();
+        let this = line(&args, "PWD");
+        assert_eq!(line(&args, NESTED_ENV), this);
+        assert_eq!(line(&args, HARVEST_ONLY_ENV), "unset");
+
         std::env::remove_var(NESTED_ENV);
         std::env::remove_var(HARVEST_ONLY_ENV);
     }
@@ -7267,6 +7290,89 @@ checksum = \"11\"
         let paths: Vec<PathBuf> = result.unwrap().script_paths.into_iter().collect();
         // What the build's own scripts put in its target directory, not a system path.
         assert_eq!(paths, [target.join("x/out/subcrates")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_search_paths_into_the_host_build_are_kept() {
+        let dir =
+            std::env::temp_dir().join(format!("subcrate-host-scripts-{}", std::process::id()));
+        // Where `nested_host_build` has the nested build go: its own directory, beside the
+        // target's (whose paths are another build's, not this one's).
+        let out_dir = dir.join("target/aarch64-unknown-linux-gnu/debug/build/owner-1a/out");
+        let compiler = rustc_key(Path::new("rustc")).map(|key| format!("{}-host", key));
+        let host = shared_target_dir(&out_dir, "owner", compiler.as_deref());
+        let target = shared_target_dir(&out_dir, "owner", rustc_key(Path::new("rustc")).as_deref());
+        assert_ne!(host, target);
+        let message = |inside: &Path| {
+            format!(
+                concat!(
+                    r#"{{"reason":"build-script-executed","package_id":"path+file:///w/backed#0.1.0","#,
+                    r#""linked_libs":[],"linked_paths":["{inside}/x/out/subcrates","native=/usr/lib"],"#,
+                    r#""cfgs":[],"env":[],"out_dir":"{inside}/x/out"}}"#
+                ),
+                inside = inside.display()
+            )
+        };
+        let messages = format!("{}\n{}\n", message(&host), message(&target));
+        let registry = "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n";
+        let mut proc_macro = top("a", vec![ext("leaf")]);
+        proc_macro.proc_macro = true;
+        let (result, _, _) =
+            nested_host_build("scripts", registry, MULTI_LOCK, &messages, &[proc_macro]);
+        let paths: Vec<PathBuf> = result.unwrap().script_paths.into_iter().collect();
+        assert_eq!(paths, [host.join("x/out/subcrates")]);
+    }
+
+    #[test]
+    fn subcrates_search_the_dependencies_subcrate_paths_of_both_builds_when_cross_compiling() {
+        let mut config = cross_config();
+        config.owner_deps = external_artifacts();
+        config
+            .owner_deps
+            .script_paths
+            .insert(PathBuf::from("t/debug/build/backed/h/out/subcrates"));
+        let mut host = external_artifacts();
+        host.lib_dirs = [PathBuf::from("host/deps")].into_iter().collect();
+        host.script_paths = [
+            // The host build's own, and a search path of its artifacts already.
+            PathBuf::from("host/build/backed/h/out/subcrates"),
+            PathBuf::from("host/deps"),
+        ]
+        .into_iter()
+        .collect();
+        config.host_deps = host;
+        let mut proc_macro = top("a", vec![]);
+        proc_macro.proc_macro = true;
+        let searched = |sub: &Subcrate| -> Vec<String> {
+            let on_owner_dep = ExternDep {
+                owner_linked: true,
+                ..linked("__subcrate_b_1", "b")
+            };
+            config
+                .rustc_args(sub, &[on_owner_dep], Path::new("out/subcrates"))
+                .into_iter()
+                .filter(|arg| arg.starts_with("dependency="))
+                .collect()
+        };
+        // The proc-macro subcrate, built on the host's crates, finds what the host's
+        // build scripts asked for; and so does a library subcrate, which may use it.
+        for sub in [&proc_macro, &top("a", vec![])] {
+            let searched = searched(sub);
+            assert_eq!(
+                searched,
+                [
+                    "dependency=out/subcrates",
+                    "dependency=t/debug",
+                    "dependency=t/debug/build/leaf/h/out",
+                    "dependency=host/deps",
+                    "dependency=host/build/backed/h/out/subcrates",
+                    "dependency=t/debug/build/backed/h/out/subcrates",
+                ],
+                "{:?}",
+                searched
+            );
+        }
     }
 
     #[test]
