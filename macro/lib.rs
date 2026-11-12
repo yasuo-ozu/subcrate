@@ -171,19 +171,76 @@ fn doc_dependency_imports(
     out
 }
 
+/// The three kinds of procedural macro a `proc-macro` subcrate can define.
+#[derive(Clone, Copy, PartialEq)]
+enum ProcMacroKind {
+    /// `#[proc_macro]`, used as `name!(..)`.
+    Bang,
+    /// `#[proc_macro_attribute]`, used as `#[name]`.
+    Attribute,
+    /// `#[proc_macro_derive(Name)]`, used as `#[derive(Name)]`.
+    Derive,
+}
+
+/// The macros a function of a `proc-macro` subcrate defines, with their kinds: the
+/// function's own name for `#[proc_macro]` and `#[proc_macro_attribute]`, the name in
+/// the attribute's argument for `#[proc_macro_derive(Name, attributes(..))]`.
+fn proc_macros_of(func: &syn::ItemFn) -> Vec<(Ident, ProcMacroKind)> {
+    let mut out = Vec::new();
+    for attr in &func.attrs {
+        let path = attr.path();
+        if path.is_ident("proc_macro") {
+            out.push((func.sig.ident.clone(), ProcMacroKind::Bang));
+        } else if path.is_ident("proc_macro_attribute") {
+            out.push((func.sig.ident.clone(), ProcMacroKind::Attribute));
+        } else if path.is_ident("proc_macro_derive") {
+            let args = attr.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            );
+            if let Ok(args) = args {
+                if let Some(name) = args.first().and_then(|meta| meta.path().get_ident()) {
+                    out.push((name.clone(), ProcMacroKind::Derive));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether an attribute is `#[doc(hidden)]`.
+fn is_doc_hidden(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("doc")
+        && attr
+            .parse_args::<Ident>()
+            .map_or(false, |arg| arg == "hidden")
+}
+
 /// Produces a documentation-only stand-in for a `proc-macro` subcrate.
 ///
 /// A `proc-macro` crate's body cannot be inlined into an ordinary crate: the
-/// `#[proc_macro]` attribute is rejected outside a proc-macro crate. So for each
-/// `#[proc_macro]` function we emit a `macro_rules!` stub that expands to
-/// `unimplemented!()`. That lets `name::mac!(..)` call sites in any code rustdoc
-/// reads resolve, whatever type is expected, without real codegen.
+/// `#[proc_macro]` attributes are rejected outside a proc-macro crate. So for each
+/// `#[proc_macro]`, `#[proc_macro_attribute]` and `#[proc_macro_derive]` function we
+/// emit a `macro_rules!` stub that expands to `unimplemented!()`. That lets
+/// `name::mac!(..)` call sites in any code rustdoc reads resolve, whatever type is
+/// expected, and `pub use name::mac;` (of an attribute or a derive too) resolve,
+/// without real codegen. An attribute or a derive can still not be *applied* in a
+/// package that `cargo doc` documents, as the stub is a plain macro.
 ///
 /// The stub uses `#[macro_export]` under a mangled, crate-unique name, then
 /// aliases it to its real name inside the module. On stable Rust, `#[macro_export]`
 /// is the only way to make a `macro_rules!` macro re-exportable by path — which a
 /// user needs to lift the macro to their crate root (`pub use foo::the_macro;`).
-/// The mangled name keeps that re-export from clashing with the user's own.
+/// The mangled name keeps that re-export from clashing with the user's own, and
+/// `#[doc(hidden)]` keeps it off the crate root's documentation page; the alias
+/// is the item rustdoc shows (as `macro.NAME.html`, inlined in the module). The
+/// function's `#[doc]` attributes go onto the stub, so the page carries the docs
+/// the macro was written with.
+///
+/// Rustdoc can show an attribute as `attr.NAME.html` and a derive as
+/// `derive.NAME.html` only if they come from a real proc-macro crate it can load, or
+/// from `macro_rules!` with `attr(..)` / `derive(..)` rules, which are unstable
+/// (`#![feature(macro_attr, macro_derive)]`). Neither is possible here, so the page
+/// says what the macro is in a closing line instead.
 fn proc_macro_doc_surface(items: &[syn::Item], internal: &str) -> proc_macro2::TokenStream {
     let mut out = proc_macro2::TokenStream::new();
     for item in items {
@@ -191,26 +248,52 @@ fn proc_macro_doc_surface(items: &[syn::Item], internal: &str) -> proc_macro2::T
             syn::Item::Fn(func) => func,
             _ => continue,
         };
-        let is_proc_macro = func
+        let docs: Vec<&syn::Attribute> = func
             .attrs
             .iter()
-            .any(|attr| attr.path().is_ident("proc_macro"));
-        if !is_proc_macro {
-            continue;
+            .filter(|attr| attr.path().is_ident("doc"))
+            .collect();
+        for (name, kind) in proc_macros_of(func) {
+            let exported = Ident::new(
+                &format!("__subcrate_doc_{}_{}", internal, name),
+                name.span(),
+            );
+            // What rustdoc cannot show by the page's type, said in the page.
+            let note: Vec<String> = match kind {
+                ProcMacroKind::Bang => vec![],
+                ProcMacroKind::Attribute => {
+                    vec![format!("*An attribute macro: apply it as `#[{}]`.*", name)]
+                }
+                ProcMacroKind::Derive => {
+                    vec![format!(
+                        "*A derive macro: use it as `#[derive({})]`.*",
+                        name
+                    )]
+                }
+            };
+            // The stub is hidden, and rustdoc hides a re-export of a hidden item, so the
+            // alias asks to be inlined, unless the macro itself is meant to be hidden.
+            let inline = if docs.iter().any(|attr| is_doc_hidden(attr)) {
+                quote! {}
+            } else {
+                quote! { #[doc(inline)] }
+            };
+            out.extend(quote! {
+                #(#docs)*
+                #(
+                    #[doc = ""]
+                    #[doc = #note]
+                )*
+                #[doc(hidden)]
+                #[macro_export]
+                #[allow(unused_macros)]
+                macro_rules! #exported {
+                    ($($tt:tt)*) => { ::core::unimplemented!() };
+                }
+                #inline
+                pub use crate::#exported as #name;
+            });
         }
-        let name = &func.sig.ident;
-        let exported = Ident::new(
-            &format!("__subcrate_doc_{}_{}", internal, name),
-            name.span(),
-        );
-        out.extend(quote! {
-            #[macro_export]
-            #[allow(unused_macros)]
-            macro_rules! #exported {
-                ($($__subcrate_tt:tt)*) => { ::core::unimplemented!() };
-            }
-            pub use crate::#exported as #name;
-        });
     }
     out
 }
