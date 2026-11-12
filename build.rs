@@ -15,8 +15,9 @@
 //! # How it works
 //!
 //! 1. Discover the package's source files, from its crate roots (`src/lib.rs`,
-//!    `src/main.rs`, `src/bin/*.rs`, `tests/*.rs`, `benches/*.rs`, `examples/*.rs`)
-//!    through `mod foo;` and `#[path = "…"]`.
+//!    `src/main.rs`, `src/bin/*.rs`, `tests/*.rs`, `benches/*.rs`, `examples/*.rs`,
+//!    and the targets `Cargo.toml` declares) through `mod foo;` and
+//!    `#[path = "…"]`. [Which roots](#crate-roots) depends on the manifest.
 //! 2. Collect every `#[subcrate]` inline module.
 //! 3. Resolve the dependencies between subcrates, sort them with [`safegraph`],
 //!    and reject any cycle.
@@ -38,6 +39,26 @@
 //! every Cargo back to the 1.56 MSRV accepts; `cargo::` is 1.77+). Cargo forwards
 //! a build-script link path to dependent packages too, so publicly exported
 //! subcrates resolve downstream with no extra wiring.
+//!
+//! # Crate roots
+//!
+//! The roots are the targets Cargo builds, found as Cargo finds them. The library is
+//! `src/lib.rs`, or the `path` of `[lib]`. Binaries (`src/main.rs`, `src/bin/`),
+//! integration tests (`tests/`), benchmarks (`benches/`) and examples (`examples/`)
+//! are found by their place, and so are the `[[bin]]`, `[[test]]`, `[[bench]]` and
+//! `[[example]]` the manifest declares: by their `path`, or by their `name` in the
+//! place Cargo looks for it when there is none.
+//!
+//! Cargo's own switches apply: `autobins = false`, `autotests = false`,
+//! `autobenches = false` and `autoexamples = false` in `[package]` turn the discovery
+//! by place off for that kind of target, leaving the declared ones. Use them when one
+//! of those directories holds files that are not this package's — for instance a
+//! workspace whose root package keeps its tests in a package of their own, in
+//! `tests/`. Cargo does not build those files as targets of this package, and neither
+//! does this helper read them (nor does it re-run when they change). Left on, as they
+//! are by default, every `*.rs` there is a root, and a `#[subcrate]` in it must
+//! resolve within the package. (Cargo's `autolib` is not read: `src/lib.rs` is
+//! always a root.)
 //!
 //! # Toolchain-conditional subcrates
 //!
@@ -108,7 +129,11 @@
 //!
 //! Selecting the owner re-runs this build script inside that nested build, with
 //! `SUBCRATE_NESTED` set. There are two reasons the owner is selected, handled
-//! differently:
+//! differently. (The variable, like `SUBCRATE_HARVEST_ONLY` below, names the package
+//! whose build script set it, and only that package's build script honours it. The
+//! nested build also runs the build scripts of the owner's dependencies, and one of
+//! those that uses `subcrate` itself — a library with inline proc-macros, say —
+//! builds its own subcrates as usual.)
 //!
 //! - **Only to unify a path dependency's features.** The owner's library is not
 //!   wanted — just the dependency, built with the owner in the resolution — so the
@@ -124,6 +149,16 @@
 //!
 //! A subcrate in the library can't use the owner crate (it would depend on itself);
 //! ones in `tests/`, `src/main.rs`, `src/bin/`, `examples/` and `benches/` can.
+//!
+//! A dependency may itself be backed by subcrates, as the owner is: its build
+//! script compiles them in the nested build (into its `OUT_DIR`, as it would
+//! anywhere), and the dependency's metadata refers to them. So the subcrate that
+//! links it must be able to find them, and the build script forwards what the nested
+//! build learns: the library search paths the build scripts of the crates built asked
+//! for (`cargo:rustc-link-search`, read from the `build-script-executed` messages),
+//! as far as they are in the nested build's own directory, go to every subcrate built
+//! on owner dependencies — the place Cargo gives those paths to its own
+//! compilations, but not to these.
 //!
 //! # Cross-compiling
 //!
@@ -335,13 +370,16 @@ pub struct Config {
     /// The build profile (`PROFILE`): `release` builds the owner's dependencies
     /// with `--release`, anything else without.
     profile: String,
-    /// Whether this build script runs inside the nested Cargo build of another
-    /// `subcrate` build script (`SUBCRATE_NESTED` is set).
+    /// Whether this build script runs inside the nested Cargo build that *this
+    /// package's* own `subcrate` build script started (`SUBCRATE_NESTED` names this
+    /// package; see [`scope_key`]). The same variable also reaches the build scripts
+    /// of the package's dependencies built in that nested build, which are not
+    /// nested in this sense and so see `false`.
     nested: bool,
     /// Whether that nested build selected the owner only to unify a path
-    /// dependency's features (`SUBCRATE_HARVEST_ONLY` is set): the owner's own
-    /// library need not compile here, so this run does nothing and lets it fail
-    /// harmlessly. See [`build_owner_deps`](Self::build_owner_deps).
+    /// dependency's features (`SUBCRATE_HARVEST_ONLY` names this package): the
+    /// owner's own library need not compile here, so this run does nothing and lets
+    /// it fail harmlessly. See [`build_owner_deps`](Self::build_owner_deps).
     harvest_only: bool,
     /// An opt-in key that replaces the package name in the nested owner-dependency
     /// target directory, so the packages of a workspace can share one such build
@@ -359,13 +397,33 @@ pub struct Config {
 }
 
 /// Environment variable set on the nested Cargo build of the owner's
-/// dependencies, so a `subcrate` build script running inside it can tell.
+/// dependencies, so the owner's own `subcrate` build script, re-entered inside it,
+/// can tell. Its value is the owner's [`scope_key`]: the nested build also runs the
+/// build scripts of the owner's dependencies, and one of them that uses `subcrate`
+/// too must not take the variable for its own.
 const NESTED_ENV: &str = "SUBCRATE_NESTED";
 
 /// Environment variable set on the nested build when the owner was selected only to
 /// unify a path dependency's features, so the re-entered build script knows its
-/// owner library is throwaway and does nothing. See [`Config::build_owner_deps`].
+/// owner library is throwaway and does nothing. Scoped to the owner by its
+/// [`scope_key`], like [`NESTED_ENV`]. See [`Config::build_owner_deps`].
 const HARVEST_ONLY_ENV: &str = "SUBCRATE_HARVEST_ONLY";
+
+/// What names a package in [`NESTED_ENV`] and [`HARVEST_ONLY_ENV`]: its manifest
+/// directory, canonicalized (so the symlinks and `..`s of the path Cargo happens to
+/// use in the nested build do not matter). One package, one directory — two packages
+/// with the same name, or one package seen from two workspaces, are not mixed up.
+fn scope_key(manifest_dir: &Path) -> OsString {
+    canonical_path(manifest_dir).into_os_string()
+}
+
+/// Whether the environment variable `name` ([`NESTED_ENV`] or [`HARVEST_ONLY_ENV`])
+/// was set for the package `scope` names ([`scope_key`]), and only for that one.
+/// Another package's value is not: the variable reaches the build scripts of every
+/// package the nested build compiles.
+fn env_is_for(name: &str, scope: &OsString) -> bool {
+    std::env::var_os(name).map_or(false, |value| &value == scope)
+}
 
 impl Config {
     /// Builds a [`Config`] from the environment variables Cargo sets for build
@@ -382,8 +440,12 @@ impl Config {
         let rustc = PathBuf::from(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()));
         let cargo = PathBuf::from(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
         let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
-        let nested = std::env::var_os(NESTED_ENV).is_some();
-        let harvest_only = std::env::var_os(HARVEST_ONLY_ENV).is_some();
+        // Both variables are for the package whose build script set them: the nested
+        // build runs the build scripts of its dependencies too, and one of those that
+        // uses `subcrate` builds its own subcrates as usual.
+        let scope = scope_key(&manifest_dir);
+        let nested = env_is_for(NESTED_ENV, &scope);
+        let harvest_only = env_is_for(HARVEST_ONLY_ENV, &scope);
 
         let target = std::env::var("TARGET").ok();
         let host = std::env::var("HOST").ok();
@@ -484,8 +546,13 @@ impl Config {
         // Watch the root source directories too: a Cargo `rerun-if-changed` on a
         // directory fires when files are *added or removed*, so a brand-new file
         // containing a `#[subcrate]` re-runs discovery. (Per-file tracking alone
-        // would miss files that did not exist on the previous run.)
-        for dir in ["src", "tests", "benches", "examples"] {
+        // would miss files that did not exist on the previous run.) A directory the
+        // manifest turns auto-discovery off for is not watched: what is in it is not
+        // this package's, and its changes are none of this build script's business.
+        let auto = std::fs::read_to_string(self.manifest_dir.join("Cargo.toml"))
+            .map(|manifest| auto_discovery(&manifest))
+            .unwrap_or_default();
+        for dir in auto.root_dirs() {
             let path = self.manifest_dir.join(dir);
             if path.is_dir() {
                 rerun_if_changed(&path);
@@ -694,6 +761,22 @@ impl Config {
             .chain(self.host_deps.lib_dirs.iter())
     }
 
+    /// Every library search path the build scripts of the crates of both builds asked
+    /// for (see [`OwnerDeps::script_paths`]), but those that are [`dependency_dirs`]
+    /// already. As for those, a subcrate built on either build may need the other's:
+    /// a proc-macro subcrate that uses a host crate backed by subcrates finds them
+    /// there, and so does a library subcrate that uses that proc-macro subcrate.
+    ///
+    /// [`dependency_dirs`]: Self::dependency_dirs
+    fn script_dirs(&self) -> impl Iterator<Item = &PathBuf> {
+        self.owner_deps
+            .script_paths
+            .union(&self.host_deps.script_paths)
+            .filter(|dir| {
+                !self.owner_deps.lib_dirs.contains(*dir) && !self.host_deps.lib_dirs.contains(*dir)
+            })
+    }
+
     /// The link to the crate `name` built by [`Config::build_owner_deps`] (or, for a
     /// proc-macro subcrate of a cross-compiled package, by
     /// [`Config::build_host_deps`]), seen as `alias` by `sub`.
@@ -855,7 +938,6 @@ impl Config {
         let output = self.run_nested(&packages, &target_dir, harvest_only, false, &|output| {
             built_nested(output, harvest_only, &crates)
         })?;
-        let mut deps = parse_artifacts(&String::from_utf8_lossy(&output.stdout));
 
         // Reclaim the disk the nested build just spent. It re-stored the owner's
         // dependency chain in its own target directory, byte for byte the same as
@@ -874,9 +956,7 @@ impl Config {
             dedup_against_main(&target_dir, &main);
         }
 
-        deps.externals = crates;
-        self.watch_nested_inputs(&deps);
-        Ok(deps)
+        Ok(self.nested_deps(&output, &target_dir, crates))
     }
 
     /// Builds, when cross-compiling, the crates the `wanted` proc-macro subcrates take
@@ -949,10 +1029,7 @@ impl Config {
         let output = self.run_nested(&packages, &target_dir, links_local_dep, true, &|output| {
             built_nested(output, links_local_dep, &crates)
         })?;
-        let mut deps = parse_artifacts(&String::from_utf8_lossy(&output.stdout));
-        deps.externals = crates;
-        self.watch_nested_inputs(&deps);
-        Ok(deps)
+        Ok(self.nested_deps(&output, &target_dir, crates))
     }
 
     /// The lock file that says which version of a package `::name` stands for when
@@ -1017,6 +1094,26 @@ impl Config {
             crates,
             links_local_dep,
         })
+    }
+
+    /// What the nested build that `output` is the result of — of the crates `crates`
+    /// stand for, in `target_dir` — produced, as the subcrates link it.
+    fn nested_deps(
+        &self,
+        output: &std::process::Output,
+        target_dir: &Path,
+        crates: BTreeMap<String, ExternalCrate>,
+    ) -> OwnerDeps {
+        let mut deps = parse_artifacts(&String::from_utf8_lossy(&output.stdout));
+        deps.externals = crates;
+        // The search paths of the crates' build scripts that matter are the ones into
+        // what this build produced: a crate backed by subcrates has them in its
+        // `OUT_DIR`, and the crates they were built against next to that. A system
+        // library's directory (a `-sys` crate's build script) is not something a
+        // subcrate needs.
+        deps.script_paths.retain(|path| is_inside(path, target_dir));
+        self.watch_nested_inputs(&deps);
+        deps
     }
 
     /// Rebuilds the subcrates when the crates they link against change. Cargo does
@@ -1120,12 +1217,18 @@ impl Config {
         host: bool,
     ) -> Result<std::process::Output, Error> {
         let mut cmd = Command::new(&self.cargo);
+        let scope = scope_key(&self.manifest_dir);
         cmd.args(args)
             .current_dir(&self.manifest_dir)
-            .env(NESTED_ENV, "1")
+            .env(NESTED_ENV, &scope)
             .stdin(Stdio::null());
+        // Both are for this package alone (see `scope_key`). Whatever an enclosing
+        // nested build left in the environment is another package's, and does not
+        // apply to this one.
         if harvest_only {
-            cmd.env(HARVEST_ONLY_ENV, "1");
+            cmd.env(HARVEST_ONLY_ENV, &scope);
+        } else {
+            cmd.env_remove(HARVEST_ONLY_ENV);
         }
         // Cargo sets these for *this* build script only. Left in place they would
         // leak into the build scripts of the packages built below, which then
@@ -1904,6 +2007,16 @@ impl Config {
                 args.push("-L".into());
                 args.push(format!("dependency={}", dir.display()));
             }
+            // A dependency that is itself backed by subcrates names them in its
+            // metadata, and its build script put them where only it looks: Cargo
+            // forwards that search path to its own compilations, so forward it to
+            // these too. (Not to the package's own compilations: Cargo already
+            // gives them the main build's copy, and two copies of one crate on a
+            // search path are an error.)
+            for dir in self.script_dirs() {
+                args.push("-L".into());
+                args.push(format!("dependency={}", dir.display()));
+            }
         }
         let mut linked: HashSet<&str> = HashSet::new();
         for dep in deps {
@@ -2505,104 +2618,265 @@ fn canonical_path(path: &Path) -> PathBuf {
 
 /// Enumerates the crate-root files and the directory their top-level modules
 /// resolve against.
+///
+/// These are the targets Cargo builds, found the way Cargo finds them: the library
+/// and, unless the manifest turns that off, the files it discovers by their place
+/// (`src/main.rs` and `src/bin/`, `tests/`, `benches/`, `examples/` — see
+/// [`AutoDiscovery`]), plus every target the manifest declares, wherever its source is.
 fn crate_roots(manifest_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let manifest = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap_or_default();
+    let auto = auto_discovery(&manifest);
     let mut roots = Vec::new();
     let src = manifest_dir.join("src");
 
-    for name in ["lib.rs", "main.rs"] {
-        let file = src.join(name);
-        if file.is_file() {
-            roots.push((file, src.clone()));
+    // `autolib` (Cargo 1.83+) is not read: a library nobody builds costs nothing
+    // here, as `src/lib.rs` is rarely not the library, and in a package that has a
+    // `[lib]` of its own its path is added below.
+    let lib = src.join("lib.rs");
+    if lib.is_file() {
+        roots.push((lib, src.clone()));
+    }
+    if auto.bins {
+        let main = src.join("main.rs");
+        if main.is_file() {
+            roots.push((main, src.clone()));
         }
+        // Binaries: `src/bin/*.rs` and `src/bin/<name>/main.rs`.
+        collect_root_dir(&src.join("bin"), &mut roots);
+    }
+    if auto.tests {
+        // Integration tests: `tests/*.rs` and `tests/<name>/main.rs`.
+        collect_root_dir(&manifest_dir.join("tests"), &mut roots);
+    }
+    if auto.benches {
+        // Benchmarks: `benches/*.rs` and `benches/<name>/main.rs`.
+        collect_root_dir(&manifest_dir.join("benches"), &mut roots);
+    }
+    if auto.examples {
+        // Examples: `examples/*.rs` and `examples/<name>/main.rs`.
+        collect_root_dir(&manifest_dir.join("examples"), &mut roots);
     }
 
-    // Binaries: `src/bin/*.rs` and `src/bin/<name>/main.rs`.
-    collect_root_dir(&src.join("bin"), &mut roots);
-    // Integration tests: `tests/*.rs` and `tests/<name>/main.rs`.
-    collect_root_dir(&manifest_dir.join("tests"), &mut roots);
-    // Benchmarks: `benches/*.rs` and `benches/<name>/main.rs`.
-    collect_root_dir(&manifest_dir.join("benches"), &mut roots);
-    // Examples: `examples/*.rs` and `examples/<name>/main.rs`.
-    collect_root_dir(&manifest_dir.join("examples"), &mut roots);
-
-    // Targets whose source is not at a default location: a `[lib] path = "…"`, or
-    // a `[[bin]]`/`[[test]]`/`[[bench]]`/`[[example]]` with a `path`. Cargo lets any
-    // target live anywhere, so the library is not always `src/lib.rs`. The path is
-    // relative to the manifest directory and may point outside it (`../shared`),
-    // which a workspace can share between members. Added on top of the defaults
-    // above; `Walker` dedups by canonical path, so an overlap compiles once.
-    if let Ok(manifest) = std::fs::read_to_string(manifest_dir.join("Cargo.toml")) {
-        for rel in target_source_paths(&manifest) {
-            let file = manifest_dir.join(&rel);
-            if file.is_file() {
-                let dir = file
-                    .parent()
-                    .map_or_else(|| manifest_dir.to_path_buf(), Path::to_path_buf);
-                roots.push((file, dir));
-            }
+    // Targets the manifest declares: a `[lib] path = "…"`, or a
+    // `[[bin]]`/`[[test]]`/`[[bench]]`/`[[example]]`. Cargo lets any target live
+    // anywhere, so the library is not always `src/lib.rs`. A `path` is relative to the
+    // manifest directory and may point outside it (`../shared`), which a workspace can
+    // share between members. A target without a `path` is where Cargo looks for it
+    // by its name. These are added on top of the defaults above, which are all there
+    // is when discovery is on, and `Walker` dedups by canonical path, so an overlap
+    // compiles once.
+    let package = package_name(&manifest);
+    for target in declared_targets(&manifest) {
+        let candidates = match &target.path {
+            Some(path) => vec![manifest_dir.join(path)],
+            None => default_target_files(
+                manifest_dir,
+                &target.kind,
+                target.name.as_deref(),
+                package.as_deref(),
+            ),
+        };
+        for file in candidates.into_iter().filter(|file| file.is_file()) {
+            let dir = file
+                .parent()
+                .map_or_else(|| manifest_dir.to_path_buf(), Path::to_path_buf);
+            roots.push((file, dir));
         }
     }
 
     roots
 }
 
-/// The `path` of every explicitly-declared target in a `Cargo.toml`: the `[lib]`
-/// table and the `[[bin]]`, `[[test]]`, `[[bench]]` and `[[example]]` arrays of
-/// tables. These let a target's source live anywhere, so the library need not be
-/// `src/lib.rs`. Auto-discovery flags (`autolib`, `autobins`, …) are ignored: a
-/// stray extra root only gets scanned for `#[subcrate]` and, finding none, costs
-/// nothing, so there is no need to replicate Cargo's exclusion rules.
-fn target_source_paths(manifest: &str) -> Vec<String> {
-    target_paths(manifest)
-        .into_iter()
-        .map(|(_, path)| path)
-        .collect()
+/// Which kinds of targets Cargo finds by looking at the file system: `src/main.rs`
+/// and `src/bin/` (`autobins`), `tests/` (`autotests`), `benches/` (`autobenches`),
+/// `examples/` (`autoexamples`). Each can be turned off in `[package]`, leaving the
+/// targets the manifest declares as the only ones of their kind — the way for a
+/// package to have files in those directories that are not its own, as when the
+/// directory holds another package (a workspace whose root package has its tests in
+/// a package of their own in `tests/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutoDiscovery {
+    bins: bool,
+    tests: bool,
+    benches: bool,
+    examples: bool,
 }
 
-/// The `path` of the `[lib]` table of a `Cargo.toml`, if it has one.
-fn lib_source_path(manifest: &str) -> Option<String> {
-    target_paths(manifest)
-        .into_iter()
-        .find(|(table, _)| table == "lib")
-        .map(|(_, path)| path)
+impl Default for AutoDiscovery {
+    fn default() -> Self {
+        AutoDiscovery {
+            bins: true,
+            tests: true,
+            benches: true,
+            examples: true,
+        }
+    }
 }
 
-/// The `path` of every explicitly-declared target, with the name of its table.
-fn target_paths(manifest: &str) -> Vec<(String, String)> {
-    let mut paths = Vec::new();
-    let mut table = None;
+impl AutoDiscovery {
+    /// The directories of the package that hold crate roots, and so are watched for
+    /// files coming and going: `src`, and the others unless discovery is off for them.
+    fn root_dirs(self) -> Vec<&'static str> {
+        let mut dirs = vec!["src"];
+        for (dir, on) in [
+            ("tests", self.tests),
+            ("benches", self.benches),
+            ("examples", self.examples),
+        ] {
+            if on {
+                dirs.push(dir);
+            }
+        }
+        dirs
+    }
+}
+
+/// What a manifest's `[package]` says about [`AutoDiscovery`]: on unless
+/// `autobins`/`autotests`/`autobenches`/`autoexamples` is `false`.
+fn auto_discovery(manifest: &str) -> AutoDiscovery {
+    let mut auto = AutoDiscovery::default();
+    for (key, value) in package_entries(manifest) {
+        let slot = match key.as_str() {
+            "autobins" => &mut auto.bins,
+            "autotests" => &mut auto.tests,
+            "autobenches" => &mut auto.benches,
+            "autoexamples" => &mut auto.examples,
+            _ => continue,
+        };
+        match value.trim() {
+            "false" => *slot = false,
+            "true" => *slot = true,
+            _ => {}
+        }
+    }
+    auto
+}
+
+/// The `[package]` table of a manifest as `(key, value)` pairs, the value as written
+/// (without a comment).
+fn package_entries(manifest: &str) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    let mut in_package = false;
+    for raw in manifest.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_package = line[1..line.len() - 1].trim() == "package";
+        } else if in_package {
+            if let Some((key, value)) = split_key_value(line) {
+                entries.push((key.trim().to_string(), value.trim().to_string()));
+            }
+        }
+    }
+    entries
+}
+
+/// The `[package]` name of a manifest.
+fn package_name(manifest: &str) -> Option<String> {
+    package_entries(manifest)
+        .into_iter()
+        .find(|(key, _)| key == "name")
+        .and_then(|(_, value)| toml_string_value(&value))
+}
+
+/// A target a `Cargo.toml` declares: its `[lib]` table, or an entry of the
+/// `[[bin]]`, `[[test]]`, `[[bench]]` or `[[example]]` arrays of tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclaredTarget {
+    /// `lib`, `bin`, `test`, `bench` or `example`.
+    kind: String,
+    name: Option<String>,
+    /// Where the source is, relative to the manifest directory, if the manifest says.
+    path: Option<String>,
+}
+
+/// Every target a `Cargo.toml` declares: the `[lib]` table and the `[[bin]]`,
+/// `[[test]]`, `[[bench]]` and `[[example]]` arrays of tables, with the `name` and
+/// `path` they give. These let a target's source live anywhere, so the library need
+/// not be `src/lib.rs`.
+fn declared_targets(manifest: &str) -> Vec<DeclaredTarget> {
+    let mut targets = Vec::new();
+    let mut current: Option<DeclaredTarget> = None;
     for raw in manifest.lines() {
         let line = strip_toml_comment(raw).trim();
         if line.is_empty() {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
+            targets.extend(current.take());
             // `[lib]`, or an array-of-tables header like `[[bin]]` (inner `[bin]`).
             let inner = line[1..line.len() - 1]
                 .trim()
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .trim();
-            table = match inner {
-                "lib" | "bin" | "test" | "bench" | "example" => Some(inner.to_string()),
+            current = match inner {
+                "lib" | "bin" | "test" | "bench" | "example" => Some(DeclaredTarget {
+                    kind: inner.to_string(),
+                    name: None,
+                    path: None,
+                }),
                 _ => None,
             };
             continue;
         }
-        let table = match &table {
-            Some(table) => table,
+        let target = match &mut current {
+            Some(target) => target,
             None => continue,
         };
-        // `path = "…"` (require `path` as its own key, not a prefix like `pathsep`).
-        if let Some(rest) = line.strip_prefix("path") {
-            if let Some(value) = rest.trim_start().strip_prefix('=') {
-                if let Some(s) = toml_string_value(value.trim()) {
-                    paths.push((table.clone(), s));
-                }
+        // `name = "…"` and `path = "…"`, each as its own key (not a prefix like
+        // `pathsep`).
+        if let Some((key, value)) = split_key_value(line) {
+            let slot = match key.trim() {
+                "name" => &mut target.name,
+                "path" => &mut target.path,
+                _ => continue,
+            };
+            if let Some(value) = toml_string_value(value.trim()) {
+                *slot = Some(value);
             }
         }
     }
-    paths
+    targets.extend(current);
+    targets
+}
+
+/// The `path` of the `[lib]` table of a `Cargo.toml`, if it has one.
+fn lib_source_path(manifest: &str) -> Option<String> {
+    declared_targets(manifest)
+        .into_iter()
+        .find(|target| target.kind == "lib")
+        .and_then(|target| target.path)
+}
+
+/// Where Cargo looks for the source of a declared target that gives no `path`, by its
+/// `name`: `tests/<name>.rs` or `tests/<name>/main.rs` for a test (likewise for
+/// benchmarks and examples), `src/bin/<name>.rs` or `src/bin/<name>/main.rs` for a
+/// binary, which is `src/main.rs` if it is named like the package. The library's is
+/// `src/lib.rs`, already a root.
+fn default_target_files(
+    manifest_dir: &Path,
+    kind: &str,
+    name: Option<&str>,
+    package: Option<&str>,
+) -> Vec<PathBuf> {
+    let dir = match kind {
+        "bin" => manifest_dir.join("src").join("bin"),
+        "test" => manifest_dir.join("tests"),
+        "bench" => manifest_dir.join("benches"),
+        "example" => manifest_dir.join("examples"),
+        _ => return Vec::new(),
+    };
+    let name = match name {
+        Some(name) => name,
+        None => return Vec::new(),
+    };
+    let mut files = Vec::new();
+    if kind == "bin" && Some(name) == package {
+        files.push(manifest_dir.join("src").join("main.rs"));
+    }
+    files.push(dir.join(format!("{}.rs", name)));
+    files.push(dir.join(name).join("main.rs"));
+    files
 }
 
 /// Collects root files from a directory that may contain both `*.rs` files and
@@ -4594,6 +4868,15 @@ struct OwnerDeps {
     /// Every directory holding an artifact: search paths for the dependencies'
     /// own dependencies.
     lib_dirs: BTreeSet<PathBuf>,
+    /// The library search paths the build scripts of the crates built asked for
+    /// (`cargo:rustc-link-search`), as far as they are in the nested build's own
+    /// target directory. A crate that is backed by subcrates keeps those in
+    /// `OUT_DIR/subcrates`, a directory of none of its artifacts' — and its metadata
+    /// refers to them, so whatever compiles against that crate has to be able to find
+    /// them (and the crates *they* were built against, which its own nested build
+    /// put elsewhere). Cargo gives these paths to the compilations it runs, not to the
+    /// subcrates this build script compiles.
+    script_paths: BTreeSet<PathBuf>,
     /// The manifests and sources of the path dependencies built, which change
     /// when someone edits them.
     sources: BTreeSet<PathBuf>,
@@ -4713,6 +4996,10 @@ fn scan_build_artifacts(base: &Path) -> (BTreeMap<String, PathBuf>, BTreeSet<Pat
 fn parse_artifacts(stdout: &str) -> OwnerDeps {
     let mut deps = OwnerDeps::default();
     for line in stdout.lines() {
+        if line.contains("\"reason\":\"build-script-executed\"") {
+            deps.script_paths.extend(build_script_link_paths(line));
+            continue;
+        }
         if !line.contains("\"reason\":\"compiler-artifact\"") {
             continue;
         }
@@ -4793,6 +5080,35 @@ fn parse_artifacts(stdout: &str) -> OwnerDeps {
         krate.prefer_hashed_rlib();
     }
     deps
+}
+
+/// The library search paths one `build-script-executed` message reports
+/// (`"linked_paths":["/…/out/subcrates","dependency=/…/debug"]`), without their
+/// kind. A `framework` path is no place for crates and is left out.
+fn build_script_link_paths(message: &str) -> Vec<PathBuf> {
+    json_string_array_field(message, "linked_paths")
+        .into_iter()
+        .filter_map(|entry| {
+            // `kind=path`, or just `path` (a path may itself contain `=`, so only the
+            // kinds Cargo knows are cut off).
+            let kinds = ["native", "dependency", "crate", "all"];
+            let path = match kinds
+                .iter()
+                .find_map(|kind| entry.strip_prefix(&format!("{}=", kind)))
+            {
+                Some(path) => path,
+                None if entry.starts_with("framework=") => return None,
+                None => entry.as_str(),
+            };
+            Some(PathBuf::from(path))
+        })
+        .collect()
+}
+
+/// Whether `path` is in the directory `dir`, however either is spelled (symlinks
+/// resolved when it is not literally inside).
+fn is_inside(path: &Path, dir: &Path) -> bool {
+    path.starts_with(dir) || canonical_path(path).starts_with(canonical_path(dir))
 }
 
 impl OwnerCrate {
@@ -6136,7 +6452,9 @@ mod tests {
     /// Runs `Config::build_owner_deps` for `subs` (all wanted) with a stand-in for
     /// Cargo — `/bin/sh build …` run in the package's directory, where `build` is a
     /// script that records its arguments and answers with `messages` — and returns
-    /// what it built and the arguments it was given. The package is `owner`, with the
+    /// what it built and the arguments it was given, followed by three more lines:
+    /// `SUBCRATE_NESTED=…`, `SUBCRATE_HARVEST_ONLY=…` (`unset`, or the value) and
+    /// `PWD=…`, as the nested build saw them. The package is `owner`, with the
     /// given manifest and lock file and its build directory `target/debug/build`.
     #[cfg(unix)]
     fn nested_build(
@@ -6152,9 +6470,14 @@ mod tests {
         std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
         std::fs::write(dir.join("Cargo.lock"), lock).unwrap();
         std::fs::write(dir.join("messages.txt"), messages).unwrap();
+        // Records the arguments, and then the environment that matters to a nested
+        // `subcrate` build script (`NAME=value`, `unset` when it is not set, and the
+        // physical directory the build runs in).
         std::fs::write(
             dir.join("build"),
-            "printf '%s\\n' \"$@\" > args.txt\ncat messages.txt\n",
+            "printf '%s\\n' \"$@\" \"SUBCRATE_NESTED=${SUBCRATE_NESTED-unset}\" \
+             \"SUBCRATE_HARVEST_ONLY=${SUBCRATE_HARVEST_ONLY-unset}\" \"PWD=$(pwd -P)\" > args.txt\n\
+             cat messages.txt\n",
         )
         .unwrap();
         let mut config = config();
@@ -6810,6 +7133,186 @@ checksum = \"11\"
         assert_eq!(toml_quote(Path::new("C:\\a\\\"b")), "\"C:\\\\a\\\\\\\"b\"");
     }
 
+    #[test]
+    fn a_nested_build_variable_is_for_the_one_package_it_names() {
+        // A name of its own: the real variables are not touched.
+        let name = "SUBCRATE_TEST_SCOPED_VARIABLE";
+        let here = scope_key(Path::new("/w/here"));
+        std::env::remove_var(name);
+        assert!(!env_is_for(name, &here));
+        std::env::set_var(name, &here);
+        assert!(env_is_for(name, &here));
+        // Set for another package, as it is in the build scripts of that package's
+        // dependencies: not for this one.
+        assert!(!env_is_for(name, &scope_key(Path::new("/w/there"))));
+        // And the value `1` the variables used to have (for everyone) names no one.
+        std::env::set_var(name, "1");
+        assert!(!env_is_for(name, &here));
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn a_package_is_named_by_its_canonical_manifest_directory() {
+        let dir = std::env::temp_dir().join(format!("subcrate-scope-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        // However Cargo happens to spell the directory, it is one package.
+        assert_eq!(
+            scope_key(&dir.join("pkg").join("..").join("pkg")),
+            scope_key(&dir.join("pkg"))
+        );
+        assert_ne!(scope_key(&dir.join("pkg")), scope_key(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_nested_build_is_set_up_for_this_package_alone() {
+        let leaf = |manifest: &str| {
+            let subs = [sub("tests/t.rs", &["user"], vec![ext("leaf")])];
+            nested_build("scope", manifest, MULTI_LOCK, "", &subs)
+        };
+        // Another package's nested build sets the variables for *its* build scripts, and
+        // this package's build script runs inside it, as a dependency.
+        let other = scope_key(Path::new("/w/other"));
+        std::env::set_var(NESTED_ENV, &other);
+        std::env::set_var(HARVEST_ONLY_ENV, &other);
+
+        // The owner joins the nested build only to unify a path dependency's features:
+        // both variables, for this package.
+        let path = "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = { path = \"../leaf\" }\n";
+        let (result, args, _) = leaf(path);
+        result.unwrap();
+        let line = |args: &[String], name: &str| {
+            let prefix = format!("{}=", name);
+            args.iter()
+                .find_map(|arg| arg.strip_prefix(prefix.as_str()))
+                .unwrap()
+                .to_string()
+        };
+        // The nested build runs in the package's directory: the one the variables name.
+        let this = line(&args, "PWD");
+        assert_eq!(line(&args, NESTED_ENV), this);
+        assert_eq!(line(&args, HARVEST_ONLY_ENV), this);
+
+        // A registry dependency does not need the owner: nothing to harvest, so the
+        // other package's value is not passed on.
+        let registry = "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n";
+        let (result, args, _) = leaf(registry);
+        result.unwrap();
+        let this = line(&args, "PWD");
+        assert_eq!(line(&args, NESTED_ENV), this);
+        assert_eq!(line(&args, HARVEST_ONLY_ENV), "unset");
+
+        std::env::remove_var(NESTED_ENV);
+        std::env::remove_var(HARVEST_ONLY_ENV);
+    }
+
+    #[test]
+    fn the_search_paths_of_build_scripts_are_read_from_cargos_messages() {
+        // `backed`'s build script has its subcrates in `out/subcrates` (a kindless
+        // path), and its own nested build's directories as `dependency` paths.
+        let message = concat!(
+            r#"{"reason":"build-script-executed","package_id":"path+file:///w/backed#0.1.0","#,
+            r#""linked_libs":[],"linked_paths":["/t/debug/build/backed-1/out/subcrates","#,
+            r#""dependency=/t/debug/subcrate-owner-deps/backed/1.99/debug","#,
+            r#""native=/usr/lib","framework=/Library/Frameworks"],"cfgs":[],"env":[],"#,
+            r#""out_dir":"/t/debug/build/backed-1/out"}"#,
+        );
+        let quiet = r#"{"reason":"build-script-executed","package_id":"x","linked_libs":[],"linked_paths":[],"cfgs":[],"env":[],"out_dir":"/t/out"}"#;
+        let deps = parse_artifacts(&format!("{}\n{}\n", quiet, message));
+        let paths: Vec<&Path> = deps.script_paths.iter().map(PathBuf::as_path).collect();
+        // The kind is dropped, a framework directory is not a place for crates, and
+        // the message is not an artifact.
+        assert_eq!(
+            paths,
+            [
+                Path::new("/t/debug/build/backed-1/out/subcrates"),
+                Path::new("/t/debug/subcrate-owner-deps/backed/1.99/debug"),
+                Path::new("/usr/lib"),
+            ]
+        );
+        assert!(deps.crates.is_empty() && deps.lib_dirs.is_empty());
+    }
+
+    #[test]
+    fn a_path_is_inside_a_directory_by_its_components() {
+        assert!(is_inside(Path::new("/t/a/b/c"), Path::new("/t/a")));
+        assert!(is_inside(Path::new("/t/a"), Path::new("/t/a")));
+        assert!(!is_inside(Path::new("/t/ab"), Path::new("/t/a")));
+        assert!(!is_inside(Path::new("/usr/lib"), Path::new("/t/a")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_search_paths_into_the_nested_build_are_kept() {
+        let dir =
+            std::env::temp_dir().join(format!("subcrate-nested-scripts-{}", std::process::id()));
+        // Where `nested_build` has the nested build go (the compiler is `rustc`'s).
+        let target = shared_target_dir(
+            &dir.join("target/debug/build/owner-1a/out"),
+            "owner",
+            rustc_key(Path::new("rustc")).as_deref(),
+        );
+        let messages = format!(
+            concat!(
+                r#"{{"reason":"build-script-executed","package_id":"path+file:///w/backed#0.1.0","#,
+                r#""linked_libs":[],"linked_paths":["{inside}/x/out/subcrates","native=/usr/lib"],"#,
+                r#""cfgs":[],"env":[],"out_dir":"{inside}/x/out"}}"#
+            ),
+            inside = target.display()
+        );
+        let registry = "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n";
+        let subs = [sub("tests/t.rs", &["user"], vec![ext("leaf")])];
+        let (result, _, _) = nested_build("scripts", registry, MULTI_LOCK, &messages, &subs);
+        let paths: Vec<PathBuf> = result.unwrap().script_paths.into_iter().collect();
+        // What the build's own scripts put in its target directory, not a system path.
+        assert_eq!(paths, [target.join("x/out/subcrates")]);
+    }
+
+    #[test]
+    fn subcrates_built_on_owner_dependencies_search_the_dependencies_subcrate_paths() {
+        let mut config = config();
+        config.owner_deps = external_artifacts();
+        config
+            .owner_deps
+            .script_paths
+            .insert(PathBuf::from("t/debug/build/backed/h/out/subcrates"));
+        // One a search path of the artifacts already: not given twice.
+        config
+            .owner_deps
+            .script_paths
+            .insert(PathBuf::from("t/debug"));
+        let on_owner_dep = ExternDep {
+            owner_linked: true,
+            ..linked("__subcrate_b_1", "b")
+        };
+        let args = config.rustc_args(
+            &top("a", vec![]),
+            &[on_owner_dep],
+            Path::new("out/subcrates"),
+        );
+        let searched: Vec<&String> = args
+            .iter()
+            .filter(|arg| arg.starts_with("dependency="))
+            .collect();
+        assert_eq!(
+            searched,
+            [
+                "dependency=out/subcrates",
+                "dependency=t/debug",
+                "dependency=t/debug/build/leaf/h/out",
+                "dependency=t/debug/build/backed/h/out/subcrates",
+            ]
+        );
+        // A subcrate that links nothing built by Cargo does not look there.
+        let args = config.rustc_args(
+            &top("a", vec![]),
+            &[linked("__subcrate_b_1", "b")],
+            Path::new("out/subcrates"),
+        );
+        assert!(!args.iter().any(|arg| arg.contains("backed")), "{:?}", args);
+    }
+
     /// A lock file with the owner, its dependencies and an unrelated package.
     const LOCK: &str = "version = 3
 
@@ -7306,8 +7809,12 @@ path = \"ignored\"
 ";
         // `[lib]`/`[[bin]]`/`[[test]]`/`[[example]]` paths, in order; a `path` key
         // in a non-target section (`[package]`, `[dependencies]`) is ignored.
+        let paths: Vec<String> = declared_targets(manifest)
+            .into_iter()
+            .filter_map(|target| target.path)
+            .collect();
         assert_eq!(
-            target_source_paths(manifest),
+            paths,
             [
                 "src/the_lib.rs",
                 "bin/tool.rs",
@@ -7318,6 +7825,219 @@ path = \"ignored\"
         // The library's own path, for the owner crate.
         assert_eq!(lib_source_path(manifest).as_deref(), Some("src/the_lib.rs"));
         assert_eq!(lib_source_path("[package]\nname = \"p\"\n"), None);
+    }
+
+    fn target(kind: &str, name: Option<&str>, path: Option<&str>) -> DeclaredTarget {
+        DeclaredTarget {
+            kind: kind.to_string(),
+            name: name.map(str::to_string),
+            path: path.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn declared_targets_carry_their_name_and_path() {
+        let manifest = "\
+[package]
+name = \"x\"
+
+[lib]
+name = \"x_lib\"
+
+[[test]]
+name = \"by_name\"
+
+[[test]]
+name = \"elsewhere\"
+path = \"suite/elsewhere.rs\" # a comment
+harness = false
+
+[[bin]]
+path = \"src/nameless.rs\"
+
+[features]
+name = \"not-a-target\"
+
+[[bench]]
+name = \"last\"
+";
+        assert_eq!(
+            declared_targets(manifest),
+            [
+                target("lib", Some("x_lib"), None),
+                target("test", Some("by_name"), None),
+                target("test", Some("elsewhere"), Some("suite/elsewhere.rs")),
+                target("bin", None, Some("src/nameless.rs")),
+                target("bench", Some("last"), None),
+            ]
+        );
+        assert_eq!(declared_targets("[package]\nname = \"p\"\n"), []);
+        assert_eq!(package_name(manifest).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn target_discovery_is_on_unless_the_manifest_turns_it_off() {
+        let on = AutoDiscovery::default();
+        assert_eq!(auto_discovery(""), on);
+        assert_eq!(auto_discovery("[package]\nname = \"p\"\n"), on);
+        assert_eq!(
+            auto_discovery("[package]\nautotests = true # the default\nautobins = true\n"),
+            on
+        );
+        // Each flag is its own: only the kind it names is off.
+        let off = |manifest: &str| auto_discovery(&format!("[package]\n{}\n", manifest));
+        let flags = |auto: AutoDiscovery| [auto.bins, auto.tests, auto.benches, auto.examples];
+        assert_eq!(flags(off("autobins = false")), [false, true, true, true]);
+        assert_eq!(flags(off("autotests = false")), [true, false, true, true]);
+        assert_eq!(flags(off("autobenches=false")), [true, true, false, true]);
+        assert_eq!(
+            flags(off("autoexamples = false # no")),
+            [true, true, true, false]
+        );
+        // Only `[package]` says so.
+        assert_eq!(
+            auto_discovery("[dependencies]\nautotests = false\n[package]\nname = \"p\"\n"),
+            on
+        );
+        // The directories to watch follow.
+        assert_eq!(on.root_dirs(), ["src", "tests", "benches", "examples"]);
+        assert_eq!(
+            off("autotests = false").root_dirs(),
+            ["src", "benches", "examples"]
+        );
+        assert_eq!(
+            auto_discovery(
+                "[package]\nautotests = false\nautobenches = false\nautoexamples = false"
+            )
+            .root_dirs(),
+            ["src"]
+        );
+    }
+
+    /// A package in a temporary directory: its `Cargo.toml` and the given (empty)
+    /// files, and the file names `crate_roots` finds, relative to it, in order.
+    fn roots_of(test: &str, manifest: &str, files: &[&str]) -> Vec<String> {
+        let dir =
+            std::env::temp_dir().join(format!("subcrate-roots-{}-{}", test, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
+        for file in files {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+        }
+        let mut roots: Vec<String> = crate_roots(&dir)
+            .into_iter()
+            .map(|(file, _)| {
+                file.strip_prefix(&dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        roots.sort();
+        roots
+    }
+
+    const LAYOUT: &[&str] = &[
+        "src/lib.rs",
+        "src/main.rs",
+        "src/bin/a.rs",
+        "src/bin/b/main.rs",
+        "tests/t.rs",
+        "tests/u/main.rs",
+        "benches/b.rs",
+        "examples/e.rs",
+        "suite/s.rs",
+    ];
+
+    #[test]
+    fn target_roots_are_found_by_their_place_by_default() {
+        let all = [
+            "benches/b.rs",
+            "examples/e.rs",
+            "src/bin/a.rs",
+            "src/bin/b/main.rs",
+            "src/lib.rs",
+            "src/main.rs",
+            "tests/t.rs",
+            "tests/u/main.rs",
+        ];
+        assert_eq!(
+            roots_of("default", "[package]\nname = \"p\"\n", LAYOUT),
+            all
+        );
+        // `true` is the default, and the flags are `[package]` keys alone.
+        assert_eq!(
+            roots_of(
+                "true",
+                "[package]\nname = \"p\"\nautotests = true\n[dependencies]\nautobins = false\n",
+                LAYOUT
+            ),
+            all
+        );
+    }
+
+    #[test]
+    fn target_discovery_that_is_off_leaves_only_the_declared_targets() {
+        // The tests, benchmarks, examples and binaries are the package's own only if
+        // it declares them: files in those places are otherwise someone else's (the
+        // tests of a workspace's root package, in a package of their own in `tests/`).
+        let off = "[package]\nname = \"p\"\nautotests = false\nautobenches = false\n\
+                   autoexamples = false\nautobins = false\n";
+        assert_eq!(roots_of("off", off, LAYOUT), ["src/lib.rs"]);
+
+        // Each flag leaves the others alone.
+        assert_eq!(
+            roots_of(
+                "tests-off",
+                "[package]\nname = \"p\"\nautotests = false\n",
+                LAYOUT
+            ),
+            [
+                "benches/b.rs",
+                "examples/e.rs",
+                "src/bin/a.rs",
+                "src/bin/b/main.rs",
+                "src/lib.rs",
+                "src/main.rs",
+            ]
+        );
+
+        // The declared ones are roots, with or without a `path`, whatever the
+        // directory: `[[test]]`, `[[bench]]` and `[[example]]` by name (as `.rs` or
+        // `main.rs` in a directory of that name), a `[[bin]]` named like the package
+        // by `src/main.rs`, any other by `src/bin/<name>`.
+        let declared = format!(
+            "{}{}",
+            off,
+            "[[test]]\nname = \"t\"\n[[test]]\nname = \"u\"\n\
+             [[test]]\nname = \"elsewhere\"\npath = \"suite/s.rs\"\n\
+             [[bench]]\nname = \"b\"\n[[example]]\nname = \"e\"\n\
+             [[bin]]\nname = \"p\"\n[[bin]]\nname = \"b\"\n\
+             [[test]]\nname = \"missing\"\n"
+        );
+        assert_eq!(
+            roots_of("declared", &declared, LAYOUT),
+            [
+                "benches/b.rs",
+                "examples/e.rs",
+                "src/bin/b/main.rs",
+                "src/lib.rs",
+                "src/main.rs",
+                "suite/s.rs",
+                "tests/t.rs",
+                "tests/u/main.rs",
+            ]
+        );
+        // A binary of another name than the package's is not `src/main.rs`.
+        let other = format!("{}{}", off, "[[bin]]\nname = \"a\"\n");
+        assert_eq!(
+            roots_of("bin", &other, LAYOUT),
+            ["src/bin/a.rs", "src/lib.rs"]
+        );
     }
 
     #[test]

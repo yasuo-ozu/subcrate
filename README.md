@@ -124,9 +124,14 @@ machinery out of its own build with `default-features = false`.
 `subcrate::build::compile()` runs from your build script. It:
 
 1. Finds the package's source files, from its crate roots (`src/lib.rs`,
-   `src/main.rs`, `src/bin/*.rs`, `tests/*.rs`, `benches/*.rs`, `examples/*.rs`)
-   through `mod foo;` and `#[path = "…"]`. It starts from `CARGO_MANIFEST_DIR`, so
-   a published, extracted package works too.
+   `src/main.rs`, `src/bin/*.rs`, `tests/*.rs`, `benches/*.rs`, `examples/*.rs`,
+   and the targets `Cargo.toml` declares) through `mod foo;` and `#[path = "…"]`.
+   It starts from `CARGO_MANIFEST_DIR`, so a published, extracted package works
+   too. The roots are the package's targets: with `autotests = false`
+   (`autobins`, `autobenches`, `autoexamples`) in `[package]`, the files in
+   `tests/` (`src/bin/`, `benches/`, `examples/`) are not read unless a
+   `[[test]]` (`[[bin]]`, …) declares them — for a package whose `tests/` holds
+   another package.
 2. Finds every `#[subcrate]` inline module in them.
 3. Compiles each with `rustc` directly (from `$RUSTC`).
 4. Puts the crates on the library search path and writes a small manifest the
