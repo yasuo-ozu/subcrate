@@ -88,6 +88,9 @@ pub use macros::mac;             // now `thiscrate::mac!()` works...
 pub fn ordinary() -> usize { 7 } // ...next to ordinary items, in one crate.
 ```
 
+Attribute macros (`#[proc_macro_attribute]`) and derive macros (`#[proc_macro_derive]`)
+are re-exported the same way, and documented too (see [Known limitations](#known-limitations)).
+
 ## Setup
 
 Three pieces, all required.
@@ -117,7 +120,20 @@ If the build helper never runs, `#[subcrate]` gives a clear compile error instea
 of a confusing linker failure.
 
 A crate that needs only the attribute, not `build::compile`, can leave the build
-machinery out of its own build with `default-features = false`.
+machinery out of its own build with `default-features = false`. Then `subcrate` is
+`#![no_std]` and only the attribute is left, so a `no_std` package can depend on it
+and be built for a target without `std` (e.g. `x86_64-unknown-none`):
+
+```toml
+[dependencies]
+subcrate = { version = "0.2", default-features = false }
+
+[build-dependencies]
+subcrate = "0.2" # the build helper runs on the host, with the default features
+```
+
+This relies on the feature resolver 2 (the default since the 2021 edition), which
+keeps the build-dependency's default features out of the normal dependency.
 
 ## How it works
 
@@ -229,6 +245,27 @@ edit/run loop is quicker than [`trybuild`] on the same compile-fail cases (24 ca
 - That stand-in can import a sibling dependency only if it is in the same crate
   root (`src/lib.rs`, or the same test/bin/example file); a cross-root dependency
   has no `crate::` path, so references to it may not resolve under `cargo doc`.
+- Under `cargo doc` a `proc_macro` subcrate is replaced by a stand-in, because
+  `rustdoc` is not given the build helper's search path and so cannot load the real
+  crate. For each `#[proc_macro]`, `#[proc_macro_attribute]` and
+  `#[proc_macro_derive(Name)]` function the stand-in defines a `macro_rules!` macro
+  with the function's doc comment (a `#[doc(hidden)]` function stays hidden), so
+  `pub use macros::{mac, attr, Name};` resolves and the package is documented. Two
+  consequences:
+  - The pages are all `macro.NAME.html` ("Macros"). Rustdoc shows `attr.NAME.html`
+    and `derive.NAME.html` only for a proc-macro crate it can load, or for
+    `macro_rules!` with `attr(..)`/`derive(..)` rules, which are unstable
+    (`#![feature(macro_attr, macro_derive)]`, a crate-level attribute that a
+    stand-in cannot add). So the page of an attribute or a derive ends with a line
+    saying what it is (`apply it as #[NAME]`, `use it as #[derive(NAME)]`).
+  - The stand-in is a plain macro, so *applying* an attribute or a derive of it in
+    the documented package fails (`cannot find attribute`). Guard those uses, and the
+    derive's helper attributes, with `#[cfg_attr(not(doc), NAME)]` and
+    `#[cfg_attr(not(doc), derive(NAME))]`. Only the documentation build is
+    affected; builds, tests and doc tests use the real crate.
+
+  The code blocks in a macro's doc comment are doc tests of the package, as they would
+  be in a proc-macro crate of their own.
 - A crate the package depends on (`#[subcrate(::syn)]`) is built by a nested,
   `--offline` `cargo build`. When cross-compiling, a proc-macro subcrate's crates
   are built for the **host** (it runs there) and a library subcrate's for the
