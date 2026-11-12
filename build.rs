@@ -125,6 +125,83 @@
 //! A subcrate in the library can't use the owner crate (it would depend on itself);
 //! ones in `tests/`, `src/main.rs`, `src/bin/`, `examples/` and `benches/` can.
 //!
+//! # Cross-compiling
+//!
+//! When `--target` is not the host, a library subcrate is built for the target, like
+//! the package, but a proc-macro subcrate is built for the host, and runs there. The
+//! crates a proc-macro subcrate uses (`#[subcrate(proc_macro, ::syn)]`) are therefore
+//! built for the host as well, by a second nested Cargo build of their own: `cargo
+//! build -p <dep>… --lib --target <host>` into `subcrate-owner-deps/<package>/<compiler>-host`,
+//! while the library subcrates' crates keep coming from the build for the target. A
+//! crate used by both kinds is built twice. So a `#![no_std]` library for a bare-metal
+//! target can have a proc-macro subcrate on `::syn`, a crate that could never be built
+//! for that target.
+//!
+//! What this needs of the declaration of the crate in `Cargo.toml`: Cargo builds `-p
+//! <dep>` only for a *normal dependency of the package that its resolution switches on
+//! for the platform being built* (here the host's), and — as the nested build is
+//! `--offline` — one that is in the local cache, which a crate the outer build never
+//! builds is not. Cargo panics on anything else (see below). For a crate the
+//! bare-metal build must not compile, that is a platform-gated normal dependency that
+//! the host satisfies, which also puts the crate in the lock file and the cache when
+//! the package is built for the host:
+//!
+//! ```toml
+//! [target.'cfg(not(target_os = "none"))'.dependencies]
+//! syn = "2"
+//! ```
+//!
+//! An optional dependency whose feature is off in the build (`--no-default-features`)
+//! does not qualify, nor does one that is only a build-dependency, nor does one that
+//! a `[target.'cfg(…)'.dependencies]` table excludes on the host: Cargo then fails
+//! (the nested build reports it, with this hint) — unless the dependency is a path
+//! dependency that is a member of the same workspace, which Cargo builds whatever its
+//! features. (So a proc-macro subcrate that needs a crate only a no-std build of the
+//! package leaves out takes it from a platform-gated normal dependency as above, not
+//! from an optional one.)
+//!
+//! A proc-macro subcrate cannot use the owner crate (`::owner`, built for the target)
+//! nor a library subcrate (the same) when cross-compiling, and says so.
+//!
+//! # Packaged crates
+//!
+//! The nested build runs in the package's own directory, where Cargo finds the
+//! workspace and `Cargo.lock` that govern it. That is right for a member of the
+//! workspace being built, and for a source tree. For a crate *built from a registry*
+//! (or a git checkout) it would not be: its own `Cargo.lock` is the one it was
+//! published with, naming versions that need not be in the local cache — the nested
+//! build is `--offline`, so it would fail for want of a download — and Cargo would
+//! rewrite that file in the registry's source directory, which is not the build's to
+//! write.
+//!
+//! So a crate that was packaged (it holds `Cargo.toml.orig`, or lies under Cargo's
+//! `registry/src` or `git/checkouts`, and its manifest stands alone: no workspace, no
+//! inherited field, no relative path dependency) gets a private workspace in the
+//! build's profile directory instead: a `Cargo.toml` whose only member is a symbolic
+//! link to the package, and a `Cargo.lock` of its own. The nested build runs with
+//! `--manifest-path` of that workspace (from the package's directory still, for
+//! Cargo's configuration files) and starts from, in this order:
+//!
+//! 1. the lock file of the workspace being built, found above `OUT_DIR`, when it
+//!    lists the package as a dependency — the versions the outer build resolved, so the
+//!    subcrate links the crates the package itself is compiled against;
+//! 2. the package's own lock file, which is the right one when the package is what is
+//!    being built (`cargo package`'s verification, docs.rs, `cargo install --locked`);
+//! 3. none, so that Cargo resolves afresh from the crates in the cache.
+//!
+//! The next is tried when one fails. The package's own `Cargo.lock` is never touched.
+//! (Where the symbolic link cannot be made, or Cargo's target directory is not under
+//! the workspace so its lock file cannot be found, the nested build falls back to the
+//! next choice, in the end to the package's directory as before.)
+//!
+//! `cargo package` verifies several packages of a workspace together (`cargo package
+//! -p a -p b`) with a local overlay registry that holds the others, which only Cargo's
+//! own process knows: a package that depends on a sibling that is not published yet
+//! finds it nowhere in the nested build. The siblings are extracted beside the package,
+//! in `target/package/`, so the private workspace points `[patch.crates-io]` at those
+//! directories (for the registry packages of the lock file whose extracted sources
+//! are there, when `target/package/tmp-registry` shows this is such a verification).
+//!
 //! # Limitations of `::name`
 //!
 //! - The crate must be an ordinary library, not a proc-macro.
@@ -135,10 +212,23 @@
 //!   them).
 //! - A custom profile is built as `dev` or `release` (a build script is only told
 //!   which), so Cargo and the build script agree on the build.
-//! - When cross-compiling, a proc-macro subcrate can't use these crates: they are
-//!   built for the target, a proc-macro for the host.
-//! - The nested build runs `--offline` from the package's own directory, so it
-//!   expects a workspace with its `Cargo.lock` and sources in place.
+//! - When cross-compiling, a proc-macro subcrate's crates are built for the host, so
+//!   they must build there (the nested build for the host has no `RUSTFLAGS` of the
+//!   target); but a proc-macro subcrate can't use the owner crate or a library
+//!   subcrate: those are built for the target, a proc-macro for the host.
+//! - The crate must be a normal dependency that the package's resolution switches on
+//!   for the platform of the nested build (the target's, or the host's for a
+//!   proc-macro subcrate), and the nested build runs `--offline`, so it must be in the
+//!   local cache. An optional dependency whose feature is off, a build-dependency
+//!   only, or one a `[target.'cfg(…)'.dependencies]` table leaves out for that
+//!   platform, is not (see [Cross-compiling](#cross-compiling)). A workspace member
+//!   (a path dependency) is built whatever its features.
+//! - The nested build runs from the package's own directory, so it expects the sources
+//!   in place; a source tree needs the workspace and `Cargo.lock` it is in (a
+//!   packaged crate has a workspace of its own, see [Packaged crates](#packaged-crates)).
+//! - `cargo package`'s verification of several packages works through a patch to the
+//!   siblings' extracted sources, for `crates.io` dependencies only (not another
+//!   registry).
 //! - Under `cargo check` and clippy the dependency copies differ from
 //!   `cargo build`'s, so a value of such a type crosses the subcrate boundary under
 //!   `cargo build`/`test` but not under `cargo check`.
@@ -212,6 +302,10 @@ pub struct Config {
     edition: String,
     /// Target triple, if cross-compiling (host != target).
     target: Option<String>,
+    /// The host triple (`HOST`), set exactly when `target` is: what the nested build
+    /// of the crates a proc-macro subcrate uses is built for (see
+    /// [`build_host_deps`](Self::build_host_deps)).
+    host: Option<String>,
     /// Panic strategy of the target (`unwind`/`abort`), applied to library
     /// subcrates so the final link is consistent.
     panic: Option<String>,
@@ -234,6 +328,10 @@ pub struct Config {
     cargo: PathBuf,
     /// The owning package's name (`CARGO_PKG_NAME`).
     package: String,
+    /// The owning package's version (`CARGO_PKG_VERSION`).
+    package_version: String,
+    /// Where the nested builds run, worked out once (see [`NestedWorkspace`]).
+    nested_workspace: std::cell::RefCell<Option<NestedWorkspace>>,
     /// The build profile (`PROFILE`): `release` builds the owner's dependencies
     /// with `--release`, anything else without.
     profile: String,
@@ -253,6 +351,11 @@ pub struct Config {
     /// The owner's dependencies (and the owner crate), built for the subcrates
     /// that use them. Filled in by [`Config::run`].
     owner_deps: OwnerDeps,
+    /// When cross-compiling: the owner's dependencies built *for the host*, for the
+    /// proc-macro subcrates that use them (a proc-macro runs on the host, so it
+    /// cannot link a crate built for the target). Empty otherwise: the proc-macro
+    /// subcrates then take theirs from `owner_deps`, like every other subcrate.
+    host_deps: OwnerDeps,
 }
 
 /// Environment variable set on the nested Cargo build of the owner's
@@ -275,6 +378,7 @@ impl Config {
         let manifest_dir = PathBuf::from(require_env("CARGO_MANIFEST_DIR")?);
         let out_dir = PathBuf::from(require_env("OUT_DIR")?);
         let package = require_env("CARGO_PKG_NAME")?;
+        let package_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
         let rustc = PathBuf::from(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()));
         let cargo = PathBuf::from(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
         let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
@@ -285,9 +389,9 @@ impl Config {
         let host = std::env::var("HOST").ok();
         // Only pass `--target` when genuinely cross-compiling; otherwise the
         // host default already matches and matches how Cargo invokes rustc.
-        let cross_target = match (&target, &host) {
-            (Some(t), Some(h)) if t != h => Some(t.clone()),
-            _ => None,
+        let (cross_target, cross_host) = match (&target, &host) {
+            (Some(t), Some(h)) if t != h => (Some(t.clone()), Some(h.clone())),
+            _ => (None, None),
         };
 
         let edition = detect_edition(&manifest_dir);
@@ -308,6 +412,7 @@ impl Config {
             rustc,
             edition,
             target: cross_target,
+            host: cross_host,
             panic,
             opt_level,
             debug_assertions,
@@ -316,11 +421,14 @@ impl Config {
             extra_rustc_args: Vec::new(),
             cargo,
             package,
+            package_version,
+            nested_workspace: std::cell::RefCell::new(None),
             profile,
             nested,
             harvest_only,
             owner_deps_key,
             owner_deps: OwnerDeps::default(),
+            host_deps: OwnerDeps::default(),
         })
     }
 
@@ -408,6 +516,9 @@ impl Config {
         // Build whatever the wanted subcrates take from the owner's dependencies
         // (or the owner itself) before compiling any of them.
         self.owner_deps = self.build_owner_deps(subcrates, &links, &wanted)?;
+        // When cross-compiling, the proc-macro subcrates take theirs from a build for
+        // the host instead.
+        self.host_deps = self.build_host_deps(subcrates, &links, &wanted)?;
 
         let owner_linked = owner_linked(&links, &order);
         // `gate_skipped[ix]`: the subcrate carries a `#[rustversion]` gate and did
@@ -437,7 +548,7 @@ impl Config {
         // copies than the `cargo build` ones used here. So point to the copies
         // built here, which otherwise are the same crates the package is built
         // with.
-        for dir in &self.owner_deps.lib_dirs {
+        for dir in self.dependency_dirs() {
             println!("cargo:rustc-link-search=dependency={}", dir.display());
         }
 
@@ -532,6 +643,7 @@ impl Config {
                     deps.push(self.external_dep(sub, name, &link.alias)?);
                 }
                 LinkTarget::Owner => {
+                    self.check_owner_use(sub)?;
                     deps.push(self.external_dep(sub, &self.owner_crate_name(), &link.alias)?);
                 }
             }
@@ -539,31 +651,66 @@ impl Config {
         Ok(deps)
     }
 
-    /// The link to the crate `name` built by [`Config::build_owner_deps`], seen as
-    /// `alias` by `sub`.
-    fn external_dep(&self, sub: &Subcrate, name: &str, alias: &str) -> Result<ExternDep, Error> {
-        // The crates were built for the target, which a proc-macro (running on the
-        // host) cannot load when the two differ.
-        if sub.proc_macro && self.target.is_some() {
+    /// Whether `sub` is built for the host while the rest of the package is built for
+    /// the target: a proc-macro subcrate of a cross-compiled package. (It runs inside
+    /// the compiler, so the crates it uses are the host's.)
+    fn is_host_built(&self, sub: &Subcrate) -> bool {
+        sub.proc_macro && self.target.is_some()
+    }
+
+    /// The error for a proc-macro subcrate that uses the owner crate (`::owner`) when
+    /// cross-compiling: the owner's library is built for the target, which a
+    /// proc-macro (running on the host) cannot load.
+    fn check_owner_use(&self, sub: &Subcrate) -> Result<(), Error> {
+        if self.is_host_built(sub) {
             return Err(Error::new(format!(
-                "proc-macro subcrate `{}` cannot depend on `::{}` when cross-compiling: \
-                 it is built for the target, but a proc-macro runs on the host",
+                "proc-macro subcrate `{}` cannot depend on the owner crate `::{}` when \
+                 cross-compiling: it is built for the target, but a proc-macro runs on the host",
                 sub.display_name(),
-                name
+                self.owner_crate_name()
             )));
         }
+        Ok(())
+    }
+
+    /// The owner dependencies `sub` links: the host's when it is
+    /// [built for the host](Self::is_host_built), else the target's.
+    fn deps_of(&self, sub: &Subcrate) -> &OwnerDeps {
+        if self.is_host_built(sub) {
+            &self.host_deps
+        } else {
+            &self.owner_deps
+        }
+    }
+
+    /// Every directory holding an owner dependency's artifacts, of both builds: the
+    /// search paths for those crates' own dependencies. A library subcrate may use a
+    /// proc-macro subcrate built on a host crate (and the other way round), so a
+    /// subcrate that is built on either needs to find the other's too.
+    fn dependency_dirs(&self) -> impl Iterator<Item = &PathBuf> {
+        self.owner_deps
+            .lib_dirs
+            .iter()
+            .chain(self.host_deps.lib_dirs.iter())
+    }
+
+    /// The link to the crate `name` built by [`Config::build_owner_deps`] (or, for a
+    /// proc-macro subcrate of a cross-compiled package, by
+    /// [`Config::build_host_deps`]), seen as `alias` by `sub`.
+    fn external_dep(&self, sub: &Subcrate, name: &str, alias: &str) -> Result<ExternDep, Error> {
+        let owner_deps = self.deps_of(sub);
         // `name` is what the subcrate's author wrote, which is not necessarily the
         // library crate it stands for (a dependency may be renamed), nor the only
         // version of that crate Cargo built.
-        let external = self.owner_deps.externals.get(name);
+        let external = owner_deps.externals.get(name);
         let crate_name = external.map_or(name, |external| external.crate_name.as_str());
         let krate = external
             .and_then(|external| external.version.as_ref())
             .and_then(|version| {
                 let key = (crate_name.to_string(), version.clone());
-                self.owner_deps.versions.get(&key)
+                owner_deps.versions.get(&key)
             })
-            .or_else(|| self.owner_deps.crates.get(crate_name))
+            .or_else(|| owner_deps.crates.get(crate_name))
             .filter(|krate| krate.rlib.is_some())
             .ok_or_else(|| {
                 Error::new(format!(
@@ -609,7 +756,9 @@ impl Config {
     /// artifacts. Builds nothing if no wanted subcrate uses any.
     ///
     /// All of them come from one nested Cargo build into a separate target
-    /// directory (see the [module documentation](self)).
+    /// directory (see the [module documentation](self)). When cross-compiling, that
+    /// build is for the target and serves the library subcrates; the proc-macro
+    /// subcrates' crates are built for the host by [`build_host_deps`](Self::build_host_deps).
     fn build_owner_deps(
         &self,
         subcrates: &[Subcrate],
@@ -620,7 +769,7 @@ impl Config {
         let mut externals: BTreeMap<&str, String> = BTreeMap::new();
         let mut owner_user: Option<String> = None;
         for (ix, links) in links.iter().enumerate() {
-            if !wanted[ix] {
+            if !wanted[ix] || self.is_host_built(&subcrates[ix]) {
                 continue;
             }
             for link in links {
@@ -654,46 +803,12 @@ impl Config {
             }
         }
 
-        // Cargo wants package specs (`-p some-crate`), `::name` is a name the package's
-        // own code uses: `Cargo.toml` says which package that is (a dependency may be
-        // renamed with `package = "…"`), and the lock file which version of it, when
-        // there are several (see [`owner_package`]).
-        let lock = find_lock(&self.manifest_dir);
-        // What this package depends on, as the lock file has it. (Without the lock
-        // file, or without this package in it, Cargo itself will say if a name is
-        // not a dependency.)
-        let locked: Option<Vec<LockedDep>> = lock
-            .as_ref()
-            .and_then(|(_, text)| locked_dependencies(text, &self.package));
-        let declared = std::fs::read_to_string(self.manifest_dir.join("Cargo.toml"))
-            .map(|manifest| declared_dependencies(&manifest))
-            .unwrap_or_default();
-        let mut packages: Vec<String> = Vec::new();
-        let mut crates: BTreeMap<String, ExternalCrate> = BTreeMap::new();
-        let mut links_local_dep = false;
-        for (name, user) in &externals {
-            let declared_dep = find_declared(&declared, name);
-            links_local_dep |= declared_dep.map_or(false, |dep| self.is_local_dep(dep));
-            let package = declared_dep.map(|dep| self.declared(dep));
-            let resolved =
-                owner_package(name, package.as_ref(), locked.as_deref()).map_err(|reason| {
-                    Error::new(format!(
-                        "subcrate `{}` depends on `::{}`, but {}",
-                        user, name, reason
-                    ))
-                })?;
-            // Two names for one package (a rename next to the original) are built once.
-            if !packages.contains(&resolved.spec) {
-                packages.push(resolved.spec);
-            }
-            crates.insert(
-                name.to_string(),
-                ExternalCrate {
-                    crate_name: resolved.crate_name,
-                    version: resolved.version,
-                },
-            );
-        }
+        let lock = self.lock_for_specs();
+        let ResolvedExternals {
+            mut packages,
+            crates,
+            links_local_dep,
+        } = self.resolve_externals(&externals, &lock)?;
         // A nested run that reaches here is building the owner's library because a
         // subcrate uses the *owner crate* (`::owner`): the harvest-only nested build,
         // which selects the owner merely to unify a dependency's features, returned
@@ -737,59 +852,10 @@ impl Config {
         let harvest_only = links_local_dep && owner_user.is_none();
 
         let target_dir = self.owner_deps_target_dir();
-        let args = self.cargo_args(&packages, &target_dir);
-        let mut cmd = Command::new(&self.cargo);
-        cmd.args(&args)
-            .current_dir(&self.manifest_dir)
-            .env(NESTED_ENV, "1")
-            .stdin(Stdio::null());
-        if harvest_only {
-            cmd.env(HARVEST_ONLY_ENV, "1");
-        }
-        // Cargo sets these for *this* build script only. Left in place they would
-        // leak into the build scripts of the packages built below, which then
-        // see this package's features and cfgs as their own.
-        // And a lint wrapper (`cargo clippy` sets one) is for the check that is
-        // under way, not for this build.
-        cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy();
-            if name.starts_with("CARGO_FEATURE_") || name.starts_with("CARGO_CFG_") {
-                cmd.env_remove(&key);
-            }
-        }
-        let output = cmd.output().map_err(|e| {
-            Error::new(format!(
-                "failed to launch `{}`: {}",
-                self.cargo.display(),
-                e
-            ))
+        let output = self.run_nested(&packages, &target_dir, harvest_only, false, &|output| {
+            built_nested(output, harvest_only, &crates)
         })?;
         let mut deps = parse_artifacts(&String::from_utf8_lossy(&output.stdout));
-        // A harvest-only build deliberately leaves the owner's own library
-        // uncompiled, so Cargo exits non-zero; that is expected as long as every
-        // crate the subcrates link was built (each is reported before the owner's
-        // library, which depends on it, so it is in the output here). Any other
-        // failure — or a dependency that genuinely did not build — is a real error.
-        let all_built = crates
-            .values()
-            .all(|external| deps.crates.contains_key(&external.crate_name));
-        if !output.status.success() && !(harvest_only && all_built) {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let args: Vec<String> = args
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect();
-            return Err(Error::new(format!(
-                "failed to build the crates the subcrates depend on \
-                 (`{} {}` in `{}`):\n{}\n\
-                 Every `::name` a `#[subcrate]` uses must be a dependency of this package",
-                self.cargo.display(),
-                args.join(" "),
-                self.manifest_dir.display(),
-                indent(stderr.trim_end())
-            )));
-        }
 
         // Reclaim the disk the nested build just spent. It re-stored the owner's
         // dependency chain in its own target directory, byte for byte the same as
@@ -809,18 +875,284 @@ impl Config {
         }
 
         deps.externals = crates;
-        // Rebuild the subcrates when the crates they link against change. Cargo
-        // does not rerun this build script for that on its own: it only watches
-        // what it is told to. A dependency from a registry is immutable, but a
-        // path dependency is edited in place, and the resolved versions come from
-        // the lock file.
+        self.watch_nested_inputs(&deps);
+        Ok(deps)
+    }
+
+    /// Builds, when cross-compiling, the crates the `wanted` proc-macro subcrates take
+    /// from the owner — crates the package depends on (`::name`) — *for the host*, and
+    /// returns their artifacts. Builds nothing when not cross-compiling (a proc-macro
+    /// subcrate then uses the crates of [`build_owner_deps`](Self::build_owner_deps)
+    /// like any other) or when no wanted proc-macro subcrate uses any.
+    ///
+    /// A proc-macro runs inside the compiler, on the host, so it can only link crates
+    /// built for the host; the target's copies (which serve the library subcrates, the
+    /// part of the package that ships) could not even be loaded. So this is a second
+    /// nested Cargo build, of just those crates, into a target directory of its own
+    /// (`subcrate-owner-deps/<package>/<compiler>-host`) and with `--target` set to the
+    /// host triple. (An explicit triple rather than none, so a `build.target` in a
+    /// Cargo configuration or `CARGO_BUILD_TARGET` in the environment cannot send it to
+    /// the target after all.) The target's `RUSTFLAGS` are not given to it, as Cargo
+    /// does not give them to the host's build scripts and proc-macros either.
+    ///
+    /// Unlike the target's build, it does not select the owner to match the main
+    /// build's copy of a crate (nothing crosses the boundary between a proc-macro and
+    /// the package's code at the type level: the macro only turns tokens into tokens, so
+    /// there is no copy to match), only where a path dependency needs it (see below).
+    /// The owner crate cannot be used by a proc-macro here at all (see
+    /// [`check_owner_use`](Self::check_owner_use)).
+    fn build_host_deps(
+        &self,
+        subcrates: &[Subcrate],
+        links: &[Vec<Link>],
+        wanted: &[bool],
+    ) -> Result<OwnerDeps, Error> {
+        if self.host.is_none() {
+            return Ok(OwnerDeps::default());
+        }
+        let mut externals: BTreeMap<&str, String> = BTreeMap::new();
+        for (ix, links) in links.iter().enumerate() {
+            if !wanted[ix] || !self.is_host_built(&subcrates[ix]) {
+                continue;
+            }
+            for link in links {
+                match &link.target {
+                    LinkTarget::External(name) => {
+                        externals
+                            .entry(name)
+                            .or_insert_with(|| subcrates[ix].display_name());
+                    }
+                    LinkTarget::Owner => self.check_owner_use(&subcrates[ix])?,
+                    LinkTarget::Subcrate(_) => {}
+                }
+            }
+        }
+        if externals.is_empty() {
+            return Ok(OwnerDeps::default());
+        }
+        let lock = self.lock_for_specs();
+        let ResolvedExternals {
+            mut packages,
+            crates,
+            links_local_dep,
+        } = self.resolve_externals(&externals, &lock)?;
+        // A path dependency may be a workspace member, and Cargo then resolves only
+        // what the selected members need: a registry crate in the same selection is
+        // found only if the owner, which depends on it, is selected too. (Its
+        // library is not wanted: see `build_owner_deps`, which does the same.)
+        if links_local_dep && !packages.contains(&self.package) {
+            packages.push(self.package.clone());
+        }
+        let target_dir = self.host_deps_target_dir();
+        // No dedup against the main build, as the target's does: it has no copy of
+        // these crates for the host to match.
+        let output = self.run_nested(&packages, &target_dir, links_local_dep, true, &|output| {
+            built_nested(output, links_local_dep, &crates)
+        })?;
+        let mut deps = parse_artifacts(&String::from_utf8_lossy(&output.stdout));
+        deps.externals = crates;
+        self.watch_nested_inputs(&deps);
+        Ok(deps)
+    }
+
+    /// The lock file that says which version of a package `::name` stands for when
+    /// the dependency graph holds several: the one that governs the nested build (see
+    /// [`NestedWorkspace`]).
+    fn lock_for_specs(&self) -> Option<(PathBuf, String)> {
+        match self.nested_workspace() {
+            NestedWorkspace::Shadow(shadow) => shadow.seeds.into_iter().flatten().next(),
+            NestedWorkspace::InPlace => find_lock(&self.manifest_dir),
+        }
+    }
+
+    /// Works out which package each `::name` in `externals` (each with the first
+    /// subcrate to use it, for errors) stands for.
+    ///
+    /// Cargo wants package specs (`-p some-crate`), `::name` is a name the package's
+    /// own code uses: `Cargo.toml` says which package that is (a dependency may be
+    /// renamed with `package = "…"`), and the lock file which version of it, when
+    /// there are several (see [`owner_package`]).
+    fn resolve_externals(
+        &self,
+        externals: &BTreeMap<&str, String>,
+        lock: &Option<(PathBuf, String)>,
+    ) -> Result<ResolvedExternals, Error> {
+        // What this package depends on, as the lock file has it. (Without the lock
+        // file, or without this package in it, Cargo itself will say if a name is
+        // not a dependency.)
+        let locked: Option<Vec<LockedDep>> = lock
+            .as_ref()
+            .and_then(|(_, text)| locked_dependencies(text, &self.package));
+        let declared = std::fs::read_to_string(self.manifest_dir.join("Cargo.toml"))
+            .map(|manifest| declared_dependencies(&manifest))
+            .unwrap_or_default();
+        let mut packages: Vec<String> = Vec::new();
+        let mut crates: BTreeMap<String, ExternalCrate> = BTreeMap::new();
+        let mut links_local_dep = false;
+        for (name, user) in externals {
+            let declared_dep = find_declared(&declared, name);
+            links_local_dep |= declared_dep.map_or(false, |dep| self.is_local_dep(dep));
+            let package = declared_dep.map(|dep| self.declared(dep));
+            let resolved =
+                owner_package(name, package.as_ref(), locked.as_deref()).map_err(|reason| {
+                    Error::new(format!(
+                        "subcrate `{}` depends on `::{}`, but {}",
+                        user, name, reason
+                    ))
+                })?;
+            // Two names for one package (a rename next to the original) are built once.
+            if !packages.contains(&resolved.spec) {
+                packages.push(resolved.spec);
+            }
+            crates.insert(
+                name.to_string(),
+                ExternalCrate {
+                    crate_name: resolved.crate_name,
+                    version: resolved.version,
+                },
+            );
+        }
+        Ok(ResolvedExternals {
+            packages,
+            crates,
+            links_local_dep,
+        })
+    }
+
+    /// Rebuilds the subcrates when the crates they link against change. Cargo does
+    /// not rerun this build script for that on its own: it only watches what it is
+    /// told to. A dependency from a registry is immutable, but a path dependency is
+    /// edited in place, and the resolved versions come from the lock file.
+    fn watch_nested_inputs(&self, deps: &OwnerDeps) {
         for source in &deps.sources {
             rerun_if_changed(source);
         }
-        if let Some((path, _)) = &lock {
-            rerun_if_changed(path);
+        match self.nested_workspace() {
+            NestedWorkspace::Shadow(shadow) => {
+                for (path, _) in shadow.seeds.iter().flatten() {
+                    rerun_if_changed(path);
+                }
+            }
+            NestedWorkspace::InPlace => {
+                if let Some((path, _)) = find_lock(&self.manifest_dir) {
+                    rerun_if_changed(&path);
+                }
+            }
         }
-        Ok(deps)
+    }
+
+    /// Runs the nested `cargo build` of `packages` into `target_dir` — for the host
+    /// when `host`, else for the target (see [`cargo_args`](Self::cargo_args)) — and
+    /// returns its output if `accept` takes it, else the error describing the failure.
+    ///
+    /// Where it runs, and against which lock file, is [`NestedWorkspace`]: for a
+    /// packaged crate it may take several attempts, each with another lock file.
+    /// Then the error is the first attempt's.
+    fn run_nested(
+        &self,
+        packages: &[String],
+        target_dir: &Path,
+        harvest_only: bool,
+        host: bool,
+        accept: &dyn Fn(&std::process::Output) -> bool,
+    ) -> Result<std::process::Output, Error> {
+        let mut args = self.cargo_args(packages, target_dir, host);
+        let workspace = self.nested_workspace();
+        let seeds: Vec<Option<(PathBuf, String)>> = match &workspace {
+            NestedWorkspace::InPlace => vec![None],
+            NestedWorkspace::Shadow(shadow) => {
+                args.push("--manifest-path".into());
+                args.push(shadow.manifest.clone().into());
+                shadow.seeds.clone()
+            }
+        };
+        let mut first_failure: Option<Error> = None;
+        for seed in &seeds {
+            if let NestedWorkspace::Shadow(shadow) = &workspace {
+                // Start from the lock file of this attempt (or from none).
+                let _ = std::fs::remove_file(&shadow.lock);
+                if let Some((_, text)) = seed {
+                    std::fs::write(&shadow.lock, text)?;
+                }
+            }
+            let output = self.launch_nested(&args, harvest_only, host)?;
+            if accept(&output) {
+                return Ok(output);
+            }
+            if first_failure.is_none() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let args: Vec<String> = args
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                let mut message = format!(
+                    "failed to build the crates the subcrates depend on \
+                     (`{} {}` in `{}`):\n{}\n\
+                     Every `::name` a `#[subcrate]` uses must be a dependency of this package",
+                    self.cargo.display(),
+                    args.join(" "),
+                    self.manifest_dir.display(),
+                    indent(stderr.trim_end())
+                );
+                // Cargo (checked from 1.78 to current nightly) panics, rather than
+                // saying so, when asked to build a package that the manifest's
+                // resolution does not activate for the build's platform.
+                if stderr.contains("panicked") && stderr.contains("features.rs") {
+                    message.push_str(
+                        ".\nThe crate has to be a normal dependency that is switched on for \
+                         the platform being built (for a proc-macro subcrate, the host's): not \
+                         an optional one whose feature is off, not a build-dependency only, \
+                         and not one that a `[target.'cfg(…)'.dependencies]` table excludes",
+                    );
+                }
+                first_failure = Some(Error::new(message));
+            }
+        }
+        Err(first_failure.unwrap_or_else(|| Error::new("the nested build was not run")))
+    }
+
+    /// Launches `self.cargo` with `args` once, in the package's directory, with the
+    /// environment prepared for a nested build (`host`: for the host's).
+    fn launch_nested(
+        &self,
+        args: &[OsString],
+        harvest_only: bool,
+        host: bool,
+    ) -> Result<std::process::Output, Error> {
+        let mut cmd = Command::new(&self.cargo);
+        cmd.args(args)
+            .current_dir(&self.manifest_dir)
+            .env(NESTED_ENV, "1")
+            .stdin(Stdio::null());
+        if harvest_only {
+            cmd.env(HARVEST_ONLY_ENV, "1");
+        }
+        // Cargo sets these for *this* build script only. Left in place they would
+        // leak into the build scripts of the packages built below, which then
+        // see this package's features and cfgs as their own.
+        // And a lint wrapper (`cargo clippy` sets one) is for the check that is
+        // under way, not for this build.
+        cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("CARGO_FEATURE_") || name.starts_with("CARGO_CFG_") {
+                cmd.env_remove(&key);
+            }
+        }
+        if host {
+            // These are the *target's* flags (Cargo does not apply `RUSTFLAGS` to
+            // what runs on the host when it is given a `--target`), and the build here
+            // is the host's.
+            cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
+            cmd.env_remove("RUSTFLAGS");
+        }
+        cmd.output().map_err(|e| {
+            Error::new(format!(
+                "failed to launch `{}`: {}",
+                self.cargo.display(),
+                e
+            ))
+        })
     }
 
     /// Links the owner dependencies of a *nested* run against the copies the
@@ -977,6 +1309,18 @@ impl Config {
         )
     }
 
+    /// The target directory of the nested build of the crates the proc-macro
+    /// subcrates use when cross-compiling: the target's, with `-host` after the
+    /// compiler. (Its own directory, so the two builds never share a lock or an
+    /// artifact name.)
+    fn host_deps_target_dir(&self) -> PathBuf {
+        let compiler = match rustc_key(&self.rustc) {
+            Some(key) => format!("{}-host", key),
+            None => "host".to_string(),
+        };
+        shared_target_dir(&self.out_dir, &self.owner_deps_dir_key(), Some(&compiler))
+    }
+
     /// The directory component naming the nested build: the opt-in
     /// [`owner_deps_key`](Self::owner_deps_key) when set (sanitized to one path
     /// component so it cannot escape), else the package name (the per-package
@@ -1012,11 +1356,13 @@ impl Config {
     ///   profile, custom ones included, is built as `dev` (a build script is only
     ///   told `debug` or `release`).
     /// * `--target` is passed only when cross-compiling: otherwise the build would
-    ///   be for an explicit target, which Cargo gives a different identity.
+    ///   be for an explicit target, which Cargo gives a different identity. It is
+    ///   the target's triple, or — when `host` asks for the build of a proc-macro
+    ///   subcrate's crates — the host's.
     ///
     /// Cargo's own diagnostics are rendered to stderr (shown if the build fails),
     /// leaving only the artifact messages on stdout as JSON.
-    fn cargo_args(&self, packages: &[String], target_dir: &Path) -> Vec<OsString> {
+    fn cargo_args(&self, packages: &[String], target_dir: &Path, host: bool) -> Vec<OsString> {
         let mut args: Vec<OsString> = vec!["build".into()];
         for package in packages {
             args.push("-p".into());
@@ -1030,11 +1376,135 @@ impl Config {
         if self.profile == "release" {
             args.push("--release".into());
         }
-        if let Some(target) = &self.target {
+        let triple = if host { &self.host } else { &self.target };
+        if let Some(triple) = triple {
             args.push("--target".into());
-            args.push(target.into());
+            args.push(triple.into());
         }
         args
+    }
+
+    /// Where the nested builds run — worked out once, and cached.
+    fn nested_workspace(&self) -> NestedWorkspace {
+        if let Some(workspace) = &*self.nested_workspace.borrow() {
+            return workspace.clone();
+        }
+        let workspace = self
+            .shadow_workspace()
+            .map_or(NestedWorkspace::InPlace, NestedWorkspace::Shadow);
+        *self.nested_workspace.borrow_mut() = Some(workspace.clone());
+        workspace
+    }
+
+    /// Sets up the private workspace of a packaged crate (see [`NestedWorkspace`]), or
+    /// `None` when the package is not one, or it cannot stand on its own in one, or
+    /// the file system will not let it be set up: the nested builds then run in the
+    /// package's directory, as they always did.
+    fn shadow_workspace(&self) -> Option<Shadow> {
+        if !is_packaged_dir(&self.manifest_dir) {
+            return None;
+        }
+        let manifest = std::fs::read_to_string(self.manifest_dir.join("Cargo.toml")).ok()?;
+        // A packaged manifest has neither a workspace nor inherited fields nor a
+        // relative path dependency: it was written to stand alone. One that does is
+        // not really packaged (a checkout that happens to be under a registry's
+        // directories), and needs the workspace it sits in.
+        if mentions_workspace(&manifest)
+            || declared_dependencies(&manifest)
+                .iter()
+                .any(|dep| dep.workspace || dep.path.as_deref().map_or(false, relative_path))
+        {
+            return None;
+        }
+        let root = shared_target_dir(&self.out_dir, &self.owner_deps_dir_key(), None)
+            .join(format!("ws-{:016x}", path_hash(&self.out_dir)));
+        std::fs::create_dir_all(&root).ok()?;
+        link_dir(&self.manifest_dir, &root.join(SHADOW_MEMBER)).ok()?;
+
+        let seeds = self.lock_candidates();
+        // `cargo package` of several packages at once verifies each against a local
+        // overlay of the others, which only Cargo's own process knows of; a package
+        // that depends on one of them finds it nowhere else. Its extracted source is
+        // beside this package's, though, so a patch can point to it.
+        let patches = match seeds.iter().flatten().next() {
+            Some((_, lock)) => self.overlay_patches(lock),
+            None => Vec::new(),
+        };
+        let root_manifest = root.join("Cargo.toml");
+        let text = shadow_manifest(&manifest, &detect_edition(&self.manifest_dir), &patches);
+        if std::fs::read_to_string(&root_manifest).ok().as_deref() != Some(text.as_str()) {
+            std::fs::write(&root_manifest, text).ok()?;
+        }
+        Some(Shadow {
+            manifest: root_manifest,
+            lock: root.join("Cargo.lock"),
+            seeds,
+        })
+    }
+
+    /// The lock files the nested build of a packaged crate is tried against, in turn
+    /// (the last always: none, so Cargo resolves afresh from what the local cache
+    /// holds).
+    ///
+    /// 1. The lock file of the workspace being built, if this package is a dependency
+    ///    in it: the versions the outer build resolved, so the crates the subcrates
+    ///    link are the ones the package itself is compiled against. It is found above
+    ///    `OUT_DIR` (in the usual layout, the `target/` directory sits in the
+    ///    workspace); Cargo does not say where it is.
+    /// 2. The package's own `Cargo.lock`, which is the right one when the package is
+    ///    itself what is being built (`cargo package`'s verification, docs.rs, `cargo
+    ///    install --locked`). Otherwise it may name versions that are not in the cache.
+    fn lock_candidates(&self) -> Vec<Option<(PathBuf, String)>> {
+        let mut candidates: Vec<Option<(PathBuf, String)>> = Vec::new();
+        for dir in self.out_dir.ancestors() {
+            let path = dir.join("Cargo.lock");
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if lock_has_dependency(&text, &self.package, &self.package_version) {
+                    candidates.push(Some((path, text)));
+                    break;
+                }
+            }
+        }
+        let own = self.manifest_dir.join("Cargo.lock");
+        if let Ok(text) = std::fs::read_to_string(&own) {
+            if !candidates.iter().flatten().any(|(_, other)| *other == text) {
+                candidates.push(Some((own, text)));
+            }
+        }
+        candidates.push(None);
+        candidates
+    }
+
+    /// The `[patch.crates-io]` entries that point the registry packages of the lock
+    /// file `lock` at their extracted sources, when this package is being verified by
+    /// `cargo package` against its siblings: the extracted package is in
+    /// `target/package/`, next to `tmp-registry` (Cargo's overlay) and the siblings'.
+    fn overlay_patches(&self, lock: &str) -> Vec<(String, PathBuf)> {
+        let dir = match self.manifest_dir.parent() {
+            Some(dir)
+                if dir.file_name().map_or(false, |name| name == "package")
+                    && dir.join("tmp-registry").is_dir() =>
+            {
+                dir
+            }
+            _ => return Vec::new(),
+        };
+        let mut patches: Vec<(String, PathBuf)> = Vec::new();
+        for package in locked_packages(lock) {
+            let from_crates_io = package.source.as_deref().map_or(false, |source| {
+                source == "registry+https://github.com/rust-lang/crates.io-index"
+                    || source.starts_with("sparse+https://index.crates.io")
+            });
+            let sibling = dir.join(format!("{}-{}", package.name, package.version));
+            if from_crates_io
+                && package.name != self.package
+                && sibling.join("Cargo.toml").is_file()
+                && !patches.iter().any(|(name, _)| *name == package.name)
+            {
+                patches.push((package.name, sibling));
+            }
+        }
+        patches
     }
 
     /// The edition `sub` is compiled with: its own override, else the package's.
@@ -1430,7 +1900,7 @@ impl Config {
         // crate also needs `subcrates_dir`, above, for the subcrates its library is
         // made of.)
         if deps.iter().any(|dep| dep.owner_linked) {
-            for dir in &self.owner_deps.lib_dirs {
+            for dir in self.dependency_dirs() {
                 args.push("-L".into());
                 args.push(format!("dependency={}", dir.display()));
             }
@@ -1470,6 +1940,212 @@ impl Config {
 
         args
     }
+}
+
+/// The `::name` crates a nested build is asked for, resolved by
+/// [`Config::resolve_externals`].
+struct ResolvedExternals {
+    /// The package specs to build (`-p …`).
+    packages: Vec<String>,
+    /// What each `::name` stands for.
+    crates: BTreeMap<String, ExternalCrate>,
+    /// Whether any is given by path, and so may be a member of the workspace.
+    links_local_dep: bool,
+}
+
+/// Whether the nested build whose output is `output` built what was asked for. A
+/// harvest-only build deliberately leaves the owner's own library uncompiled, so Cargo
+/// exits non-zero; that is expected as long as every crate the subcrates link was
+/// built (each is reported before the owner's library, which depends on it, so it is
+/// in the output here). Any other failure — or a dependency that genuinely did not
+/// build — is a real error.
+fn built_nested(
+    output: &std::process::Output,
+    harvest_only: bool,
+    crates: &BTreeMap<String, ExternalCrate>,
+) -> bool {
+    output.status.success()
+        || (harvest_only && {
+            let built = parse_artifacts(&String::from_utf8_lossy(&output.stdout));
+            crates
+                .values()
+                .all(|external| built.crates.contains_key(&external.crate_name))
+        })
+}
+
+/// The name of the member of a [`Shadow`] workspace that is the package.
+const SHADOW_MEMBER: &str = "pkg";
+
+/// Where, and against which lock file, the nested `cargo build` runs.
+///
+/// Cargo takes a package's workspace, and so its `Cargo.lock`, from the directory it
+/// runs in. For a package that is a member of the workspace being built, or a
+/// checkout, that is right: the same versions the outer build resolved. For a package
+/// *built from a registry* (or a git checkout) it is wrong in two ways: the package's
+/// own `Cargo.lock` — the one it was published with — names versions that need not be
+/// in the local cache (the nested build is `--offline`), so the build fails for want
+/// of a download; and Cargo rewrites that lock file, in the registry's source
+/// directory, which is nobody's to write (and may be read-only).
+#[derive(Debug, Clone)]
+enum NestedWorkspace {
+    /// In the package's own directory, against the lock file of the workspace it is
+    /// in.
+    InPlace,
+    /// In a private workspace of the build script's own: see [`Shadow`].
+    Shadow(Shadow),
+}
+
+/// A private workspace around a packaged crate.
+///
+/// It sits in the build's profile directory, next to the nested target directory: a
+/// `Cargo.toml` with a `[workspace]` whose only member, `pkg`, is a symbolic link to
+/// the package's directory, and its own `Cargo.lock`. The nested `cargo build` runs
+/// with `--manifest-path` of that workspace, from the package's directory still (so
+/// the Cargo configuration files, which Cargo finds from the current directory,
+/// stay in reach). The package's own `Cargo.lock` is never read by Cargo nor written.
+///
+/// The lock file the nested build starts from is, preferably, the versions the outer
+/// build resolved: see [`Config::lock_candidates`]. The package is a member here
+/// instead of a root, so the `[profile]` and `[patch]` tables of its manifest are
+/// ignored — as they are when Cargo builds it as a dependency.
+#[derive(Debug, Clone)]
+struct Shadow {
+    /// The workspace's manifest, for `--manifest-path`.
+    manifest: PathBuf,
+    /// Its lock file.
+    lock: PathBuf,
+    /// The lock files to start a nested build from, one after the other until one
+    /// builds (`None`: no lock file).
+    seeds: Vec<Option<(PathBuf, String)>>,
+}
+
+/// Whether the package at `dir` was packaged: extracted from a `.crate` file (by a
+/// registry, by `cargo package`'s verification, by `cargo vendor`) or checked out of
+/// a git repository by Cargo, rather than a source tree somebody works in. Every
+/// packaged crate holds `Cargo.toml.orig`, the manifest as written.
+fn is_packaged_dir(dir: &Path) -> bool {
+    if dir.join("Cargo.toml.orig").is_file() {
+        return true;
+    }
+    let names: Vec<&std::ffi::OsStr> = dir.components().map(|part| part.as_os_str()).collect();
+    names.windows(2).any(|pair| {
+        (pair[0] == "registry" && pair[1] == "src") || (pair[0] == "git" && pair[1] == "checkouts")
+    })
+}
+
+/// Whether `path` is relative: a path dependency given so is relative to the
+/// manifest, and would not find its target from the private workspace's link.
+fn relative_path(path: &str) -> bool {
+    !Path::new(path).is_absolute()
+}
+
+/// Whether a manifest mentions a workspace — a `[workspace]` table, or a field or
+/// dependency taken from one (`version.workspace = true`, `{ workspace = true }`).
+fn mentions_workspace(manifest: &str) -> bool {
+    manifest
+        .lines()
+        .map(|line| strip_toml_comment(line).trim())
+        .any(|line| {
+            line.starts_with("[workspace")
+                || line.contains(".workspace")
+                || line.contains("workspace =")
+                || line.contains("workspace=")
+        })
+}
+
+/// A hash of a path, for a directory name that is stable for it.
+fn path_hash(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Makes `link` a symbolic link to the directory `target`, replacing a link to
+/// another place.
+fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    if std::fs::read_link(link).map_or(false, |existing| existing == target) {
+        return Ok(());
+    }
+    // Whatever is there (a stale link) goes; a real directory is not removable here
+    // unless it is empty, which is as it should be.
+    let _ = std::fs::remove_file(link);
+    let _ = std::fs::remove_dir(link);
+    symlink_dir(target, link)
+}
+
+#[cfg(unix)]
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn symlink_dir(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "symbolic links are not supported here",
+    ))
+}
+
+/// The `Cargo.toml` of a [`Shadow`] workspace: the member, the resolver the package's
+/// own manifest would have as a workspace root (its `resolver`, else by edition), and
+/// the `patches` as `[patch.crates-io]`.
+fn shadow_manifest(package: &str, edition: &str, patches: &[(String, PathBuf)]) -> String {
+    let mut explicit = None;
+    let mut in_package = false;
+    for raw in package.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+        } else if in_package {
+            if let Some((key, value)) = split_key_value(line) {
+                if key.trim() == "resolver" {
+                    explicit = toml_string_value(value);
+                }
+            }
+        }
+    }
+    let resolver = match explicit.as_deref() {
+        Some(resolver @ ("1" | "2" | "3")) => resolver,
+        _ => match edition {
+            "2015" | "2018" => "1",
+            "2021" => "2",
+            _ => "3",
+        },
+    };
+    let mut text = format!(
+        "# Written by subcrate's build helper: a workspace around the packaged crate, so the\n\
+         # nested build has a Cargo.lock of its own and leaves the package's alone.\n\
+         [workspace]\nmembers = [\"{}\"]\nresolver = \"{}\"\n",
+        SHADOW_MEMBER, resolver
+    );
+    if !patches.is_empty() {
+        text.push_str("\n[patch.crates-io]\n");
+        for (name, path) in patches {
+            text.push_str(&format!("{} = {{ path = {} }}\n", name, toml_quote(path)));
+        }
+    }
+    text
+}
+
+/// A path as a TOML basic string.
+fn toml_quote(path: &Path) -> String {
+    let mut out = String::from("\"");
+    for c in path.to_string_lossy().chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// The directory the nested builds of `package` share (see
@@ -4330,6 +5006,57 @@ fn locked_dependencies(lock: &str, package: &str) -> Option<Vec<LockedDep>> {
     )
 }
 
+/// A package in a lock file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockedPackage {
+    name: String,
+    version: String,
+    /// Where it comes from (`registry+…`, `git+…`); a path package has none.
+    source: Option<String>,
+}
+
+/// Every package of the lock file `lock`.
+fn locked_packages(lock: &str) -> Vec<LockedPackage> {
+    let mut packages: Vec<LockedPackage> = Vec::new();
+    let mut current: Option<LockedPackage> = None;
+    let value = |line: &str, key: &str| -> Option<String> {
+        line.strip_prefix(key)
+            .and_then(|rest| rest.trim_start().strip_prefix('='))
+            .and_then(toml_string_value)
+    };
+    for line in lock.lines().map(str::trim) {
+        if line.starts_with('[') {
+            packages.extend(current.take());
+            if line == "[[package]]" {
+                current = Some(LockedPackage {
+                    name: String::new(),
+                    version: String::new(),
+                    source: None,
+                });
+            }
+        } else if let Some(package) = current.as_mut() {
+            if let Some(name) = value(line, "name") {
+                package.name = name;
+            } else if let Some(version) = value(line, "version") {
+                package.version = version;
+            } else if let Some(source) = value(line, "source") {
+                package.source = Some(source);
+            }
+        }
+    }
+    packages.extend(current);
+    packages
+}
+
+/// Whether the lock file `lock` has `name` at `version` as a dependency — from a
+/// registry or git, not a package on disk — which is how the lock file of a
+/// workspace that builds a registry crate lists it.
+fn lock_has_dependency(lock: &str, name: &str, version: &str) -> bool {
+    locked_packages(lock).iter().any(|package| {
+        package.name == name && package.version == version && package.source.is_some()
+    })
+}
+
 /// A `::name` dependency resolved to the package that provides it.
 #[derive(Debug, PartialEq, Eq)]
 struct OwnerPackage {
@@ -4849,6 +5576,7 @@ mod tests {
             rustc: PathBuf::from("rustc"),
             edition: "2021".to_string(),
             target: None,
+            host: None,
             panic: None,
             opt_level: "0".to_string(),
             debug_assertions: true,
@@ -4857,11 +5585,14 @@ mod tests {
             extra_rustc_args: Vec::new(),
             cargo: PathBuf::from("cargo"),
             package: "owner".to_string(),
+            package_version: "0.1.0".to_string(),
+            nested_workspace: std::cell::RefCell::new(None),
             profile: "debug".to_string(),
             nested: false,
             harvest_only: false,
             owner_deps_key: None,
             owner_deps: OwnerDeps::default(),
+            host_deps: OwnerDeps::default(),
         }
     }
 
@@ -5239,20 +5970,111 @@ mod tests {
         assert!(message.contains("no library artifact"), "{}", message);
     }
 
-    #[test]
-    fn a_proc_macro_subcrate_cannot_use_an_owner_dependency_when_cross_compiling() {
+    fn cross_config() -> Config {
         let mut config = config();
         config.target = Some("aarch64-unknown-linux-gnu".to_string());
+        config.host = Some("x86_64-unknown-linux-gnu".to_string());
+        config
+    }
+
+    #[test]
+    fn a_proc_macro_subcrate_links_the_hosts_copy_of_an_owner_dependency_when_cross_compiling() {
+        // The target's build holds `leaf` at `target/…`, the host's at `host/…`: a
+        // proc-macro subcrate (which runs on the host) takes the host's, a library
+        // subcrate the target's.
+        let mut config = cross_config();
         config.owner_deps = external_artifacts();
-        let mut sub = top("a", vec![ext("leaf")]);
-        sub.proc_macro = true;
+        let mut host = external_artifacts();
+        for krate in host.crates.values_mut() {
+            krate.rlib = krate
+                .rlib
+                .take()
+                .map(|rlib| PathBuf::from("host").join(rlib));
+            krate.rmeta = krate
+                .rmeta
+                .take()
+                .map(|rmeta| PathBuf::from("host").join(rmeta));
+        }
+        host.lib_dirs = [PathBuf::from("host/deps")].into_iter().collect();
+        config.host_deps = host;
         let links = [Link {
             alias: "leaf".to_string(),
             target: LinkTarget::External("leaf".to_string()),
         }];
-        let result = config.extern_deps(&[sub], 0, &links, Path::new("out"), &[true]);
-        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        let mut proc_macro = top("a", vec![ext("leaf")]);
+        proc_macro.proc_macro = true;
+        let library = top("a", vec![ext("leaf")]);
+        let paths = |sub: Subcrate| -> Vec<PathBuf> {
+            let deps = config
+                .extern_deps(&[sub], 0, &links, Path::new("out"), &[true])
+                .unwrap();
+            deps.into_iter().flat_map(|dep| dep.paths).collect()
+        };
+        let host_paths = paths(proc_macro);
+        assert!(!host_paths.is_empty());
+        assert!(
+            host_paths.iter().all(|path| path.starts_with("host")),
+            "{:?}",
+            host_paths
+        );
+        let target_paths = paths(library);
+        assert!(!target_paths.is_empty());
+        assert!(
+            target_paths.iter().all(|path| !path.starts_with("host")),
+            "{:?}",
+            target_paths
+        );
+        // Both builds' directories are searched by a subcrate built on either.
+        let dirs: Vec<&PathBuf> = config.dependency_dirs().collect();
+        assert!(dirs.contains(&&PathBuf::from("host/deps")), "{:?}", dirs);
+    }
+
+    #[test]
+    fn a_proc_macro_subcrate_cannot_use_the_owner_crate_when_cross_compiling() {
+        let config = cross_config();
+        let mut sub = sub("tests/t.rs", &["user"], vec![ext("owner")]);
+        sub.proc_macro = true;
+        let subs = [sub];
+        let links = resolve_links(&subs, &owner()).unwrap();
+        // Refused before anything is built (a `cargo` that cannot be launched proves
+        // that), and by the link itself.
+        let mut config = config;
+        config.cargo = PathBuf::from("/nonexistent/cargo");
+        let message = config
+            .build_host_deps(&subs, &links, &[true])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
         assert!(message.contains("cross-compiling"), "{}", message);
+        assert!(message.contains("owner crate `::owner`"), "{}", message);
+        let message = config
+            .extern_deps(&subs, 0, &links[0], Path::new("out"), &[true])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("cross-compiling"), "{}", message);
+    }
+
+    #[test]
+    fn a_library_subcrate_of_a_cross_compiled_package_does_not_need_the_host_build() {
+        // Nothing is built for the host unless a proc-macro subcrate uses a crate.
+        let mut config = cross_config();
+        config.cargo = PathBuf::from("/nonexistent/cargo");
+        let subs = [top("a", vec![ext("leaf")])];
+        let links = resolve_links(&subs, &owner()).unwrap();
+        let deps = config.build_host_deps(&subs, &links, &[true]).unwrap();
+        assert!(deps.crates.is_empty() && deps.lib_dirs.is_empty());
+        // And not when the package is not cross-compiled at all: the proc-macro
+        // subcrate takes the one build.
+        let mut native = config;
+        native.target = None;
+        native.host = None;
+        let mut proc_macro = top("a", vec![ext("leaf")]);
+        proc_macro.proc_macro = true;
+        let subs = [proc_macro];
+        let links = resolve_links(&subs, &owner()).unwrap();
+        let deps = native.build_host_deps(&subs, &links, &[true]).unwrap();
+        assert!(deps.crates.is_empty());
     }
 
     #[test]
@@ -5438,16 +6260,18 @@ mod tests {
 
     #[test]
     fn the_nested_cargo_build_is_into_a_separate_target_directory() {
-        let args = |config: &Config| -> Vec<String> {
+        let args_for = |config: &Config, host: bool| -> Vec<String> {
             config
                 .cargo_args(
                     &["serde".to_string(), "owner".to_string()],
                     Path::new("out/owner-deps-target"),
+                    host,
                 )
                 .iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect()
         };
+        let args = |config: &Config| args_for(config, false);
 
         let debug = args(&config());
         assert_eq!(debug[0], "build");
@@ -5470,9 +6294,520 @@ mod tests {
 
         let mut cross = config();
         cross.target = Some("aarch64-unknown-linux-gnu".to_string());
-        let cross = args(&cross);
-        let at = cross.iter().position(|a| a == "--target").unwrap();
-        assert_eq!(cross[at + 1], "aarch64-unknown-linux-gnu");
+        cross.host = Some("x86_64-unknown-linux-gnu".to_string());
+        let target_args = args(&cross);
+        let at = target_args.iter().position(|a| a == "--target").unwrap();
+        assert_eq!(target_args[at + 1], "aarch64-unknown-linux-gnu");
+        // The build for a proc-macro subcrate's crates names the host explicitly.
+        let host_args = args_for(&cross, true);
+        let at = host_args.iter().position(|a| a == "--target").unwrap();
+        assert_eq!(host_args[at + 1], "x86_64-unknown-linux-gnu");
+    }
+
+    /// Runs `build_host_deps` for `subs` (all wanted) on a cross-compiling `config` with
+    /// the stand-in for Cargo of [`nested_build`], returning what it built, the
+    /// arguments it was given and its own directory (removed).
+    #[cfg(unix)]
+    fn nested_host_build(
+        test: &str,
+        manifest: &str,
+        lock: &str,
+        messages: &str,
+        subs: &[Subcrate],
+    ) -> (Result<OwnerDeps, Error>, Vec<String>, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("subcrate-host-{}-{}", test, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(dir.join("Cargo.lock"), lock).unwrap();
+        std::fs::write(dir.join("messages.txt"), messages).unwrap();
+        std::fs::write(
+            dir.join("build"),
+            "printf '%s\\n' \"$@\" > args.txt\ncat messages.txt\n",
+        )
+        .unwrap();
+        let mut config = cross_config();
+        config.cargo = PathBuf::from("/bin/sh");
+        config.manifest_dir = dir.clone();
+        config.out_dir = dir.join("target/aarch64-unknown-linux-gnu/debug/build/owner-1a/out");
+        let links = resolve_links(subs, &owner()).unwrap();
+        let result = config.build_host_deps(subs, &links, &vec![true; subs.len()]);
+        let args = std::fs::read_to_string(dir.join("args.txt"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        (result, args, dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_crates_of_a_proc_macro_subcrate_are_built_for_the_host_when_cross_compiling() {
+        let manifest = "[package]\nname = \"owner\"\n\n[dependencies]\ndup = \"2\"\n";
+        let mut proc_macro = top("a", vec![ext("dup")]);
+        proc_macro.proc_macro = true;
+        let message = dup_message("2.0.0", true);
+        let (result, args, dir) =
+            nested_host_build("pm", manifest, MULTI_LOCK, &message, &[proc_macro]);
+        let deps = result.unwrap();
+        assert_eq!(packages_asked_for(&args), ["dup:2.0.0"]);
+        // For the host, by its triple, in a directory of its own.
+        let at = args.iter().position(|arg| arg == "--target").unwrap();
+        assert_eq!(args[at + 1], "x86_64-unknown-linux-gnu");
+        let at = args.iter().position(|arg| arg == "--target-dir").unwrap();
+        let target_dir = PathBuf::from(&args[at + 1]);
+        assert!(
+            target_dir.starts_with(
+                dir.join("target/aarch64-unknown-linux-gnu/debug/subcrate-owner-deps/owner")
+            ),
+            "{}",
+            target_dir.display()
+        );
+        assert!(target_dir.to_string_lossy().ends_with("-host") || target_dir.ends_with("host"));
+        assert_eq!(deps.externals["dup"].crate_name, "dup");
+        assert!(deps.crates.contains_key("dup"));
+
+        // A library subcrate of the same package is not its business.
+        let library = top("a", vec![ext("dup")]);
+        let (result, args, _) =
+            nested_host_build("lib", manifest, MULTI_LOCK, &message, &[library]);
+        assert!(result.unwrap().crates.is_empty());
+        assert!(args.is_empty(), "{:?}", args);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_dependency_selects_the_owner_in_the_host_build_too() {
+        // As in the target's build (see `build_owner_deps`): Cargo only finds a
+        // registry crate next to a workspace member if the owner is selected.
+        let manifest = "[package]\nname = \"owner\"\n\n[dependencies]\n\
+                        leaf = { path = \"../leaf\" }\ndup = \"2\"\n";
+        let mut proc_macro = top("a", vec![ext("leaf"), ext("dup")]);
+        proc_macro.proc_macro = true;
+        let message = dup_message("2.0.0", true);
+        let (result, args, _) =
+            nested_host_build("path", manifest, MULTI_LOCK, &message, &[proc_macro]);
+        result.unwrap();
+        assert_eq!(packages_asked_for(&args), ["dup:2.0.0", "leaf", "owner"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_build_that_panics_in_cargos_resolver_says_what_the_dependency_needs() {
+        let dir = std::env::temp_dir().join(format!("subcrate-panic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("Cargo.lock"), MULTI_LOCK).unwrap();
+        std::fs::write(
+            dir.join("build"),
+            "echo \"thread 'main' panicked at src/cargo/core/resolver/features.rs:325:13:\" >&2\nexit 101\n",
+        )
+        .unwrap();
+        let mut config = config();
+        config.cargo = PathBuf::from("/bin/sh");
+        config.manifest_dir = dir.clone();
+        config.out_dir = dir.join("target/debug/build/owner-1a/out");
+        let subs = [top("a", vec![ext("leaf")])];
+        let links = resolve_links(&subs, &owner()).unwrap();
+        let result = config.build_owner_deps(&subs, &links, &[true]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("failed to build the crates"),
+            "{}",
+            message
+        );
+        assert!(message.contains("normal dependency"), "{}", message);
+        assert!(message.contains("optional"), "{}", message);
+    }
+
+    fn temp_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("subcrate-{}-{}", test, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_packaged_directory_is_told_by_its_original_manifest_or_by_where_cargo_puts_it() {
+        let dir = temp_dir("packaged-dir");
+        assert!(!is_packaged_dir(&dir));
+        std::fs::write(dir.join("Cargo.toml.orig"), "").unwrap();
+        assert!(is_packaged_dir(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        for packaged in [
+            "/home/u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/serde-1.0.0",
+            "/home/u/.cargo/git/checkouts/repo-1a2b3c/abcdef0",
+        ] {
+            assert!(is_packaged_dir(Path::new(packaged)), "{}", packaged);
+        }
+        for source in [
+            "/home/u/src/serde",
+            "/home/u/registry/serde",
+            "/home/u/git/checkout",
+        ] {
+            assert!(!is_packaged_dir(Path::new(source)), "{}", source);
+        }
+    }
+
+    #[test]
+    fn a_manifest_that_belongs_to_a_workspace_is_told() {
+        assert!(mentions_workspace(
+            "[package]\nname = \"a\"\n[workspace]\nmembers = []\n"
+        ));
+        assert!(mentions_workspace("[package]\nversion.workspace = true\n"));
+        assert!(mentions_workspace(
+            "[dependencies]\nserde = { workspace = true }\n"
+        ));
+        assert!(mentions_workspace("[workspace.dependencies]\nx = \"1\"\n"));
+        assert!(!mentions_workspace(
+            "[package]\nname = \"a\"\n# the workspace = nothing\n[dependencies]\nx = \"1\"\n"
+        ));
+    }
+
+    #[test]
+    fn the_lock_file_of_a_registry_dependency_is_told_from_one_that_lists_the_package_on_disk() {
+        let lock = "version = 3
+
+[[package]]
+name = \"a\"
+version = \"0.1.0\"
+
+[[package]]
+name = \"b\"
+version = \"1.2.3\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"00\"
+
+[[package]]
+name = \"b\"
+version = \"2.0.0\"
+";
+        let packages = locked_packages(lock);
+        assert_eq!(packages.len(), 3);
+        assert_eq!(packages[1].name, "b");
+        assert_eq!(packages[1].version, "1.2.3");
+        assert!(packages[1]
+            .source
+            .as_deref()
+            .unwrap()
+            .starts_with("registry+"));
+        assert_eq!(packages[2].source, None);
+        assert!(lock_has_dependency(lock, "b", "1.2.3"));
+        // A package on disk is the workspace's own, not a dependency; and a version
+        // that is not locked is not it either.
+        assert!(!lock_has_dependency(lock, "a", "0.1.0"));
+        assert!(!lock_has_dependency(lock, "b", "2.0.0"));
+        assert!(!lock_has_dependency(lock, "b", "1.2.4"));
+        assert!(!lock_has_dependency(lock, "c", "1.2.3"));
+    }
+
+    const REGISTRY_LOCK: &str = "version = 3
+
+[[package]]
+name = \"owner\"
+version = \"0.1.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"00\"
+dependencies = [
+ \"leaf\",
+]
+
+[[package]]
+name = \"leaf\"
+version = \"1.0.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"11\"
+";
+
+    /// A packaged `owner` (the marker `Cargo.toml.orig`, its own lock file) that
+    /// `dir/ws`'s build — `dir/ws/target/debug/build/owner-1a/out` — has as a dependency.
+    fn packaged_owner(dir: &Path, manifest: &str, own_lock: &str, ws_lock: &str) -> Config {
+        let package = dir.join("registry/owner-0.1.0");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(package.join("Cargo.toml.orig"), manifest).unwrap();
+        std::fs::write(package.join("Cargo.lock"), own_lock).unwrap();
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("Cargo.lock"), ws_lock).unwrap();
+        let mut config = config();
+        config.manifest_dir = package;
+        config.out_dir = ws.join("target/debug/build/owner-1a/out");
+        config
+    }
+
+    #[test]
+    fn a_packaged_crate_is_built_against_the_versions_of_the_workspace_that_builds_it() {
+        let dir = temp_dir("lock-order");
+        let own = REGISTRY_LOCK.replace("1.0.0", "1.0.9");
+        let config = packaged_owner(&dir, "[package]\nname = \"owner\"\n", &own, REGISTRY_LOCK);
+        let candidates = config.lock_candidates();
+        // The workspace's lock first (it lists the package as a dependency), then the
+        // package's own, then none.
+        assert_eq!(candidates.len(), 3, "{:?}", candidates);
+        assert_eq!(candidates[0].as_ref().unwrap().0, dir.join("ws/Cargo.lock"));
+        assert_eq!(
+            candidates[1].as_ref().unwrap().0,
+            dir.join("registry/owner-0.1.0/Cargo.lock")
+        );
+        assert!(candidates[2].is_none());
+
+        // The same text twice is one attempt.
+        let same = packaged_owner(
+            &dir,
+            "[package]\nname = \"owner\"\n",
+            REGISTRY_LOCK,
+            REGISTRY_LOCK,
+        );
+        assert_eq!(same.lock_candidates().len(), 2);
+
+        // A lock file that has the package only as its own member (as `cargo package`'s
+        // verification, or any workspace that holds it, has it) is not "the workspace
+        // that builds it as a dependency": the package's own lock is the one then.
+        let member = REGISTRY_LOCK.replace("source = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"00\"\n", "");
+        let config = packaged_owner(&dir, "[package]\nname = \"owner\"\n", &own, &member);
+        let candidates = config.lock_candidates();
+        assert_eq!(candidates.len(), 2, "{:?}", candidates);
+        assert_eq!(
+            candidates[0].as_ref().unwrap().0,
+            dir.join("registry/owner-0.1.0/Cargo.lock")
+        );
+        // The versions that the build resolves are what `::name` is matched against.
+        let locked = config.lock_for_specs();
+        assert!(locked.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_packaged_crate_gets_a_workspace_of_its_own_and_its_lock_file_is_left_alone() {
+        let dir = temp_dir("shadow");
+        let manifest =
+            "[package]\nname = \"owner\"\nedition = \"2018\"\n\n[dependencies]\nleaf = \"1\"\n";
+        let config = packaged_owner(&dir, manifest, "# the package's own lock\n", REGISTRY_LOCK);
+        let package = config.manifest_dir.clone();
+        let own_lock = std::fs::read_to_string(package.join("Cargo.lock")).unwrap();
+
+        let shadow = match config.nested_workspace() {
+            NestedWorkspace::Shadow(shadow) => shadow,
+            NestedWorkspace::InPlace => panic!("a packaged crate runs in a workspace of its own"),
+        };
+        // In the build's profile directory, not in the package.
+        assert!(shadow
+            .manifest
+            .starts_with(dir.join("ws/target/debug/subcrate-owner-deps/owner")));
+        let root = std::fs::read_to_string(&shadow.manifest).unwrap();
+        assert!(root.contains("members = [\"pkg\"]"), "{}", root);
+        // The resolver of an edition 2018 package as a root.
+        assert!(root.contains("resolver = \"1\""), "{}", root);
+        assert!(!root.contains("[patch"), "{}", root);
+        let member = shadow.manifest.parent().unwrap().join("pkg");
+        assert_eq!(std::fs::read_link(&member).unwrap(), package);
+        assert_eq!(shadow.lock.parent(), shadow.manifest.parent());
+
+        // The package's own lock file is not Cargo's to read or write.
+        assert_eq!(
+            std::fs::read_to_string(package.join("Cargo.lock")).unwrap(),
+            own_lock
+        );
+
+        // A second look finds the same thing (and does not need to set it up again).
+        match config.nested_workspace() {
+            NestedWorkspace::Shadow(again) => assert_eq!(again.manifest, shadow.manifest),
+            NestedWorkspace::InPlace => panic!("the workspace changed"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_packaged_crates_nested_build_runs_in_its_private_workspace_on_each_lock_file_in_turn() {
+        let dir = temp_dir("shadow-run");
+        let config = packaged_owner(
+            &dir,
+            "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n",
+            "# the package's own lock\n",
+            REGISTRY_LOCK,
+        );
+        let package = config.manifest_dir.clone();
+        let mut config = config;
+        config.cargo = PathBuf::from("/bin/sh");
+        // A stand-in for Cargo that fails while it has a lock file to read (logging
+        // the first line of it), and builds without one.
+        let message = concat!(
+            r#"{"reason":"compiler-artifact","package_id":"#,
+            r#""registry+https://github.com/rust-lang/crates.io-index#leaf@1.0.0","#,
+            r#""manifest_path":"/r/leaf/Cargo.toml","target":{"kind":["lib"],"name":"leaf"},"#,
+            r#""filenames":["/t/debug/deps/libleaf-1.rlib","/t/debug/deps/libleaf-1.rmeta"]}"#
+        );
+        std::fs::write(package.join("messages.txt"), message).unwrap();
+        std::fs::write(
+            package.join("build"),
+            "prev=\nfor a in \"$@\"; do\n  [ \"$prev\" = --manifest-path ] && m=\"$a\"\n  prev=\"$a\"\ndone\n\
+             echo \"$m\" >> manifest.txt\n\
+             d=$(dirname \"$m\")\n\
+             if [ -f \"$d/Cargo.lock\" ]; then\n  head -n 1 \"$d/Cargo.lock\" >> locks.txt\n  echo boom >&2\n  exit 1\nfi\n\
+             echo none >> locks.txt\ncat messages.txt\n",
+        )
+        .unwrap();
+        let subs = [top("a", vec![ext("leaf")])];
+        let links = resolve_links(&subs, &owner()).unwrap();
+        let deps = config.build_owner_deps(&subs, &links, &[true]).unwrap();
+        assert!(deps.crates.contains_key("leaf"));
+
+        // Each attempt: the workspace's lock (here "version = 3", a different first
+        // line from the package's own), the package's own, and none.
+        let locks = std::fs::read_to_string(package.join("locks.txt")).unwrap();
+        assert_eq!(
+            locks.lines().collect::<Vec<_>>(),
+            ["version = 3", "# the package's own lock", "none"]
+        );
+        let manifests = std::fs::read_to_string(package.join("manifest.txt")).unwrap();
+        let manifest = manifests.lines().next().unwrap();
+        assert!(manifests.lines().all(|line| line == manifest));
+        assert!(
+            manifest.ends_with("Cargo.toml") && manifest.contains("subcrate-owner-deps"),
+            "{}",
+            manifest
+        );
+        // And the package's own lock file is as it was.
+        assert_eq!(
+            std::fs::read_to_string(package.join("Cargo.lock")).unwrap(),
+            "# the package's own lock\n"
+        );
+
+        // When every attempt fails, the first one's error is the one reported.
+        std::fs::write(package.join("build"), "echo first >&2\nexit 1\n").unwrap();
+        let message = config
+            .build_owner_deps(&subs, &links, &[true])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("--manifest-path"), "{}", message);
+        assert!(message.contains("first"), "{}", message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_package_that_stands_alone_is_given_a_workspace_of_its_own() {
+        let dir = temp_dir("shadow-not");
+        let in_place = |manifest: &str, marker: bool| {
+            let config = packaged_owner(&dir, manifest, "", REGISTRY_LOCK);
+            if !marker {
+                std::fs::remove_file(config.manifest_dir.join("Cargo.toml.orig")).unwrap();
+            }
+            matches!(config.nested_workspace(), NestedWorkspace::InPlace)
+        };
+        let plain = "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n";
+        // Not packaged: a source tree, its workspace's (or its own) lock file applies.
+        assert!(in_place(plain, false));
+        // Packaged, but a manifest that needs something around it.
+        assert!(in_place("[package]\nname = \"owner\"\n[workspace]\n", true));
+        assert!(in_place(
+            "[package]\nname = \"owner\"\n[dependencies]\nleaf = { workspace = true }\n",
+            true
+        ));
+        assert!(in_place(
+            "[package]\nname = \"owner\"\n[dependencies]\nleaf = { path = \"../leaf\" }\n",
+            true
+        ));
+        // An absolute path finds its target from anywhere.
+        let absolute = format!(
+            "[package]\nname = \"owner\"\n[dependencies]\nleaf = {{ path = {} }}\n",
+            toml_quote(&std::env::temp_dir())
+        );
+        assert!(!cfg!(unix) || !in_place(&absolute, true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_private_workspace_names_the_resolver_the_package_would_have_as_a_root() {
+        let manifest = |edition: &str, extra: &str| {
+            format!(
+                "[package]\nname = \"owner\"\nedition = \"{}\"\n{}",
+                edition, extra
+            )
+        };
+        let resolver = |text: String, edition: &str| {
+            let root = shadow_manifest(&text, edition, &[]);
+            let line = root
+                .lines()
+                .find(|line| line.starts_with("resolver"))
+                .unwrap()
+                .to_string();
+            line
+        };
+        assert_eq!(resolver(manifest("2015", ""), "2015"), "resolver = \"1\"");
+        assert_eq!(resolver(manifest("2018", ""), "2018"), "resolver = \"1\"");
+        assert_eq!(resolver(manifest("2021", ""), "2021"), "resolver = \"2\"");
+        assert_eq!(resolver(manifest("2024", ""), "2024"), "resolver = \"3\"");
+        // Its own word wins; one in another table is not it.
+        assert_eq!(
+            resolver(manifest("2018", "resolver = \"2\"\n"), "2018"),
+            "resolver = \"2\""
+        );
+        assert_eq!(
+            resolver(manifest("2018", "[lints]\nresolver = \"3\"\n"), "2018"),
+            "resolver = \"1\""
+        );
+    }
+
+    #[test]
+    fn a_package_verified_next_to_its_siblings_is_patched_to_their_extracted_sources() {
+        let dir = temp_dir("overlay");
+        let package_dir = dir.join("target/package");
+        let make = |name: &str| {
+            let sibling = package_dir.join(name);
+            std::fs::create_dir_all(&sibling).unwrap();
+            std::fs::write(sibling.join("Cargo.toml"), "").unwrap();
+            sibling
+        };
+        let owner = make("owner-0.1.0");
+        let leaf = make("leaf-1.0.0");
+        let _unrelated = make("other-3.0.0");
+        let mut config = config();
+        config.manifest_dir = owner.clone();
+        // Without Cargo's overlay beside the packages it is not a verification.
+        assert!(config.overlay_patches(REGISTRY_LOCK).is_empty());
+        std::fs::create_dir_all(package_dir.join("tmp-registry")).unwrap();
+        // `leaf` is a registry dependency whose extracted source is there. The package
+        // itself, and a package from another registry, are not patched.
+        let other = REGISTRY_LOCK.replace(
+            "registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"11",
+            "registry+https://example.com/index\"\nchecksum = \"11",
+        );
+        assert_eq!(
+            config.overlay_patches(REGISTRY_LOCK),
+            vec![("leaf".to_string(), leaf.clone())]
+        );
+        assert!(config.overlay_patches(&other).is_empty());
+        // A package that was not extracted is left to Cargo's registry.
+        let gone = REGISTRY_LOCK.replace("1.0.0", "1.0.1");
+        assert!(config.overlay_patches(&gone).is_empty());
+
+        let text = shadow_manifest(
+            "[package]\n",
+            "2021",
+            &config.overlay_patches(REGISTRY_LOCK),
+        );
+        assert!(
+            text.contains("[patch.crates-io]\nleaf = { path = \""),
+            "{}",
+            text
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_path_is_quoted_for_toml() {
+        assert_eq!(toml_quote(Path::new("/a/b")), "\"/a/b\"");
+        assert_eq!(toml_quote(Path::new("C:\\a\\\"b")), "\"C:\\\\a\\\\\\\"b\"");
     }
 
     /// A lock file with the owner, its dependencies and an unrelated package.

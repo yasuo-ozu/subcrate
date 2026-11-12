@@ -224,6 +224,31 @@ edit/run loop is quicker than [`trybuild`] on the same compile-fail cases (24 ca
 - That stand-in can import a sibling dependency only if it is in the same crate
   root (`src/lib.rs`, or the same test/bin/example file); a cross-root dependency
   has no `crate::` path, so references to it may not resolve under `cargo doc`.
+- A crate the package depends on (`#[subcrate(::syn)]`) is built by a nested,
+  `--offline` `cargo build`. When cross-compiling, a proc-macro subcrate's crates
+  are built for the **host** (it runs there) and a library subcrate's for the
+  target, so a `#![no_std]` library can have a proc-macro subcrate on `::syn`. The
+  crate must be a normal dependency that the package's resolution switches on for
+  that platform: an optional dependency whose feature is off, a build-dependency
+  only, or one that a `[target.'cfg(…)'.dependencies]` table leaves out is not
+  something Cargo can build (it panics; the build says what to change). For a crate
+  that the bare-metal build must not compile, declare it for the host only:
+
+  ```toml
+  [target.'cfg(not(target_os = "none"))'.dependencies]
+  syn = "2"
+  ```
+
+  A proc-macro subcrate cannot use the package's own library (`::this_package`) nor a
+  library subcrate when cross-compiling: those are built for the target.
+- A package built from a registry (or a git checkout) is built by that nested
+  `cargo` in a private workspace of its own, against the versions the workspace being
+  built resolved — not its own published `Cargo.lock`, which is left untouched. The
+  workspace holds a symbolic link to the package; where one cannot be made (Windows
+  without the right to create links) the nested build runs in the package's directory,
+  with its own `Cargo.lock`, as before. `cargo package -p a -p b` verifies a package
+  against its not-yet-published sibling through that workspace (for `crates.io`
+  dependencies).
 
 ## Related work
 

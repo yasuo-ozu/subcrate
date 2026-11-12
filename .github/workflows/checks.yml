@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: |
-          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup toolchain install nightly --profile minimal --target x86_64-unknown-none --no-self-update
           rustup default nightly
           rustc --version
       # Exercises the `mod foo;`-inside-a-subcrate tests, which require nightly
