@@ -88,8 +88,7 @@ pub use macros::mac;             // now `thiscrate::mac!()` works...
 pub fn ordinary() -> usize { 7 } // ...next to ordinary items, in one crate.
 ```
 
-Attribute macros (`#[proc_macro_attribute]`) and derive macros (`#[proc_macro_derive]`)
-are re-exported the same way, and documented too (see [Known limitations](#known-limitations)).
+Attribute and derive macros are re-exported the same way.
 
 ## Setup
 
@@ -120,9 +119,10 @@ If the build helper never runs, `#[subcrate]` gives a clear compile error instea
 of a confusing linker failure.
 
 A crate that needs only the attribute, not `build::compile`, can leave the build
-machinery out of its own build with `default-features = false`. Then `subcrate` is
-`#![no_std]` and only the attribute is left, so a `no_std` package can depend on it
-and be built for a target without `std` (e.g. `x86_64-unknown-none`):
+machinery out of its own build with `default-features = false`. `subcrate` is then
+`#![no_std]`, so a `no_std` package can use it on a target without `std` (e.g.
+`x86_64-unknown-none`). This needs feature resolver 2 (the default since edition 2021),
+which keeps the build-dependency's default features out of the normal dependency:
 
 ```toml
 [dependencies]
@@ -132,22 +132,16 @@ subcrate = { version = "0.2", default-features = false }
 subcrate = "0.2" # the build helper runs on the host, with the default features
 ```
 
-This relies on the feature resolver 2 (the default since the 2021 edition), which
-keeps the build-dependency's default features out of the normal dependency.
-
 ## How it works
 
 `subcrate::build::compile()` runs from your build script. It:
 
 1. Finds the package's source files, from its crate roots (`src/lib.rs`,
    `src/main.rs`, `src/bin/*.rs`, `tests/*.rs`, `benches/*.rs`, `examples/*.rs`,
-   and the targets `Cargo.toml` declares) through `mod foo;` and `#[path = "…"]`.
-   It starts from `CARGO_MANIFEST_DIR`, so a published, extracted package works
-   too. The roots are the package's targets: with `autotests = false`
-   (`autobins`, `autobenches`, `autoexamples`) in `[package]`, the files in
-   `tests/` (`src/bin/`, `benches/`, `examples/`) are not read unless a
-   `[[test]]` (`[[bin]]`, …) declares them — for a package whose `tests/` holds
-   another package.
+   and declared targets) through `mod foo;` and `#[path = "…"]`. It starts from
+   `CARGO_MANIFEST_DIR`, so a published, extracted package works too. `autotests = false`
+   (likewise `autobins`, `autobenches`, `autoexamples`) in `[package]` skips the files in
+   `tests/` (…) unless a `[[test]]` (…) declares them, e.g. for another package in `tests/`.
 2. Finds every `#[subcrate]` inline module in them.
 3. Compiles each with `rustc` directly (from `$RUSTC`).
 4. Puts the crates on the library search path and writes a small manifest the
@@ -245,66 +239,43 @@ edit/run loop is quicker than [`trybuild`] on the same compile-fail cases (24 ca
 - That stand-in can import a sibling dependency only if it is in the same crate
   root (`src/lib.rs`, or the same test/bin/example file); a cross-root dependency
   has no `crate::` path, so references to it may not resolve under `cargo doc`.
-- Under `cargo doc` a `proc_macro` subcrate is replaced by a stand-in, because
-  `rustdoc` is not given the build helper's search path and so cannot load the real
-  crate. For each `#[proc_macro]`, `#[proc_macro_attribute]` and
-  `#[proc_macro_derive(Name)]` function the stand-in defines a `macro_rules!` macro
-  with the function's doc comment (a `#[doc(hidden)]` function stays hidden), so
-  `pub use macros::{mac, attr, Name};` resolves and the package is documented. Two
-  consequences:
-  - The pages are all `macro.NAME.html` ("Macros"). Rustdoc shows `attr.NAME.html`
-    and `derive.NAME.html` only for a proc-macro crate it can load, or for
-    `macro_rules!` with `attr(..)`/`derive(..)` rules, which are unstable
-    (`#![feature(macro_attr, macro_derive)]`, a crate-level attribute that a
-    stand-in cannot add). So the page of an attribute or a derive ends with a line
-    saying what it is (`apply it as #[NAME]`, `use it as #[derive(NAME)]`).
-  - The stand-in is a plain macro, so *applying* an attribute or a derive of it in
-    the documented package fails (`cannot find attribute`). Guard those uses, and the
-    derive's helper attributes, with `#[cfg_attr(not(doc), NAME)]` and
-    `#[cfg_attr(not(doc), derive(NAME))]`. Only the documentation build is
-    affected; builds, tests and doc tests use the real crate.
-
-  The code blocks in a macro's doc comment are doc tests of the package, as they would
-  be in a proc-macro crate of their own.
-- A crate the package depends on (`#[subcrate(::syn)]`) is built by a nested,
-  `--offline` `cargo build`. When the package is built for a target — cross-compiling,
-  or given `--target` even for the host's own triple, where Cargo stops applying
-  `RUSTFLAGS` to build scripts and proc-macros — a proc-macro subcrate's crates are built
-  for the **host** (it runs there, and without the target's `RUSTFLAGS`) and a library
-  subcrate's for the target, so a `#![no_std]` library can have a proc-macro subcrate on
-  `::syn`. The crate must be a normal dependency that the package's resolution switches
-  on for that platform. One that is not is not something Cargo can build: an optional
-  dependency whose feature is off, or a dev-dependency, is not in the dependency graph
-  and Cargo says no package of that name matches; a build-dependency only, or one that a
-  `[target.'cfg(…)'.dependencies]` table leaves out for the platform, makes Cargo panic
-  in its resolver (the build says what to change). For a crate that the bare-metal build
-  must not compile, declare it for the host only:
+- Under `cargo doc`, a `proc_macro` subcrate is replaced by a stand-in, since `rustdoc` cannot
+  load the real crate: each `#[proc_macro]`, `#[proc_macro_attribute]` and
+  `#[proc_macro_derive(Name)]` function becomes a `macro_rules!` macro with its doc comment
+  (and its doc tests), so `pub use macros::{mac, attr, Name};` resolves. Its pages are all
+  `macro.NAME.html`, and *applying* its attribute or derive in the documented package fails:
+  guard those uses, and the derive's helper attributes, with `#[cfg_attr(not(doc), NAME)]`
+  and `#[cfg_attr(not(doc), derive(NAME))]`. Builds, tests and doc tests use the real crate.
+- A crate the package depends on (`#[subcrate(::syn)]`) is built by a nested, `--offline`
+  `cargo build`. For a package built for a target (cross-compiling, or `--target` even for
+  the host's triple, as Cargo then applies `RUSTFLAGS` to the target only), a proc-macro
+  subcrate's crates are built for the **host** without the target's `RUSTFLAGS` (though
+  `build.rustflags` from a config file still reaches them) and a library subcrate's for the
+  target, so a `#![no_std]` library can have a proc-macro subcrate on `::syn`.
+- Such a crate must be a normal dependency that the package's resolution enables for that
+  platform. An optional one whose feature is off, or a dev-dependency, gives "did not match
+  any packages". A build-dependency only, or one a `[target.'cfg(…)'.dependencies]` table
+  leaves out, makes Cargo panic (the build says what to change). To keep it out of the
+  bare-metal build, declare it for the host only:
 
   ```toml
   [target.'cfg(not(target_os = "none"))'.dependencies]
   syn = "2"
   ```
-
-  A proc-macro subcrate cannot use the package's own library (`::this_package`) nor a
-  library subcrate when cross-compiling: those are built for the target.
-- A package built from a registry (or a git checkout, or a vendored directory) is built
-  by that nested `cargo` in a private workspace of its own: a stub package that depends
-  on it as a dependency, not as a member, so — as when Cargo builds it as a dependency —
-  its dev-dependencies are not resolved, and with the features the outer build gave it. The
-  workspace takes the versions the workspace being built resolved, not the package's own
-  published `Cargo.lock`, which is left untouched (nor is anything else written into the
-  package's directory, a git checkout included), and the `[patch]` and `[replace]` tables of
-  that workspace's manifest. The build runs from that workspace's directory, so its
-  Cargo configuration (a source replacement, a mirror, `[net]`, `[patch]` in
-  `.cargo/config.toml`) applies, as `$CARGO_HOME`'s does. The workspace is found by its
-  `Cargo.lock` above the build's target directory, so this needs the target directory to
-  be under it, as it is by default; with `CARGO_TARGET_DIR` elsewhere the build runs from the
-  package's directory and sees only `$CARGO_HOME`'s configuration and no `[patch]`. (And the
-  configuration of a directory the build was started in below the workspace's root, or of
-  `--config`, is not seen.) A crate that `[replace]` swaps for another and that a subcrate
-  names (`::name`) is two packages of one name and version to `cargo build -p`, which cannot
-  choose: use `[patch]`. `cargo package -p a -p b` verifies a package against its
-  not-yet-published sibling through that workspace (for `crates.io` dependencies).
+- When cross-compiling, a proc-macro subcrate cannot use `::this_package` or a library subcrate.
+- A registry (git, vendored) package is built by that nested `cargo` in a private workspace:
+  a stub that depends on it, not as a member, so its dev-dependencies are not resolved. It
+  takes the outer build's features, versions (not the package's `Cargo.lock`), `[patch]` and
+  `[replace]`; nothing is written into the package's directory. Cargo's configuration there
+  (source replacement, mirror, `[net]`) applies.
+- That workspace is found by its `Cargo.lock` above the target directory: with
+  `CARGO_TARGET_DIR` outside it, there is no `[patch]`, `[replace]` or project configuration.
+- `--config`, and configuration of a directory below the workspace root that the build was
+  started in, are not seen.
+- A `[replace]`d crate that a subcrate names (`::name`) is two packages of one name and
+  version to `cargo build -p`: use `[patch]`.
+- `cargo package -p a -p b` verifies a package against its not-yet-published sibling through
+  that workspace (`crates.io` only).
 
 ## Related work
 
