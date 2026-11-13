@@ -267,14 +267,18 @@ edit/run loop is quicker than [`trybuild`] on the same compile-fail cases (24 ca
   The code blocks in a macro's doc comment are doc tests of the package, as they would
   be in a proc-macro crate of their own.
 - A crate the package depends on (`#[subcrate(::syn)]`) is built by a nested,
-  `--offline` `cargo build`. When cross-compiling, a proc-macro subcrate's crates
-  are built for the **host** (it runs there) and a library subcrate's for the
-  target, so a `#![no_std]` library can have a proc-macro subcrate on `::syn`. The
-  crate must be a normal dependency that the package's resolution switches on for
-  that platform: an optional dependency whose feature is off, a build-dependency
-  only, or one that a `[target.'cfg(…)'.dependencies]` table leaves out is not
-  something Cargo can build (it panics; the build says what to change). For a crate
-  that the bare-metal build must not compile, declare it for the host only:
+  `--offline` `cargo build`. When the package is built for a target — cross-compiling,
+  or given `--target` even for the host's own triple, where Cargo stops applying
+  `RUSTFLAGS` to build scripts and proc-macros — a proc-macro subcrate's crates are built
+  for the **host** (it runs there, and without the target's `RUSTFLAGS`) and a library
+  subcrate's for the target, so a `#![no_std]` library can have a proc-macro subcrate on
+  `::syn`. The crate must be a normal dependency that the package's resolution switches
+  on for that platform. One that is not is not something Cargo can build: an optional
+  dependency whose feature is off, or a dev-dependency, is not in the dependency graph
+  and Cargo says no package of that name matches; a build-dependency only, or one that a
+  `[target.'cfg(…)'.dependencies]` table leaves out for the platform, makes Cargo panic
+  in its resolver (the build says what to change). For a crate that the bare-metal build
+  must not compile, declare it for the host only:
 
   ```toml
   [target.'cfg(not(target_os = "none"))'.dependencies]
@@ -283,14 +287,24 @@ edit/run loop is quicker than [`trybuild`] on the same compile-fail cases (24 ca
 
   A proc-macro subcrate cannot use the package's own library (`::this_package`) nor a
   library subcrate when cross-compiling: those are built for the target.
-- A package built from a registry (or a git checkout) is built by that nested
-  `cargo` in a private workspace of its own, against the versions the workspace being
-  built resolved — not its own published `Cargo.lock`, which is left untouched. The
-  workspace holds a symbolic link to the package; where one cannot be made (Windows
-  without the right to create links) the nested build runs in the package's directory,
-  with its own `Cargo.lock`, as before. `cargo package -p a -p b` verifies a package
-  against its not-yet-published sibling through that workspace (for `crates.io`
-  dependencies).
+- A package built from a registry (or a git checkout, or a vendored directory) is built
+  by that nested `cargo` in a private workspace of its own: a stub package that depends
+  on it as a dependency, not as a member, so — as when Cargo builds it as a dependency —
+  its dev-dependencies are not resolved, and with the features the outer build gave it. The
+  workspace takes the versions the workspace being built resolved, not the package's own
+  published `Cargo.lock`, which is left untouched (nor is anything else written into the
+  package's directory, a git checkout included), and the `[patch]` and `[replace]` tables of
+  that workspace's manifest. The build runs from that workspace's directory, so its
+  Cargo configuration (a source replacement, a mirror, `[net]`, `[patch]` in
+  `.cargo/config.toml`) applies, as `$CARGO_HOME`'s does. The workspace is found by its
+  `Cargo.lock` above the build's target directory, so this needs the target directory to
+  be under it, as it is by default; with `CARGO_TARGET_DIR` elsewhere the build runs from the
+  package's directory and sees only `$CARGO_HOME`'s configuration and no `[patch]`. (And the
+  configuration of a directory the build was started in below the workspace's root, or of
+  `--config`, is not seen.) A crate that `[replace]` swaps for another and that a subcrate
+  names (`::name`) is two packages of one name and version to `cargo build -p`, which cannot
+  choose: use `[patch]`. `cargo package -p a -p b` verifies a package against its
+  not-yet-published sibling through that workspace (for `crates.io` dependencies).
 
 ## Related work
 
