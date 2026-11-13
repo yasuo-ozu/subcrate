@@ -15,6 +15,10 @@ subcrate = { path = ".." }
 # crate, so the owner joins the nested selection only through the path-dependency
 # gate — the behaviour this package guards.
 pm-user = { path = "../examples/pm-user" }
+# A workspace member that is itself backed by subcrates (and runs a nested build of its
+# own). Linked by a second subcrate, still without the owner crate, so the nested build
+# runs with `SUBCRATE_HARVEST_ONLY` set — and that must not reach `backed`'s build script.
+backed = { path = "../examples/backed" }
 
 [build-dependencies]
 subcrate = { path = ".." }

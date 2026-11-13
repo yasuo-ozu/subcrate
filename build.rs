@@ -15,8 +15,8 @@
 //! # How it works
 //!
 //! 1. Discover the package's source files, from its crate roots (`src/lib.rs`,
-//!    `src/main.rs`, `src/bin/*.rs`, `tests/*.rs`, `benches/*.rs`, `examples/*.rs`)
-//!    through `mod foo;` and `#[path = "…"]`.
+//!    `src/main.rs`, `src/bin/*.rs`, `tests/*.rs`, `benches/*.rs`, `examples/*.rs` and declared
+//!    targets, see [Crate roots](#crate-roots)) through `mod foo;` and `#[path = "…"]`.
 //! 2. Collect every `#[subcrate]` inline module.
 //! 3. Resolve the dependencies between subcrates, sort them with [`safegraph`],
 //!    and reject any cycle.
@@ -38,6 +38,18 @@
 //! every Cargo back to the 1.56 MSRV accepts; `cargo::` is 1.77+). Cargo forwards
 //! a build-script link path to dependent packages too, so publicly exported
 //! subcrates resolve downstream with no extra wiring.
+//!
+//! # Crate roots
+//!
+//! The roots are the targets Cargo builds, found as Cargo finds them: the library (`src/lib.rs`
+//! or `[lib] path`), and the binaries, tests, benchmarks and examples, both by place
+//! (`src/main.rs`, `src/bin/`, `tests/`, `benches/`, `examples/`) and as declared (`[[bin]]`,
+//! `[[test]]`, `[[bench]]`, `[[example]]`, by `path`, else by `name`).
+//!
+//! `autobins`, `autotests`, `autobenches` and `autoexamples` set to `false` in `[package]`
+//! turn the discovery by place off for that kind, for a directory holding files that are not
+//! this package's (like another package in `tests/`): they are then neither read nor watched.
+//! Left on, every `*.rs` there is a root. `autolib` is not read: `src/lib.rs` is always a root.
 //!
 //! # Toolchain-conditional subcrates
 //!
@@ -108,7 +120,8 @@
 //!
 //! Selecting the owner re-runs this build script inside that nested build, with
 //! `SUBCRATE_NESTED` set. There are two reasons the owner is selected, handled
-//! differently:
+//! differently. (Both variables name the owner's package, so a dependency's own `subcrate`
+//! build script, run in the same nested build, ignores them.)
 //!
 //! - **Only to unify a path dependency's features.** The owner's library is not
 //!   wanted — just the dependency, built with the owner in the resolution — so the
@@ -125,6 +138,78 @@
 //! A subcrate in the library can't use the owner crate (it would depend on itself);
 //! ones in `tests/`, `src/main.rs`, `src/bin/`, `examples/` and `benches/` can.
 //!
+//! A dependency may itself be backed by subcrates, which its build script compiles in the
+//! nested build. So the build script forwards the library search paths that the nested
+//! build's build scripts asked for (`cargo:rustc-link-search`), when they are in the nested
+//! build's directory, to every subcrate built on owner dependencies: Cargo gives them to its
+//! own compilations, but not to these.
+//!
+//! # Cross-compiling
+//!
+//! When `--target` is not the host, a library subcrate is built for the target, but a
+//! proc-macro subcrate is built for the host and runs there. So the crates a proc-macro
+//! subcrate uses (`#[subcrate(proc_macro, ::syn)]`) come from a second nested build,
+//! `cargo build -p <dep>… --lib --target <host>`, in
+//! `subcrate-owner-deps/<package>/<compiler>-host`. A crate used by both kinds is built
+//! twice. This lets a `#![no_std]` library for a bare-metal target have a proc-macro
+//! subcrate on `::syn`. Search paths are forwarded as above, and a subcrate built on either
+//! build is given both.
+//!
+//! **`--target` for the host's own triple** is treated the same way, though `TARGET` equals
+//! `HOST`. Once Cargo is given `--target` (or `build.target`), whatever the triple, it applies
+//! `RUSTFLAGS` to the target's artifacts only, never to build scripts or proc-macros, and
+//! builds those into `target/<profile>` and the target's into `target/<triple>/<profile>`. A
+//! nested build without `--target` would apply the flags to everything (`-C
+//! target-feature=+crt-static` then breaks `proc-macro2`'s build script). So `explicit_target`
+//! tells the two apart by that layout (`OUT_DIR` in `target/<triple>/<profile>`, the build
+//! script's executable in `target/<profile>`), and the nested builds get `--target`: `<triple>`
+//! with the flags for a library subcrate's crates, `<host>` without them for a proc-macro
+//! subcrate's.
+//!
+//! Cargo builds `-p <dep>` only for a *normal dependency that the package's resolution
+//! switches on for the platform being built* (here the host's) and, as the nested build is
+//! `--offline`, only one in the local cache. An optional dependency whose feature is off, or a
+//! dev-dependency, is not in the dependency graph (`package ID specification … did not match
+//! any packages`). A build-dependency only, or one that a `[target.'cfg(…)'.dependencies]`
+//! table excludes, makes Cargo panic in its resolver (the nested build reports it, with a
+//! hint). A path dependency that is a workspace member is built whatever its features. For a
+//! crate the bare-metal build must not compile, use a platform-gated normal dependency that
+//! the host satisfies (this also puts it in the lock file and the cache):
+//!
+//! ```toml
+//! [target.'cfg(not(target_os = "none"))'.dependencies]
+//! syn = "2"
+//! ```
+//!
+//! # Packaged crates
+//!
+//! The nested build runs in the package's directory, where Cargo finds the workspace and
+//! `Cargo.lock` that govern it. That is wrong for a crate *built from a registry* (or a git
+//! checkout): its own `Cargo.lock` may name versions that are not in the local cache (the
+//! build is `--offline`), Cargo would rewrite it in a directory that is not the build's to
+//! write, and the build would resolve dev-dependencies and see no `[patch]` or project config.
+//!
+//! So a packaged crate (one with `Cargo.toml.orig`, or under Cargo's `registry/src` or
+//! `git/checkouts`) gets a private workspace (`Shadow`) in the build's profile directory: a
+//! stub package, the workspace root, that depends on the crate by path, as a dependency and
+//! not a member. So, as in the outer build, its `[dev-dependencies]`, `[profile]` and `[patch]`
+//! are ignored. The stub gets the crate's features (from `CARGO_FEATURE_*`), a `Cargo.lock` of
+//! its own, and the `[patch]` and `[replace]` tables and the resolver of the workspace being
+//! built: the nearest directory above `OUT_DIR` whose `Cargo.lock` lists the crate as a
+//! registry or git dependency. The nested build runs **from that workspace's directory**,
+//! because Cargo finds its configuration files (source replacement, `[net]`, `[patch]` in
+//! `.cargo/config.toml`) from the directory it runs in, not from the manifest; `$CARGO_HOME`'s
+//! applies anywhere. With no workspace found, it runs in the package's directory. It starts
+//! from the first of these lock files, the next when one fails:
+//!
+//! 1. the lock file of the workspace being built: the versions the outer build resolved;
+//! 2. the package's own lock file, right when the package is what is being built (`cargo
+//!    package`'s verification, docs.rs, `cargo install --locked`);
+//! 3. none, so that Cargo resolves afresh from the cache.
+//!
+//! The package's own `Cargo.lock` and directory are never written. If the private workspace
+//! cannot be written, the build runs in the package's directory.
+//!
 //! # Limitations of `::name`
 //!
 //! - The crate must be an ordinary library, not a proc-macro.
@@ -135,10 +220,30 @@
 //!   them).
 //! - A custom profile is built as `dev` or `release` (a build script is only told
 //!   which), so Cargo and the build script agree on the build.
-//! - When cross-compiling, a proc-macro subcrate can't use these crates: they are
-//!   built for the target, a proc-macro for the host.
-//! - The nested build runs `--offline` from the package's own directory, so it
-//!   expects a workspace with its `Cargo.lock` and sources in place.
+//! - When building for a target, a proc-macro subcrate's crates are built for the host, so
+//!   they must build there. That build gets none of the target's `RUSTFLAGS`, but
+//!   `build.rustflags` and `target.<host>.rustflags` from a config file still apply. For a
+//!   different triple, a proc-macro subcrate can't use the owner crate or a library subcrate:
+//!   they are built for the target.
+//! - `--target` for the host's own triple is told from the layout of Cargo's build directory
+//!   (see [Cross-compiling](#cross-compiling)), which Cargo does not promise. If it changes,
+//!   the build is taken for one without `--target`, and a `RUSTFLAGS` that cannot apply to
+//!   build scripts then fails the nested build.
+//! - The crate must be a normal dependency that the package's resolution switches on for the
+//!   nested build's platform, and be in the local cache (`--offline`): see
+//!   [Cross-compiling](#cross-compiling). A workspace member is built whatever its features.
+//! - A crate that `[replace]` swaps is two packages of one name and version to `cargo build
+//!   -p`, so `::name` cannot select it (the error says to use `[patch]`). The `[replace]`
+//!   table is still carried into the nested build of a packaged crate.
+//! - For a packaged crate the workspace is found by the `Cargo.lock` above `OUT_DIR`. A
+//!   `CARGO_TARGET_DIR` outside it means no `[patch]`/`[replace]` and no project-level Cargo
+//!   configuration in the nested build. Configuration of a deeper starting directory, or
+//!   given as `--config`, is never seen.
+//! - A source tree's nested build runs from the package's directory, so it needs the sources
+//!   in place with their workspace and `Cargo.lock` (see [Packaged crates](#packaged-crates)).
+//! - `cargo package -p a -p b` verifies a package against its not-yet-published sibling through a
+//!   `[patch.crates-io]` to the siblings' extracted sources in `target/package/`, for `crates.io`
+//!   dependencies only.
 //! - Under `cargo check` and clippy the dependency copies differ from
 //!   `cargo build`'s, so a value of such a type crosses the subcrate boundary under
 //!   `cargo build`/`test` but not under `cargo check`.
@@ -210,8 +315,12 @@ pub struct Config {
     out_dir: PathBuf,
     rustc: PathBuf,
     edition: String,
-    /// Target triple, if cross-compiling (host != target).
+    /// Target triple, if built for a target: cross-compiling, or `--target` given even for
+    /// the host's own triple (see [`explicit_target`]).
     target: Option<String>,
+    /// The host triple (`HOST`), set exactly when `target` is, for
+    /// [`build_host_deps`](Self::build_host_deps).
+    host: Option<String>,
     /// Panic strategy of the target (`unwind`/`abort`), applied to library
     /// subcrates so the final link is consistent.
     panic: Option<String>,
@@ -234,16 +343,20 @@ pub struct Config {
     cargo: PathBuf,
     /// The owning package's name (`CARGO_PKG_NAME`).
     package: String,
+    /// The owning package's version (`CARGO_PKG_VERSION`).
+    package_version: String,
+    /// Where the nested builds run, worked out once (see [`NestedWorkspace`]).
+    nested_workspace: std::cell::RefCell<Option<NestedWorkspace>>,
     /// The build profile (`PROFILE`): `release` builds the owner's dependencies
     /// with `--release`, anything else without.
     profile: String,
-    /// Whether this build script runs inside the nested Cargo build of another
-    /// `subcrate` build script (`SUBCRATE_NESTED` is set).
+    /// Whether this build script runs inside the nested Cargo build that this package's own
+    /// `subcrate` build script started (`SUBCRATE_NESTED` names it; see [`scope_key`]).
     nested: bool,
     /// Whether that nested build selected the owner only to unify a path
-    /// dependency's features (`SUBCRATE_HARVEST_ONLY` is set): the owner's own
-    /// library need not compile here, so this run does nothing and lets it fail
-    /// harmlessly. See [`build_owner_deps`](Self::build_owner_deps).
+    /// dependency's features (`SUBCRATE_HARVEST_ONLY` names this package): the
+    /// owner's own library need not compile here, so this run does nothing and lets
+    /// it fail harmlessly. See [`build_owner_deps`](Self::build_owner_deps).
     harvest_only: bool,
     /// An opt-in key that replaces the package name in the nested owner-dependency
     /// target directory, so the packages of a workspace can share one such build
@@ -253,16 +366,32 @@ pub struct Config {
     /// The owner's dependencies (and the owner crate), built for the subcrates
     /// that use them. Filled in by [`Config::run`].
     owner_deps: OwnerDeps,
+    /// When building for a target: the owner's dependencies built *for the host*, without the
+    /// target's flags, for the proc-macro subcrates (they run on the host and cannot link crates
+    /// built for the target). Empty otherwise: they then use `owner_deps`.
+    host_deps: OwnerDeps,
 }
 
 /// Environment variable set on the nested Cargo build of the owner's
-/// dependencies, so a `subcrate` build script running inside it can tell.
+/// dependencies, so the owner's `subcrate` build script can tell. The value is the owner's
+/// [`scope_key`], so a dependency's own `subcrate` build script ignores it.
 const NESTED_ENV: &str = "SUBCRATE_NESTED";
 
 /// Environment variable set on the nested build when the owner was selected only to
 /// unify a path dependency's features, so the re-entered build script knows its
-/// owner library is throwaway and does nothing. See [`Config::build_owner_deps`].
+/// owner library is throwaway and does nothing. Scoped like [`NESTED_ENV`]; see
+/// [`Config::build_owner_deps`].
 const HARVEST_ONLY_ENV: &str = "SUBCRATE_HARVEST_ONLY";
+
+/// What names a package in [`NESTED_ENV`] and [`HARVEST_ONLY_ENV`]: its canonical manifest directory.
+fn scope_key(manifest_dir: &Path) -> OsString {
+    canonical_path(manifest_dir).into_os_string()
+}
+
+/// Whether `name` ([`NESTED_ENV`] or [`HARVEST_ONLY_ENV`]) is set for the package `scope` names.
+fn env_is_for(name: &str, scope: &OsString) -> bool {
+    std::env::var_os(name).map_or(false, |value| &value == scope)
+}
 
 impl Config {
     /// Builds a [`Config`] from the environment variables Cargo sets for build
@@ -275,19 +404,25 @@ impl Config {
         let manifest_dir = PathBuf::from(require_env("CARGO_MANIFEST_DIR")?);
         let out_dir = PathBuf::from(require_env("OUT_DIR")?);
         let package = require_env("CARGO_PKG_NAME")?;
+        let package_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
         let rustc = PathBuf::from(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()));
         let cargo = PathBuf::from(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
         let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
-        let nested = std::env::var_os(NESTED_ENV).is_some();
-        let harvest_only = std::env::var_os(HARVEST_ONLY_ENV).is_some();
+        let scope = scope_key(&manifest_dir);
+        let nested = env_is_for(NESTED_ENV, &scope);
+        let harvest_only = env_is_for(HARVEST_ONLY_ENV, &scope);
 
         let target = std::env::var("TARGET").ok();
         let host = std::env::var("HOST").ok();
-        // Only pass `--target` when genuinely cross-compiling; otherwise the
-        // host default already matches and matches how Cargo invokes rustc.
-        let cross_target = match (&target, &host) {
-            (Some(t), Some(h)) if t != h => Some(t.clone()),
-            _ => None,
+        // Pass `--target` only when Cargo itself builds for a target: cross-compiling, or given
+        // `--target` even for the host's own triple, where Cargo applies `RUSTFLAGS` to the target's
+        // artifacts only (see `explicit_target`). Otherwise the host default matches.
+        let explicit = target.as_deref().map_or(false, |target| {
+            explicit_target(&out_dir, std::env::current_exe().ok().as_deref(), target)
+        });
+        let (cross_target, cross_host) = match (&target, &host) {
+            (Some(t), Some(h)) if t != h || explicit => (Some(t.clone()), Some(h.clone())),
+            _ => (None, None),
         };
 
         let edition = detect_edition(&manifest_dir);
@@ -308,6 +443,7 @@ impl Config {
             rustc,
             edition,
             target: cross_target,
+            host: cross_host,
             panic,
             opt_level,
             debug_assertions,
@@ -316,11 +452,14 @@ impl Config {
             extra_rustc_args: Vec::new(),
             cargo,
             package,
+            package_version,
+            nested_workspace: std::cell::RefCell::new(None),
             profile,
             nested,
             harvest_only,
             owner_deps_key,
             owner_deps: OwnerDeps::default(),
+            host_deps: OwnerDeps::default(),
         })
     }
 
@@ -376,8 +515,12 @@ impl Config {
         // Watch the root source directories too: a Cargo `rerun-if-changed` on a
         // directory fires when files are *added or removed*, so a brand-new file
         // containing a `#[subcrate]` re-runs discovery. (Per-file tracking alone
-        // would miss files that did not exist on the previous run.)
-        for dir in ["src", "tests", "benches", "examples"] {
+        // would miss files that did not exist on the previous run.) Directories whose
+        // auto-discovery is off are not watched: their files are not this package's.
+        let auto = std::fs::read_to_string(self.manifest_dir.join("Cargo.toml"))
+            .map(|manifest| auto_discovery(&manifest))
+            .unwrap_or_default();
+        for dir in auto.root_dirs() {
             let path = self.manifest_dir.join(dir);
             if path.is_dir() {
                 rerun_if_changed(&path);
@@ -408,6 +551,7 @@ impl Config {
         // Build whatever the wanted subcrates take from the owner's dependencies
         // (or the owner itself) before compiling any of them.
         self.owner_deps = self.build_owner_deps(subcrates, &links, &wanted)?;
+        self.host_deps = self.build_host_deps(subcrates, &links, &wanted)?;
 
         let owner_linked = owner_linked(&links, &order);
         // `gate_skipped[ix]`: the subcrate carries a `#[rustversion]` gate and did
@@ -437,7 +581,7 @@ impl Config {
         // copies than the `cargo build` ones used here. So point to the copies
         // built here, which otherwise are the same crates the package is built
         // with.
-        for dir in &self.owner_deps.lib_dirs {
+        for dir in self.dependency_dirs() {
             println!("cargo:rustc-link-search=dependency={}", dir.display());
         }
 
@@ -512,7 +656,7 @@ impl Config {
                     let dep = &subcrates[*target];
                     // A proc-macro crate runs on the host, but a library subcrate is
                     // built for the target; when those differ the host cannot load it.
-                    if sub.proc_macro && !dep.proc_macro && self.target.is_some() {
+                    if sub.proc_macro && !dep.proc_macro && self.is_cross() {
                         return Err(Error::new(format!(
                             "proc-macro subcrate `{}` cannot depend on library subcrate `{}` \
                              when cross-compiling: the library is built for the target, \
@@ -532,38 +676,98 @@ impl Config {
                     deps.push(self.external_dep(sub, name, &link.alias)?);
                 }
                 LinkTarget::Owner => {
-                    deps.push(self.external_dep(sub, &self.owner_crate_name(), &link.alias)?);
+                    self.check_owner_use(sub)?;
+                    // The owner's library comes from the target's build, whoever links it.
+                    deps.push(self.external_dep_from(
+                        &self.owner_deps,
+                        sub,
+                        &self.owner_crate_name(),
+                        &link.alias,
+                    )?);
                 }
             }
         }
         Ok(deps)
     }
 
-    /// The link to the crate `name` built by [`Config::build_owner_deps`], seen as
-    /// `alias` by `sub`.
-    fn external_dep(&self, sub: &Subcrate, name: &str, alias: &str) -> Result<ExternDep, Error> {
-        // The crates were built for the target, which a proc-macro (running on the
-        // host) cannot load when the two differ.
-        if sub.proc_macro && self.target.is_some() {
+    /// Whether `TARGET` is not `HOST`: a proc-macro (running on the host) cannot load the package's library.
+    fn is_cross(&self) -> bool {
+        self.target.is_some() && self.target != self.host
+    }
+
+    /// Whether `sub` is built for the host while the package is built for a target: a proc-macro subcrate.
+    fn is_host_built(&self, sub: &Subcrate) -> bool {
+        sub.proc_macro && self.target.is_some()
+    }
+
+    /// The error for a proc-macro subcrate that uses the owner crate when cross-compiling: its
+    /// library is built for the target, which a proc-macro (running on the host) cannot load.
+    fn check_owner_use(&self, sub: &Subcrate) -> Result<(), Error> {
+        if sub.proc_macro && self.is_cross() {
             return Err(Error::new(format!(
-                "proc-macro subcrate `{}` cannot depend on `::{}` when cross-compiling: \
-                 it is built for the target, but a proc-macro runs on the host",
+                "proc-macro subcrate `{}` cannot depend on the owner crate `::{}` when \
+                 cross-compiling: it is built for the target, but a proc-macro runs on the host",
                 sub.display_name(),
-                name
+                self.owner_crate_name()
             )));
         }
+        Ok(())
+    }
+
+    /// The owner dependencies `sub` links: the host's when it is
+    /// [built for the host](Self::is_host_built), else the target's.
+    fn deps_of(&self, sub: &Subcrate) -> &OwnerDeps {
+        if self.is_host_built(sub) {
+            &self.host_deps
+        } else {
+            &self.owner_deps
+        }
+    }
+
+    /// Every directory holding an owner dependency's artifacts, of both builds.
+    fn dependency_dirs(&self) -> impl Iterator<Item = &PathBuf> {
+        self.owner_deps
+            .lib_dirs
+            .iter()
+            .chain(self.host_deps.lib_dirs.iter())
+    }
+
+    /// Every library search path the build scripts of both builds asked for (see
+    /// [`OwnerDeps::script_paths`]), except the [`dependency_dirs`](Self::dependency_dirs).
+    fn script_dirs(&self) -> impl Iterator<Item = &PathBuf> {
+        self.owner_deps
+            .script_paths
+            .union(&self.host_deps.script_paths)
+            .filter(|dir| {
+                !self.owner_deps.lib_dirs.contains(*dir) && !self.host_deps.lib_dirs.contains(*dir)
+            })
+    }
+
+    /// The link to the crate `name`, from the build that serves `sub` ([`Self::deps_of`]).
+    fn external_dep(&self, sub: &Subcrate, name: &str, alias: &str) -> Result<ExternDep, Error> {
+        self.external_dep_from(self.deps_of(sub), sub, name, alias)
+    }
+
+    /// The link to the crate `name` among `owner_deps`, seen as `alias` by `sub`.
+    fn external_dep_from(
+        &self,
+        owner_deps: &OwnerDeps,
+        sub: &Subcrate,
+        name: &str,
+        alias: &str,
+    ) -> Result<ExternDep, Error> {
         // `name` is what the subcrate's author wrote, which is not necessarily the
         // library crate it stands for (a dependency may be renamed), nor the only
         // version of that crate Cargo built.
-        let external = self.owner_deps.externals.get(name);
+        let external = owner_deps.externals.get(name);
         let crate_name = external.map_or(name, |external| external.crate_name.as_str());
         let krate = external
             .and_then(|external| external.version.as_ref())
             .and_then(|version| {
                 let key = (crate_name.to_string(), version.clone());
-                self.owner_deps.versions.get(&key)
+                owner_deps.versions.get(&key)
             })
-            .or_else(|| self.owner_deps.crates.get(crate_name))
+            .or_else(|| owner_deps.crates.get(crate_name))
             .filter(|krate| krate.rlib.is_some())
             .ok_or_else(|| {
                 Error::new(format!(
@@ -609,7 +813,8 @@ impl Config {
     /// artifacts. Builds nothing if no wanted subcrate uses any.
     ///
     /// All of them come from one nested Cargo build into a separate target
-    /// directory (see the [module documentation](self)).
+    /// directory (see the [module documentation](self)). When building for a target, this build
+    /// serves the library subcrates and [`build_host_deps`](Self::build_host_deps) the proc-macro ones.
     fn build_owner_deps(
         &self,
         subcrates: &[Subcrate],
@@ -623,16 +828,19 @@ impl Config {
             if !wanted[ix] {
                 continue;
             }
+            // A subcrate built for the host takes its crates from the host's build. The owner is built
+            // only here: a proc-macro subcrate that can't load it is rejected by `check_owner_use`.
+            let host_built = self.is_host_built(&subcrates[ix]);
             for link in links {
                 let user = || subcrates[ix].display_name();
                 match &link.target {
-                    LinkTarget::External(name) => {
+                    LinkTarget::External(name) if !host_built => {
                         externals.entry(name).or_insert_with(user);
                     }
-                    LinkTarget::Owner => {
+                    LinkTarget::Owner if !host_built || !self.is_cross() => {
                         owner_user.get_or_insert_with(user);
                     }
-                    LinkTarget::Subcrate(_) => {}
+                    _ => {}
                 }
             }
         }
@@ -654,46 +862,12 @@ impl Config {
             }
         }
 
-        // Cargo wants package specs (`-p some-crate`), `::name` is a name the package's
-        // own code uses: `Cargo.toml` says which package that is (a dependency may be
-        // renamed with `package = "…"`), and the lock file which version of it, when
-        // there are several (see [`owner_package`]).
-        let lock = find_lock(&self.manifest_dir);
-        // What this package depends on, as the lock file has it. (Without the lock
-        // file, or without this package in it, Cargo itself will say if a name is
-        // not a dependency.)
-        let locked: Option<Vec<LockedDep>> = lock
-            .as_ref()
-            .and_then(|(_, text)| locked_dependencies(text, &self.package));
-        let declared = std::fs::read_to_string(self.manifest_dir.join("Cargo.toml"))
-            .map(|manifest| declared_dependencies(&manifest))
-            .unwrap_or_default();
-        let mut packages: Vec<String> = Vec::new();
-        let mut crates: BTreeMap<String, ExternalCrate> = BTreeMap::new();
-        let mut links_local_dep = false;
-        for (name, user) in &externals {
-            let declared_dep = find_declared(&declared, name);
-            links_local_dep |= declared_dep.map_or(false, |dep| self.is_local_dep(dep));
-            let package = declared_dep.map(|dep| self.declared(dep));
-            let resolved =
-                owner_package(name, package.as_ref(), locked.as_deref()).map_err(|reason| {
-                    Error::new(format!(
-                        "subcrate `{}` depends on `::{}`, but {}",
-                        user, name, reason
-                    ))
-                })?;
-            // Two names for one package (a rename next to the original) are built once.
-            if !packages.contains(&resolved.spec) {
-                packages.push(resolved.spec);
-            }
-            crates.insert(
-                name.to_string(),
-                ExternalCrate {
-                    crate_name: resolved.crate_name,
-                    version: resolved.version,
-                },
-            );
-        }
+        let lock = self.lock_for_specs();
+        let ResolvedExternals {
+            mut packages,
+            crates,
+            links_local_dep,
+        } = self.resolve_externals(&externals, &lock)?;
         // A nested run that reaches here is building the owner's library because a
         // subcrate uses the *owner crate* (`::owner`): the harvest-only nested build,
         // which selects the owner merely to unify a dependency's features, returned
@@ -737,59 +911,9 @@ impl Config {
         let harvest_only = links_local_dep && owner_user.is_none();
 
         let target_dir = self.owner_deps_target_dir();
-        let args = self.cargo_args(&packages, &target_dir);
-        let mut cmd = Command::new(&self.cargo);
-        cmd.args(&args)
-            .current_dir(&self.manifest_dir)
-            .env(NESTED_ENV, "1")
-            .stdin(Stdio::null());
-        if harvest_only {
-            cmd.env(HARVEST_ONLY_ENV, "1");
-        }
-        // Cargo sets these for *this* build script only. Left in place they would
-        // leak into the build scripts of the packages built below, which then
-        // see this package's features and cfgs as their own.
-        // And a lint wrapper (`cargo clippy` sets one) is for the check that is
-        // under way, not for this build.
-        cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy();
-            if name.starts_with("CARGO_FEATURE_") || name.starts_with("CARGO_CFG_") {
-                cmd.env_remove(&key);
-            }
-        }
-        let output = cmd.output().map_err(|e| {
-            Error::new(format!(
-                "failed to launch `{}`: {}",
-                self.cargo.display(),
-                e
-            ))
+        let output = self.run_nested(&packages, &target_dir, harvest_only, false, &|output| {
+            built_nested(output, harvest_only, &crates)
         })?;
-        let mut deps = parse_artifacts(&String::from_utf8_lossy(&output.stdout));
-        // A harvest-only build deliberately leaves the owner's own library
-        // uncompiled, so Cargo exits non-zero; that is expected as long as every
-        // crate the subcrates link was built (each is reported before the owner's
-        // library, which depends on it, so it is in the output here). Any other
-        // failure — or a dependency that genuinely did not build — is a real error.
-        let all_built = crates
-            .values()
-            .all(|external| deps.crates.contains_key(&external.crate_name));
-        if !output.status.success() && !(harvest_only && all_built) {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let args: Vec<String> = args
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect();
-            return Err(Error::new(format!(
-                "failed to build the crates the subcrates depend on \
-                 (`{} {}` in `{}`):\n{}\n\
-                 Every `::name` a `#[subcrate]` uses must be a dependency of this package",
-                self.cargo.display(),
-                args.join(" "),
-                self.manifest_dir.display(),
-                indent(stderr.trim_end())
-            )));
-        }
 
         // Reclaim the disk the nested build just spent. It re-stored the owner's
         // dependency chain in its own target directory, byte for byte the same as
@@ -808,19 +932,272 @@ impl Config {
             dedup_against_main(&target_dir, &main);
         }
 
+        Ok(self.nested_deps(&output, &target_dir, crates))
+    }
+
+    /// When building for a target (`--target`, cross-compiling or not), builds the crates the
+    /// `wanted` proc-macro subcrates take from the package *for the host*, and returns their
+    /// artifacts. Builds nothing when no target was named or no such subcrate uses any.
+    ///
+    /// A proc-macro runs on the host and can only link crates built for it. So this is a second
+    /// nested build, of just those crates, into `subcrate-owner-deps/<package>/<compiler>-host`,
+    /// with an explicit `--target <host>` (so `build.target` or `CARGO_BUILD_TARGET` cannot send
+    /// it to the target) and without the target's `RUSTFLAGS`, which Cargo does not give to the
+    /// host's build scripts and proc-macros either. Unlike the target's build, it does not select
+    /// the owner to match the main build's copy of a crate: no type crosses between a proc-macro
+    /// and the package.
+    fn build_host_deps(
+        &self,
+        subcrates: &[Subcrate],
+        links: &[Vec<Link>],
+        wanted: &[bool],
+    ) -> Result<OwnerDeps, Error> {
+        if self.host.is_none() {
+            return Ok(OwnerDeps::default());
+        }
+        let mut externals: BTreeMap<&str, String> = BTreeMap::new();
+        for (ix, links) in links.iter().enumerate() {
+            if !wanted[ix] || !self.is_host_built(&subcrates[ix]) {
+                continue;
+            }
+            for link in links {
+                match &link.target {
+                    LinkTarget::External(name) => {
+                        externals
+                            .entry(name)
+                            .or_insert_with(|| subcrates[ix].display_name());
+                    }
+                    LinkTarget::Owner => self.check_owner_use(&subcrates[ix])?,
+                    LinkTarget::Subcrate(_) => {}
+                }
+            }
+        }
+        if externals.is_empty() {
+            return Ok(OwnerDeps::default());
+        }
+        let lock = self.lock_for_specs();
+        let ResolvedExternals {
+            mut packages,
+            crates,
+            links_local_dep,
+        } = self.resolve_externals(&externals, &lock)?;
+        // A path dependency may be a workspace member: select the owner too (as `build_owner_deps` does).
+        if links_local_dep && !packages.contains(&self.package) {
+            packages.push(self.package.clone());
+        }
+        let target_dir = self.host_deps_target_dir();
+        // No dedup against the main build: it has no copy of these crates for the host to match.
+        let output = self.run_nested(&packages, &target_dir, links_local_dep, true, &|output| {
+            built_nested(output, links_local_dep, &crates)
+        })?;
+        Ok(self.nested_deps(&output, &target_dir, crates))
+    }
+
+    /// The lock file that governs the nested build (see [`NestedWorkspace`]), which says
+    /// which version of a package `::name` stands for.
+    fn lock_for_specs(&self) -> Option<(PathBuf, String)> {
+        match self.nested_workspace() {
+            NestedWorkspace::Shadow(shadow) => shadow.seeds.into_iter().flatten().next(),
+            NestedWorkspace::InPlace => find_lock(&self.manifest_dir),
+        }
+    }
+
+    /// Works out which package each `::name` in `externals` (with the first subcrate to use it,
+    /// for errors) stands for: `Cargo.toml` says which package a name is (a dependency may be
+    /// renamed), and the lock file which version (see [`owner_package`]).
+    fn resolve_externals(
+        &self,
+        externals: &BTreeMap<&str, String>,
+        lock: &Option<(PathBuf, String)>,
+    ) -> Result<ResolvedExternals, Error> {
+        // What this package depends on, as the lock file has it. (Without the lock
+        // file, or without this package in it, Cargo itself will say if a name is
+        // not a dependency.)
+        let locked: Option<Vec<LockedDep>> = lock
+            .as_ref()
+            .and_then(|(_, text)| locked_dependencies(text, &self.package));
+        let declared = std::fs::read_to_string(self.manifest_dir.join("Cargo.toml"))
+            .map(|manifest| declared_dependencies(&manifest))
+            .unwrap_or_default();
+        let mut packages: Vec<String> = Vec::new();
+        let mut crates: BTreeMap<String, ExternalCrate> = BTreeMap::new();
+        let mut links_local_dep = false;
+        for (name, user) in externals {
+            let declared_dep = find_declared(&declared, name);
+            links_local_dep |= declared_dep.map_or(false, |dep| self.is_local_dep(dep));
+            let package = declared_dep.map(|dep| self.declared(dep));
+            let resolved =
+                owner_package(name, package.as_ref(), locked.as_deref()).map_err(|reason| {
+                    Error::new(format!(
+                        "subcrate `{}` depends on `::{}`, but {}",
+                        user, name, reason
+                    ))
+                })?;
+            // Two names for one package (a rename next to the original) are built once.
+            if !packages.contains(&resolved.spec) {
+                packages.push(resolved.spec);
+            }
+            crates.insert(
+                name.to_string(),
+                ExternalCrate {
+                    crate_name: resolved.crate_name,
+                    version: resolved.version,
+                },
+            );
+        }
+        Ok(ResolvedExternals {
+            packages,
+            crates,
+            links_local_dep,
+        })
+    }
+
+    /// What the nested build (`output`) of `crates` in `target_dir` produced, as the subcrates link it.
+    fn nested_deps(
+        &self,
+        output: &std::process::Output,
+        target_dir: &Path,
+        crates: BTreeMap<String, ExternalCrate>,
+    ) -> OwnerDeps {
+        let mut deps = parse_artifacts(&String::from_utf8_lossy(&output.stdout));
         deps.externals = crates;
-        // Rebuild the subcrates when the crates they link against change. Cargo
-        // does not rerun this build script for that on its own: it only watches
-        // what it is told to. A dependency from a registry is immutable, but a
-        // path dependency is edited in place, and the resolved versions come from
-        // the lock file.
+        // Only search paths into what this build produced matter: a crate backed by subcrates has
+        // them in its `OUT_DIR`. A `-sys` crate's system library directory is not needed.
+        deps.script_paths.retain(|path| is_inside(path, target_dir));
+        self.watch_nested_inputs(&deps);
+        deps
+    }
+
+    /// Reruns the build script when the crates the subcrates link change: a path dependency
+    /// is edited in place and the versions come from the lock file, and Cargo watches neither.
+    fn watch_nested_inputs(&self, deps: &OwnerDeps) {
         for source in &deps.sources {
             rerun_if_changed(source);
         }
-        if let Some((path, _)) = &lock {
-            rerun_if_changed(path);
+        match self.nested_workspace() {
+            NestedWorkspace::Shadow(shadow) => {
+                for (path, _) in shadow.seeds.iter().flatten() {
+                    rerun_if_changed(path);
+                }
+                for path in &shadow.watch {
+                    rerun_if_changed(path);
+                }
+            }
+            NestedWorkspace::InPlace => {
+                if let Some((path, _)) = find_lock(&self.manifest_dir) {
+                    rerun_if_changed(&path);
+                }
+            }
         }
-        Ok(deps)
+    }
+
+    /// Runs the nested `cargo build` of `packages` into `target_dir`, for the host if `host`, else
+    /// for the target (see [`cargo_args`](Self::cargo_args)). Returns its output if `accept` takes
+    /// it, else the error: for a packaged crate, the first of several attempts' (see [`NestedWorkspace`]).
+    fn run_nested(
+        &self,
+        packages: &[String],
+        target_dir: &Path,
+        harvest_only: bool,
+        host: bool,
+        accept: &dyn Fn(&std::process::Output) -> bool,
+    ) -> Result<std::process::Output, Error> {
+        let mut args = self.cargo_args(packages, target_dir, host);
+        let workspace = self.nested_workspace();
+        let seeds: Vec<Option<(PathBuf, String)>> = match &workspace {
+            NestedWorkspace::InPlace => vec![None],
+            NestedWorkspace::Shadow(shadow) => {
+                args.push("--manifest-path".into());
+                args.push(shadow.manifest.clone().into());
+                shadow.seeds.clone()
+            }
+        };
+        let cwd = match &workspace {
+            NestedWorkspace::InPlace => self.manifest_dir.clone(),
+            NestedWorkspace::Shadow(shadow) => shadow.cwd.clone(),
+        };
+        let mut first_failure: Option<Error> = None;
+        for seed in &seeds {
+            if let NestedWorkspace::Shadow(shadow) = &workspace {
+                let _ = std::fs::remove_file(&shadow.lock);
+                if let Some((_, text)) = seed {
+                    std::fs::write(&shadow.lock, text)?;
+                }
+            }
+            let output = self.launch_nested(&args, &cwd, harvest_only, host)?;
+            if accept(&output) {
+                return Ok(output);
+            }
+            if first_failure.is_none() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let args: Vec<String> = args
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                let mut message = format!(
+                    "failed to build the crates the subcrates depend on \
+                     (`{} {}` in `{}`):\n{}",
+                    self.cargo.display(),
+                    args.join(" "),
+                    cwd.display(),
+                    indent(stderr.trim_end())
+                );
+                if let Some(hint) = nested_failure_hint(&stderr) {
+                    message.push('\n');
+                    message.push_str(hint);
+                }
+                first_failure = Some(Error::new(message));
+            }
+        }
+        Err(first_failure.unwrap_or_else(|| Error::new("the nested build was not run")))
+    }
+
+    /// Launches `self.cargo` with `args` once, in `cwd`, with the environment prepared
+    /// for a nested build (`host`: for the host's).
+    fn launch_nested(
+        &self,
+        args: &[OsString],
+        cwd: &Path,
+        harvest_only: bool,
+        host: bool,
+    ) -> Result<std::process::Output, Error> {
+        let mut cmd = Command::new(&self.cargo);
+        let scope = scope_key(&self.manifest_dir);
+        cmd.args(args)
+            .current_dir(cwd)
+            .env(NESTED_ENV, &scope)
+            .stdin(Stdio::null());
+        // Both are for this package alone (see `scope_key`), not an enclosing nested build's.
+        if harvest_only {
+            cmd.env(HARVEST_ONLY_ENV, &scope);
+        } else {
+            cmd.env_remove(HARVEST_ONLY_ENV);
+        }
+        // Cargo sets these for *this* build script only. Left in place they would
+        // leak into the build scripts of the packages built below, which then
+        // see this package's features and cfgs as their own.
+        // And a lint wrapper (`cargo clippy` sets one) is for the check that is
+        // under way, not for this build.
+        cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("CARGO_FEATURE_") || name.starts_with("CARGO_CFG_") {
+                cmd.env_remove(&key);
+            }
+        }
+        if host {
+            // These are the target's flags, which Cargo does not apply to what runs on the host once
+            // given a `--target`; this build is the host's.
+            cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
+            cmd.env_remove("RUSTFLAGS");
+        }
+        cmd.output().map_err(|e| {
+            Error::new(format!(
+                "failed to launch `{}`: {}",
+                self.cargo.display(),
+                e
+            ))
+        })
     }
 
     /// Links the owner dependencies of a *nested* run against the copies the
@@ -977,6 +1354,16 @@ impl Config {
         )
     }
 
+    /// The target directory of the host build of the crates the proc-macro subcrates use: the
+    /// target's, with `-host` after the compiler, so the two builds never share a lock.
+    fn host_deps_target_dir(&self) -> PathBuf {
+        let compiler = match rustc_key(&self.rustc) {
+            Some(key) => format!("{}-host", key),
+            None => "host".to_string(),
+        };
+        shared_target_dir(&self.out_dir, &self.owner_deps_dir_key(), Some(&compiler))
+    }
+
     /// The directory component naming the nested build: the opt-in
     /// [`owner_deps_key`](Self::owner_deps_key) when set (sanitized to one path
     /// component so it cannot escape), else the package name (the per-package
@@ -995,11 +1382,7 @@ impl Config {
     /// beneath it too, under `subcrate-owner-deps`. `None` when the layout is not the
     /// usual one, in which case the disk-reclaiming step is simply skipped.
     fn main_profile_dir(&self) -> Option<PathBuf> {
-        self.out_dir
-            .ancestors()
-            .find(|dir| dir.file_name().map_or(false, |name| name == "build"))
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
+        profile_dir(&self.out_dir).map(Path::to_path_buf)
     }
 
     /// The arguments of the nested `cargo build` of `packages` into `target_dir`.
@@ -1011,12 +1394,14 @@ impl Config {
     /// * `--release` matches the outer profile when it is `release`; any other
     ///   profile, custom ones included, is built as `dev` (a build script is only
     ///   told `debug` or `release`).
-    /// * `--target` is passed only when cross-compiling: otherwise the build would
-    ///   be for an explicit target, which Cargo gives a different identity.
+    /// * `--target` is passed only when the package is built for a target (see
+    ///   [`explicit_target`]), the host's own triple included: without it Cargo would apply
+    ///   `RUSTFLAGS` to build scripts and proc-macros too. It is the target's triple, or the
+    ///   host's when `host` asks for the build of a proc-macro subcrate's crates.
     ///
     /// Cargo's own diagnostics are rendered to stderr (shown if the build fails),
     /// leaving only the artifact messages on stdout as JSON.
-    fn cargo_args(&self, packages: &[String], target_dir: &Path) -> Vec<OsString> {
+    fn cargo_args(&self, packages: &[String], target_dir: &Path, host: bool) -> Vec<OsString> {
         let mut args: Vec<OsString> = vec!["build".into()];
         for package in packages {
             args.push("-p".into());
@@ -1030,11 +1415,154 @@ impl Config {
         if self.profile == "release" {
             args.push("--release".into());
         }
-        if let Some(target) = &self.target {
+        let triple = if host { &self.host } else { &self.target };
+        if let Some(triple) = triple {
             args.push("--target".into());
-            args.push(target.into());
+            args.push(triple.into());
         }
         args
+    }
+
+    fn nested_workspace(&self) -> NestedWorkspace {
+        if let Some(workspace) = &*self.nested_workspace.borrow() {
+            return workspace.clone();
+        }
+        let workspace = self
+            .shadow_workspace()
+            .map_or(NestedWorkspace::InPlace, NestedWorkspace::Shadow);
+        *self.nested_workspace.borrow_mut() = Some(workspace.clone());
+        workspace
+    }
+
+    /// Sets up the private workspace of a packaged crate (see [`NestedWorkspace`]), or `None`
+    /// when the package is not one or it cannot be set up.
+    fn shadow_workspace(&self) -> Option<Shadow> {
+        if !is_packaged_dir(&self.manifest_dir) {
+            return None;
+        }
+        let manifest = std::fs::read_to_string(self.manifest_dir.join("Cargo.toml")).ok()?;
+        let root = shared_target_dir(&self.out_dir, &self.owner_deps_dir_key(), None)
+            .join(format!("ws-{:016x}", path_hash(&self.out_dir)));
+        std::fs::create_dir_all(root.join("src")).ok()?;
+        // A package needs a target. (It is never built: only what it depends on is.)
+        let lib = root.join("src").join("lib.rs");
+        if !lib.is_file() {
+            std::fs::write(&lib, "").ok()?;
+        }
+
+        let outer = self.outer_workspace();
+        let seeds = self.lock_candidates();
+        let outer_manifest = outer
+            .as_ref()
+            .and_then(|outer| std::fs::read_to_string(outer.dir.join("Cargo.toml")).ok());
+        // The nested build must use the same `[patch]` and `[replace]` as the outer one.
+        let overrides = match (&outer, &outer_manifest) {
+            (Some(outer), Some(text)) => override_tables(text, &outer.dir),
+            _ => String::new(),
+        };
+        // `cargo package -p a -p b` verifies each package against an overlay of the others that
+        // only Cargo's process knows; their extracted sources are beside this package's: patch them in.
+        let patches = match seeds.iter().flatten().next() {
+            Some((_, lock)) => self.overlay_patches(lock),
+            None => Vec::new(),
+        };
+        let features = enabled_features(&manifest, &|var| std::env::var_os(var).is_some());
+        // The resolver of the workspace being built if known, else the package's as a root.
+        let resolver = match (&outer, &outer_manifest) {
+            (Some(outer), Some(text)) => resolver_of(text, &detect_edition(&outer.dir)),
+            _ => resolver_of(&manifest, &detect_edition(&self.manifest_dir)),
+        };
+        let stub = Stub {
+            name: &self.package,
+            path: &self.manifest_dir,
+            features: &features,
+        };
+        let root_manifest = root.join("Cargo.toml");
+        let text = shadow_manifest(&stub, resolver, &patches, &overrides);
+        if std::fs::read_to_string(&root_manifest).ok().as_deref() != Some(text.as_str()) {
+            std::fs::write(&root_manifest, text).ok()?;
+        }
+        Some(Shadow {
+            manifest: root_manifest,
+            lock: root.join("Cargo.lock"),
+            seeds,
+            // Cargo finds its configuration files from the directory it runs in, not from the
+            // manifest it is given, so run where the workspace being built is.
+            cwd: outer
+                .as_ref()
+                .map_or_else(|| self.manifest_dir.clone(), |outer| outer.dir.clone()),
+            watch: outer
+                .iter()
+                .map(|outer| outer.dir.join("Cargo.toml"))
+                .collect(),
+        })
+    }
+
+    /// The workspace building this package as a dependency: the nearest directory above `OUT_DIR`
+    /// whose `Cargo.lock` lists the package as a registry (or git) dependency, with that lock file.
+    /// Cargo does not say where it is; this relies on `target/` being in it.
+    fn outer_workspace(&self) -> Option<OuterWorkspace> {
+        for dir in self.out_dir.ancestors() {
+            let lock = dir.join("Cargo.lock");
+            if let Ok(text) = std::fs::read_to_string(&lock) {
+                if lock_has_dependency(&text, &self.package, &self.package_version) {
+                    return Some(OuterWorkspace {
+                        dir: dir.to_path_buf(),
+                        lock,
+                        lock_text: text,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// The lock files the nested build of a packaged crate is tried against, in turn: the
+    /// workspace being built's (see [`outer_workspace`](Self::outer_workspace)), the package's
+    /// own, and none (Cargo resolves afresh from the cache).
+    fn lock_candidates(&self) -> Vec<Option<(PathBuf, String)>> {
+        let mut candidates: Vec<Option<(PathBuf, String)>> = Vec::new();
+        if let Some(outer) = self.outer_workspace() {
+            candidates.push(Some((outer.lock, outer.lock_text)));
+        }
+        let own = self.manifest_dir.join("Cargo.lock");
+        if let Ok(text) = std::fs::read_to_string(&own) {
+            if !candidates.iter().flatten().any(|(_, other)| *other == text) {
+                candidates.push(Some((own, text)));
+            }
+        }
+        candidates.push(None);
+        candidates
+    }
+
+    /// The `[patch.crates-io]` entries that point the registry packages of `lock` at their extracted
+    /// sources in `target/package/`, when `cargo package` verifies this package against its siblings.
+    fn overlay_patches(&self, lock: &str) -> Vec<(String, PathBuf)> {
+        let dir = match self.manifest_dir.parent() {
+            Some(dir)
+                if dir.file_name().map_or(false, |name| name == "package")
+                    && dir.join("tmp-registry").is_dir() =>
+            {
+                dir
+            }
+            _ => return Vec::new(),
+        };
+        let mut patches: Vec<(String, PathBuf)> = Vec::new();
+        for package in locked_packages(lock) {
+            let from_crates_io = package.source.as_deref().map_or(false, |source| {
+                source == "registry+https://github.com/rust-lang/crates.io-index"
+                    || source.starts_with("sparse+https://index.crates.io")
+            });
+            let sibling = dir.join(format!("{}-{}", package.name, package.version));
+            if from_crates_io
+                && package.name != self.package
+                && sibling.join("Cargo.toml").is_file()
+                && !patches.iter().any(|(name, _)| *name == package.name)
+            {
+                patches.push((package.name, sibling));
+            }
+        }
+        patches
     }
 
     /// The edition `sub` is compiled with: its own override, else the package's.
@@ -1430,7 +1958,14 @@ impl Config {
         // crate also needs `subcrates_dir`, above, for the subcrates its library is
         // made of.)
         if deps.iter().any(|dep| dep.owner_linked) {
-            for dir in &self.owner_deps.lib_dirs {
+            for dir in self.dependency_dirs() {
+                args.push("-L".into());
+                args.push(format!("dependency={}", dir.display()));
+            }
+            // A dependency backed by subcrates has them where only its build script looks: forward that
+            // search path, as Cargo does to its own compilations. Not to the package's own: Cargo gives
+            // them the main build's copy, and two copies of a crate on a search path are an error.
+            for dir in self.script_dirs() {
                 args.push("-L".into());
                 args.push(format!("dependency={}", dir.display()));
             }
@@ -1472,15 +2007,376 @@ impl Config {
     }
 }
 
+/// The `::name` crates a nested build is asked for, from [`Config::resolve_externals`].
+struct ResolvedExternals {
+    /// The package specs to build (`-p …`).
+    packages: Vec<String>,
+    /// What each `::name` stands for.
+    crates: BTreeMap<String, ExternalCrate>,
+    /// Whether any is given by path, and so may be a member of the workspace.
+    links_local_dep: bool,
+}
+
+/// Whether the nested build whose output is `output` built what was asked for. A harvest-only
+/// build leaves the owner's library uncompiled on purpose, so Cargo exits non-zero; that is fine
+/// if every crate the subcrates link was built. Any other failure is a real error.
+fn built_nested(
+    output: &std::process::Output,
+    harvest_only: bool,
+    crates: &BTreeMap<String, ExternalCrate>,
+) -> bool {
+    output.status.success()
+        || (harvest_only && {
+            let built = parse_artifacts(&String::from_utf8_lossy(&output.stdout));
+            crates
+                .values()
+                .all(|external| built.crates.contains_key(&external.crate_name))
+        })
+}
+
+/// What may have made a nested build fail, as far as Cargo's `stderr` tells: nothing when it
+/// says nothing of the sort, as a hint at a cause that is probably not it would obscure.
+fn nested_failure_hint(stderr: &str) -> Option<&'static str> {
+    // Cargo (checked from 1.78 to current nightly) panics, rather than saying so, when asked
+    // to build a package that the manifest's resolution does not activate for the platform.
+    if stderr.contains("panicked") && stderr.contains("features.rs") {
+        return Some(
+            "The crate has to be a normal dependency that is switched on for the platform being \
+             built (for a proc-macro subcrate, the host's): not an optional one whose feature \
+             is off, not a build-dependency only, and not one that a \
+             `[target.'cfg(…)'.dependencies]` table excludes",
+        );
+    }
+    if stderr.contains("did not match any packages") || stderr.contains("matched no packages") {
+        return Some("Every `::name` a `#[subcrate]` uses must be a dependency of this package");
+    }
+    // Two packages of one name and version, which `-p name:version` cannot tell apart: a
+    // crate that the workspace's `[replace]` swaps for another is both.
+    if stderr.contains("is ambiguous") {
+        return Some(
+            "A crate that `[replace]` swaps for another is two packages of one name and version \
+             to Cargo, which `cargo build -p` cannot choose between: use `[patch]` instead",
+        );
+    }
+    if stderr.contains("offline")
+        || stderr.contains("no matching package named")
+        || stderr.contains("failed to download")
+        || stderr.contains("failed to select a version")
+    {
+        return Some(
+            "The nested build runs `--offline`, so every crate it needs must already be in the \
+             local cache or source, as the ones this package's own build uses are, and it takes \
+             its sources, `[patch]` and `[replace]` tables from the workspace being built",
+        );
+    }
+    None
+}
+
+/// Where, and against which lock file, the nested `cargo build` runs. See "Packaged crates"
+/// in the [module documentation](self).
+#[derive(Debug, Clone)]
+enum NestedWorkspace {
+    /// In the package's own directory, against its workspace's lock file.
+    InPlace,
+    /// In a private workspace of the build script's own: see [`Shadow`].
+    Shadow(Shadow),
+}
+
+/// A private workspace around a packaged crate, in the build's profile directory: a stub
+/// package that is the workspace root and depends on the crate by path, as a dependency and
+/// not a member, with the features the outer build gave it and a `Cargo.lock` of its own. It
+/// copies the `[patch]` and `[replace]` tables of the workspace being built. See "Packaged
+/// crates" in the [module documentation](self) and [`Config::lock_candidates`].
+#[derive(Debug, Clone)]
+struct Shadow {
+    /// The workspace's manifest, for `--manifest-path`.
+    manifest: PathBuf,
+    lock: PathBuf,
+    /// The lock files to start a nested build from, one after the other until one
+    /// builds (`None`: no lock file).
+    seeds: Vec<Option<(PathBuf, String)>>,
+    /// The directory the nested build runs in, for Cargo's configuration files: the
+    /// workspace being built if it can be found, else the package's directory.
+    cwd: PathBuf,
+    /// Files whose change changes the nested build: the manifest of the workspace being built.
+    watch: Vec<PathBuf>,
+}
+
+/// The workspace that builds a packaged crate as a dependency (see [`Config::outer_workspace`]).
+#[derive(Debug, Clone)]
+struct OuterWorkspace {
+    dir: PathBuf,
+    lock: PathBuf,
+    lock_text: String,
+}
+
+/// Whether the package at `dir` was packaged (extracted from a `.crate` file or checked out
+/// from git by Cargo, not a source tree). Every packaged crate holds `Cargo.toml.orig`.
+fn is_packaged_dir(dir: &Path) -> bool {
+    if dir.join("Cargo.toml.orig").is_file() {
+        return true;
+    }
+    let names: Vec<&std::ffi::OsStr> = dir.components().map(|part| part.as_os_str()).collect();
+    names.windows(2).any(|pair| {
+        (pair[0] == "registry" && pair[1] == "src") || (pair[0] == "git" && pair[1] == "checkouts")
+    })
+}
+
+/// A hash of a path, for a directory name that is stable for it.
+fn path_hash(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The package a [`Shadow`] workspace is around, as its stub depends on it.
+struct Stub<'a> {
+    /// The package's name.
+    name: &'a str,
+    /// Its directory.
+    path: &'a Path,
+    /// The features it is to have: all of those the outer build enabled.
+    features: &'a [String],
+}
+
+/// The resolver (`"1"`, `"2"` or `"3"`) that `manifest` has as a workspace root: its
+/// `resolver`, else the one its `edition` stands for.
+fn resolver_of(manifest: &str, edition: &str) -> &'static str {
+    let mut explicit = None;
+    let mut in_table = false;
+    for raw in manifest.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.starts_with('[') {
+            in_table = line == "[package]" || line == "[workspace]";
+        } else if in_table {
+            if let Some((key, value)) = split_key_value(line) {
+                if key.trim() == "resolver" {
+                    explicit = toml_string_value(value);
+                }
+            }
+        }
+    }
+    match explicit.as_deref() {
+        Some("1") => "1",
+        Some("2") => "2",
+        Some("3") => "3",
+        _ => match edition {
+            "2015" | "2018" => "1",
+            "2021" => "2",
+            _ => "3",
+        },
+    }
+}
+
+/// The key the stub depends on the package under.
+const STUB_DEPENDENCY: &str = "packaged";
+
+/// The `Cargo.toml` of a [`Shadow`] workspace: the stub package with the given `resolver`,
+/// then `patches` (siblings extracted for `cargo package`'s verification) as
+/// `[patch.crates-io]` and `overrides` ([`override_tables`]).
+fn shadow_manifest(
+    stub: &Stub,
+    resolver: &str,
+    patches: &[(String, PathBuf)],
+    overrides: &str,
+) -> String {
+    let features: Vec<String> = stub.features.iter().map(|name| toml_string(name)).collect();
+    let mut text = format!(
+        "# Written by subcrate's build helper: a workspace around the packaged crate, so the\n\
+         # nested build has a Cargo.lock of its own and leaves the package's alone.\n\
+         [package]\nname = \"subcrate-nested-build\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+         publish = false\n\n\
+         [dependencies.{}]\npackage = {}\npath = {}\ndefault-features = false\n\
+         features = [{}]\n\n\
+         [workspace]\nresolver = \"{}\"\n",
+        STUB_DEPENDENCY,
+        toml_string(stub.name),
+        toml_quote(stub.path),
+        features.join(", "),
+        resolver
+    );
+    // A package that the workspace being built patches is not patched twice.
+    let patches: Vec<&(String, PathBuf)> = patches
+        .iter()
+        .filter(|(name, _)| !overrides.contains(name.as_str()))
+        .collect();
+    if !patches.is_empty() {
+        // One table is one header: next to the workspace's own `[patch.crates-io]`, these are separate.
+        let separate = !overrides.is_empty();
+        if !separate {
+            text.push_str("\n[patch.crates-io]\n");
+        }
+        for (name, path) in patches {
+            if separate {
+                text.push_str(&format!(
+                    "\n[patch.crates-io.{}]\npath = {}\n",
+                    toml_string(name),
+                    toml_quote(path)
+                ));
+            } else {
+                text.push_str(&format!("{} = {{ path = {} }}\n", name, toml_quote(path)));
+            }
+        }
+    }
+    if !overrides.is_empty() {
+        text.push('\n');
+        text.push_str(overrides);
+    }
+    text
+}
+
+/// The `[patch]` and `[replace]` tables of a workspace root's manifest, with relative paths
+/// (`path = "../fork"`) made absolute against `base`, its directory. A line-by-line reading
+/// (comments and blank lines dropped), as the other manifest readers here.
+fn override_tables(manifest: &str, base: &Path) -> String {
+    let absolute = |value: &str| -> Option<String> {
+        let path = toml_string_value(value)?;
+        let path = Path::new(&path);
+        Some(toml_quote(&if path.is_relative() {
+            base.join(path)
+        } else {
+            path.to_path_buf()
+        }))
+    };
+    let mut out = String::new();
+    let mut copying = false;
+    // In `[patch.<source>.<name>]` or `[replace.<spec>]`: the entry is the table.
+    let mut entry_table = false;
+    for raw in manifest.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let keys = if line.starts_with("[[") {
+                None
+            } else {
+                split_toml_key(&line[1..line.len() - 1])
+            };
+            copying = match keys.as_deref() {
+                Some([first, ..]) => first == "patch" || first == "replace",
+                _ => false,
+            };
+            entry_table = match keys.as_deref() {
+                Some([first, rest @ ..]) => {
+                    (first == "patch" && rest.len() >= 2)
+                        || (first == "replace" && !rest.is_empty())
+                }
+                _ => false,
+            };
+            if copying {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        if !copying {
+            continue;
+        }
+        let rewritten = match split_key_value(line) {
+            Some((key, value)) => {
+                let key = key.trim();
+                let value = value.trim();
+                let dotted_path = split_toml_key(key).map_or(false, |keys| {
+                    keys.last().map_or(false, |last| last == "path")
+                        && (entry_table || keys.len() > 1)
+                });
+                if value.starts_with('{') && value.ends_with('}') {
+                    let fields: Vec<String> = split_top_level(&value[1..value.len() - 1])
+                        .into_iter()
+                        .map(|field| match split_key_value(field) {
+                            Some((name, value)) if name.trim() == "path" => {
+                                let before = &field[..field.len() - field.trim_start().len()];
+                                let after = &field[field.trim_end().len()..];
+                                match absolute(value) {
+                                    Some(path) => format!("{}path = {}{}", before, path, after),
+                                    None => field.to_string(),
+                                }
+                            }
+                            _ => field.to_string(),
+                        })
+                        .collect();
+                    format!("{} = {{{}}}", key, fields.join(","))
+                } else if dotted_path {
+                    match absolute(value) {
+                        Some(path) => format!("{} = {}", key, path),
+                        None => line.to_string(),
+                    }
+                } else {
+                    line.to_string()
+                }
+            }
+            // The rest of a value that runs over several lines.
+            None => line.to_string(),
+        };
+        out.push_str(&rewritten);
+        out.push('\n');
+    }
+    out
+}
+
+fn toml_quote(path: &Path) -> String {
+    toml_string(&path.to_string_lossy())
+}
+
+fn toml_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The profile directory (`target/debug`, `target/<triple>/release`) a path in Cargo's build
+/// directory is in: the parent of the nearest `build` directory above it.
+fn profile_dir(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .find(|dir| dir.file_name().map_or(false, |name| name == "build"))
+        .and_then(Path::parent)
+}
+
+/// Whether Cargo is building for an explicit target (`--target`, `build.target` or
+/// `CARGO_BUILD_TARGET`), the host's own triple included, rather than for the host with none
+/// named. `target` is the build script's `TARGET`, `out_dir` its `OUT_DIR`, `exe` its executable.
+///
+/// With one, Cargo applies `RUSTFLAGS` to the target's artifacts only; without, to everything.
+/// When the triples are equal, only the layout of the build directory tells the two apart: host
+/// artifacts (the build script's executable) are in `target/<profile>`, the target's (`OUT_DIR`)
+/// in `target/<triple>/<profile>`. So a build is for an explicit target when `OUT_DIR` is in a
+/// profile directory directly under a directory named like `TARGET`, and the executable is not
+/// in that profile directory but in one of its own (a target directory merely called like the
+/// triple holds both). Without the executable, the first has to do. A build-dependency's build
+/// script, built for the host, has `OUT_DIR` in `target/<profile>` and the host's `TARGET`.
+fn explicit_target(out_dir: &Path, exe: Option<&Path>, target: &str) -> bool {
+    let profile = match profile_dir(out_dir) {
+        Some(profile) => profile,
+        None => return false,
+    };
+    let under_triple = profile
+        .parent()
+        .and_then(Path::file_name)
+        .map_or(false, |name| name == target);
+    if !under_triple {
+        return false;
+    }
+    match exe.and_then(profile_dir) {
+        Some(host_profile) => canonical_path(host_profile) != canonical_path(profile),
+        None => true,
+    }
+}
+
 /// The directory the nested builds of `package` share (see
 /// [`Config::owner_deps_target_dir`]): `subcrate-owner-deps/<package>` — and
 /// `/<compiler>`, if known — in the profile directory above `out_dir`.
 fn shared_target_dir(out_dir: &Path, package: &str, compiler: Option<&str>) -> PathBuf {
-    let profile_dir = out_dir
-        .ancestors()
-        .find(|dir| dir.file_name().map_or(false, |name| name == "build"))
-        .and_then(Path::parent);
-    match profile_dir {
+    match profile_dir(out_dir) {
         Some(dir) => {
             let dir = dir.join("subcrate-owner-deps").join(package);
             match compiler {
@@ -1829,104 +2725,241 @@ fn canonical_path(path: &Path) -> PathBuf {
 
 /// Enumerates the crate-root files and the directory their top-level modules
 /// resolve against.
+///
+/// These are the targets Cargo builds: the library, the files found by place (unless
+/// the manifest turns that off, see [`AutoDiscovery`]) and every declared target.
 fn crate_roots(manifest_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let manifest = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap_or_default();
+    let auto = auto_discovery(&manifest);
     let mut roots = Vec::new();
     let src = manifest_dir.join("src");
 
-    for name in ["lib.rs", "main.rs"] {
-        let file = src.join(name);
-        if file.is_file() {
-            roots.push((file, src.clone()));
+    // `autolib` (Cargo 1.83+) is not read: `src/lib.rs` is rarely not the library, and a
+    // `[lib] path` is added below.
+    let lib = src.join("lib.rs");
+    if lib.is_file() {
+        roots.push((lib, src.clone()));
+    }
+    if auto.bins {
+        let main = src.join("main.rs");
+        if main.is_file() {
+            roots.push((main, src.clone()));
         }
+        // Binaries: `src/bin/*.rs` and `src/bin/<name>/main.rs`.
+        collect_root_dir(&src.join("bin"), &mut roots);
+    }
+    if auto.tests {
+        // Integration tests: `tests/*.rs` and `tests/<name>/main.rs`.
+        collect_root_dir(&manifest_dir.join("tests"), &mut roots);
+    }
+    if auto.benches {
+        // Benchmarks: `benches/*.rs` and `benches/<name>/main.rs`.
+        collect_root_dir(&manifest_dir.join("benches"), &mut roots);
+    }
+    if auto.examples {
+        // Examples: `examples/*.rs` and `examples/<name>/main.rs`.
+        collect_root_dir(&manifest_dir.join("examples"), &mut roots);
     }
 
-    // Binaries: `src/bin/*.rs` and `src/bin/<name>/main.rs`.
-    collect_root_dir(&src.join("bin"), &mut roots);
-    // Integration tests: `tests/*.rs` and `tests/<name>/main.rs`.
-    collect_root_dir(&manifest_dir.join("tests"), &mut roots);
-    // Benchmarks: `benches/*.rs` and `benches/<name>/main.rs`.
-    collect_root_dir(&manifest_dir.join("benches"), &mut roots);
-    // Examples: `examples/*.rs` and `examples/<name>/main.rs`.
-    collect_root_dir(&manifest_dir.join("examples"), &mut roots);
-
-    // Targets whose source is not at a default location: a `[lib] path = "…"`, or
-    // a `[[bin]]`/`[[test]]`/`[[bench]]`/`[[example]]` with a `path`. Cargo lets any
-    // target live anywhere, so the library is not always `src/lib.rs`. The path is
-    // relative to the manifest directory and may point outside it (`../shared`),
-    // which a workspace can share between members. Added on top of the defaults
-    // above; `Walker` dedups by canonical path, so an overlap compiles once.
-    if let Ok(manifest) = std::fs::read_to_string(manifest_dir.join("Cargo.toml")) {
-        for rel in target_source_paths(&manifest) {
-            let file = manifest_dir.join(&rel);
-            if file.is_file() {
-                let dir = file
-                    .parent()
-                    .map_or_else(|| manifest_dir.to_path_buf(), Path::to_path_buf);
-                roots.push((file, dir));
-            }
+    // Declared targets: `[lib] path`, `[[bin]]`, `[[test]]`, `[[bench]]`, `[[example]]`. A target may live
+    // anywhere (a `path` may leave the manifest directory); with no `path`, Cargo looks for it by name.
+    // `Walker` dedups by canonical path, so an overlap with the defaults above compiles once.
+    let package = package_name(&manifest);
+    for target in declared_targets(&manifest) {
+        let candidates = match &target.path {
+            Some(path) => vec![manifest_dir.join(path)],
+            None => default_target_files(
+                manifest_dir,
+                &target.kind,
+                target.name.as_deref(),
+                package.as_deref(),
+            ),
+        };
+        for file in candidates.into_iter().filter(|file| file.is_file()) {
+            let dir = file
+                .parent()
+                .map_or_else(|| manifest_dir.to_path_buf(), Path::to_path_buf);
+            roots.push((file, dir));
         }
     }
 
     roots
 }
 
-/// The `path` of every explicitly-declared target in a `Cargo.toml`: the `[lib]`
-/// table and the `[[bin]]`, `[[test]]`, `[[bench]]` and `[[example]]` arrays of
-/// tables. These let a target's source live anywhere, so the library need not be
-/// `src/lib.rs`. Auto-discovery flags (`autolib`, `autobins`, …) are ignored: a
-/// stray extra root only gets scanned for `#[subcrate]` and, finding none, costs
-/// nothing, so there is no need to replicate Cargo's exclusion rules.
-fn target_source_paths(manifest: &str) -> Vec<String> {
-    target_paths(manifest)
-        .into_iter()
-        .map(|(_, path)| path)
-        .collect()
+/// Which kinds of targets Cargo finds by place: `src/main.rs` and `src/bin/` (`autobins`), `tests/`
+/// (`autotests`), `benches/` (`autobenches`), `examples/` (`autoexamples`); each can be turned off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutoDiscovery {
+    bins: bool,
+    tests: bool,
+    benches: bool,
+    examples: bool,
 }
 
-/// The `path` of the `[lib]` table of a `Cargo.toml`, if it has one.
-fn lib_source_path(manifest: &str) -> Option<String> {
-    target_paths(manifest)
-        .into_iter()
-        .find(|(table, _)| table == "lib")
-        .map(|(_, path)| path)
+impl Default for AutoDiscovery {
+    fn default() -> Self {
+        AutoDiscovery {
+            bins: true,
+            tests: true,
+            benches: true,
+            examples: true,
+        }
+    }
 }
 
-/// The `path` of every explicitly-declared target, with the name of its table.
-fn target_paths(manifest: &str) -> Vec<(String, String)> {
-    let mut paths = Vec::new();
-    let mut table = None;
+impl AutoDiscovery {
+    /// The directories holding crate roots, to be watched: `src`, and the others unless discovery is off.
+    fn root_dirs(self) -> Vec<&'static str> {
+        let mut dirs = vec!["src"];
+        for (dir, on) in [
+            ("tests", self.tests),
+            ("benches", self.benches),
+            ("examples", self.examples),
+        ] {
+            if on {
+                dirs.push(dir);
+            }
+        }
+        dirs
+    }
+}
+
+/// What a manifest's `[package]` says about [`AutoDiscovery`]: on unless a flag is `false`.
+fn auto_discovery(manifest: &str) -> AutoDiscovery {
+    let mut auto = AutoDiscovery::default();
+    for (key, value) in package_entries(manifest) {
+        let slot = match key.as_str() {
+            "autobins" => &mut auto.bins,
+            "autotests" => &mut auto.tests,
+            "autobenches" => &mut auto.benches,
+            "autoexamples" => &mut auto.examples,
+            _ => continue,
+        };
+        match value.trim() {
+            "false" => *slot = false,
+            "true" => *slot = true,
+            _ => {}
+        }
+    }
+    auto
+}
+
+/// The `[package]` table as `(key, value)` pairs, the value as written (without a comment).
+fn package_entries(manifest: &str) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    let mut in_package = false;
+    for raw in manifest.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_package = line[1..line.len() - 1].trim() == "package";
+        } else if in_package {
+            if let Some((key, value)) = split_key_value(line) {
+                entries.push((key.trim().to_string(), value.trim().to_string()));
+            }
+        }
+    }
+    entries
+}
+
+fn package_name(manifest: &str) -> Option<String> {
+    package_entries(manifest)
+        .into_iter()
+        .find(|(key, _)| key == "name")
+        .and_then(|(_, value)| toml_string_value(&value))
+}
+
+/// A target a `Cargo.toml` declares (`[lib]`, or an entry of `[[bin]]`, `[[test]]`, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclaredTarget {
+    /// `lib`, `bin`, `test`, `bench` or `example`.
+    kind: String,
+    name: Option<String>,
+    /// Where the source is, relative to the manifest directory, if the manifest says.
+    path: Option<String>,
+}
+
+/// Every target a `Cargo.toml` declares, with the `name` and `path` it gives. A target's
+/// source can live anywhere, so the library need not be `src/lib.rs`.
+fn declared_targets(manifest: &str) -> Vec<DeclaredTarget> {
+    let mut targets = Vec::new();
+    let mut current: Option<DeclaredTarget> = None;
     for raw in manifest.lines() {
         let line = strip_toml_comment(raw).trim();
         if line.is_empty() {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
+            targets.extend(current.take());
             // `[lib]`, or an array-of-tables header like `[[bin]]` (inner `[bin]`).
             let inner = line[1..line.len() - 1]
                 .trim()
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .trim();
-            table = match inner {
-                "lib" | "bin" | "test" | "bench" | "example" => Some(inner.to_string()),
+            current = match inner {
+                "lib" | "bin" | "test" | "bench" | "example" => Some(DeclaredTarget {
+                    kind: inner.to_string(),
+                    name: None,
+                    path: None,
+                }),
                 _ => None,
             };
             continue;
         }
-        let table = match &table {
-            Some(table) => table,
+        let target = match &mut current {
+            Some(target) => target,
             None => continue,
         };
-        // `path = "…"` (require `path` as its own key, not a prefix like `pathsep`).
-        if let Some(rest) = line.strip_prefix("path") {
-            if let Some(value) = rest.trim_start().strip_prefix('=') {
-                if let Some(s) = toml_string_value(value.trim()) {
-                    paths.push((table.clone(), s));
-                }
+        // `name` and `path` as whole keys (not a prefix like `pathsep`).
+        if let Some((key, value)) = split_key_value(line) {
+            let slot = match key.trim() {
+                "name" => &mut target.name,
+                "path" => &mut target.path,
+                _ => continue,
+            };
+            if let Some(value) = toml_string_value(value.trim()) {
+                *slot = Some(value);
             }
         }
     }
-    paths
+    targets.extend(current);
+    targets
+}
+
+fn lib_source_path(manifest: &str) -> Option<String> {
+    declared_targets(manifest)
+        .into_iter()
+        .find(|target| target.kind == "lib")
+        .and_then(|target| target.path)
+}
+
+/// Where Cargo looks for a declared target that gives no `path`, by its `name`:
+/// `<dir>/<name>.rs` or `<dir>/<name>/main.rs` (`tests`, `benches`, `examples`, and `src/bin`
+/// for a binary, which is `src/main.rs` if named like the package). The library's is `src/lib.rs`.
+fn default_target_files(
+    manifest_dir: &Path,
+    kind: &str,
+    name: Option<&str>,
+    package: Option<&str>,
+) -> Vec<PathBuf> {
+    let dir = match kind {
+        "bin" => manifest_dir.join("src").join("bin"),
+        "test" => manifest_dir.join("tests"),
+        "bench" => manifest_dir.join("benches"),
+        "example" => manifest_dir.join("examples"),
+        _ => return Vec::new(),
+    };
+    let name = match name {
+        Some(name) => name,
+        None => return Vec::new(),
+    };
+    let mut files = Vec::new();
+    if kind == "bin" && Some(name) == package {
+        files.push(manifest_dir.join("src").join("main.rs"));
+    }
+    files.push(dir.join(format!("{}.rs", name)));
+    files.push(dir.join(name).join("main.rs"));
+    files
 }
 
 /// Collects root files from a directory that may contain both `*.rs` files and
@@ -3570,6 +4603,8 @@ struct DeclaredDep {
     version: Option<String>,
     /// Where it is on disk: `path = "…"`.
     path: Option<String>,
+    /// Whether it is optional: `optional = true`.
+    optional: bool,
     /// Which table of the file (counting headers) it is in, to keep apart the same
     /// key in two `[target.…]` tables.
     section: usize,
@@ -3650,6 +4685,7 @@ fn declared_dependencies(manifest: &str) -> Vec<DeclaredDep> {
                 workspace: false,
                 version: None,
                 path: None,
+                optional: false,
                 section,
             });
             deps.len() - 1
@@ -3662,6 +4698,7 @@ fn declared_dependencies(manifest: &str) -> Vec<DeclaredDep> {
             "workspace" => dep.workspace = value.trim() == "true",
             "version" => dep.version = toml_string_value(value),
             "path" => dep.path = toml_string_value(value),
+            "optional" => dep.optional = value.trim() == "true",
             _ => {}
         }
     }
@@ -3694,7 +4731,7 @@ fn declared_dependencies(manifest: &str) -> Vec<DeclaredDep> {
                 match &keys[1..] {
                     [] if value.trim().starts_with('{') => {
                         // `name = { package = "real", … }`
-                        for field in ["package", "workspace", "version", "path"] {
+                        for field in ["package", "workspace", "version", "path", "optional"] {
                             if let Some(value) = inline_table_field(value, field) {
                                 set_field(dep, field, value);
                             }
@@ -3918,6 +4955,9 @@ struct OwnerDeps {
     /// Every directory holding an artifact: search paths for the dependencies'
     /// own dependencies.
     lib_dirs: BTreeSet<PathBuf>,
+    /// The library search paths the crates' build scripts asked for (`cargo:rustc-link-search`)
+    /// inside the nested build's target directory. Cargo gives them to its own compilations only.
+    script_paths: BTreeSet<PathBuf>,
     /// The manifests and sources of the path dependencies built, which change
     /// when someone edits them.
     sources: BTreeSet<PathBuf>,
@@ -4037,6 +5077,10 @@ fn scan_build_artifacts(base: &Path) -> (BTreeMap<String, PathBuf>, BTreeSet<Pat
 fn parse_artifacts(stdout: &str) -> OwnerDeps {
     let mut deps = OwnerDeps::default();
     for line in stdout.lines() {
+        if line.contains("\"reason\":\"build-script-executed\"") {
+            deps.script_paths.extend(build_script_link_paths(line));
+            continue;
+        }
         if !line.contains("\"reason\":\"compiler-artifact\"") {
             continue;
         }
@@ -4117,6 +5161,32 @@ fn parse_artifacts(stdout: &str) -> OwnerDeps {
         krate.prefer_hashed_rlib();
     }
     deps
+}
+
+/// The library search paths one `build-script-executed` message reports (`linked_paths`), without
+/// their kind. A `framework` path is no place for crates and is left out.
+fn build_script_link_paths(message: &str) -> Vec<PathBuf> {
+    json_string_array_field(message, "linked_paths")
+        .into_iter()
+        .filter_map(|entry| {
+            // `kind=path`, or just `path` (which may contain `=`, so only Cargo's kinds are cut off).
+            let kinds = ["native", "dependency", "crate", "all"];
+            let path = match kinds
+                .iter()
+                .find_map(|kind| entry.strip_prefix(&format!("{}=", kind)))
+            {
+                Some(path) => path,
+                None if entry.starts_with("framework=") => return None,
+                None => entry.as_str(),
+            };
+            Some(PathBuf::from(path))
+        })
+        .collect()
+}
+
+/// Whether `path` is in `dir`, however either is spelled (symlinks resolved).
+fn is_inside(path: &Path, dir: &Path) -> bool {
+    path.starts_with(dir) || canonical_path(path).starts_with(canonical_path(dir))
 }
 
 impl OwnerCrate {
@@ -4330,6 +5400,55 @@ fn locked_dependencies(lock: &str, package: &str) -> Option<Vec<LockedDep>> {
     )
 }
 
+/// A package in a lock file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockedPackage {
+    name: String,
+    version: String,
+    /// Where it comes from (`registry+…`, `git+…`); a path package has none.
+    source: Option<String>,
+}
+
+fn locked_packages(lock: &str) -> Vec<LockedPackage> {
+    let mut packages: Vec<LockedPackage> = Vec::new();
+    let mut current: Option<LockedPackage> = None;
+    let value = |line: &str, key: &str| -> Option<String> {
+        line.strip_prefix(key)
+            .and_then(|rest| rest.trim_start().strip_prefix('='))
+            .and_then(toml_string_value)
+    };
+    for line in lock.lines().map(str::trim) {
+        if line.starts_with('[') {
+            packages.extend(current.take());
+            if line == "[[package]]" {
+                current = Some(LockedPackage {
+                    name: String::new(),
+                    version: String::new(),
+                    source: None,
+                });
+            }
+        } else if let Some(package) = current.as_mut() {
+            if let Some(name) = value(line, "name") {
+                package.name = name;
+            } else if let Some(version) = value(line, "version") {
+                package.version = version;
+            } else if let Some(source) = value(line, "source") {
+                package.source = Some(source);
+            }
+        }
+    }
+    packages.extend(current);
+    packages
+}
+
+/// Whether `lock` has `name` at `version` as a dependency from a registry or git, not a
+/// package on disk (how a workspace that builds a registry crate lists it).
+fn lock_has_dependency(lock: &str, name: &str, version: &str) -> bool {
+    locked_packages(lock).iter().any(|package| {
+        package.name == name && package.version == version && package.source.is_some()
+    })
+}
+
 /// A `::name` dependency resolved to the package that provides it.
 #[derive(Debug, PartialEq, Eq)]
 struct OwnerPackage {
@@ -4501,6 +5620,26 @@ fn enabled_feature_cfgs(manifest_dir: &Path) -> Vec<String> {
         }
     }
     cfgs
+}
+
+/// The features of the package that Cargo enabled for this build, as a dependency on it would name
+/// them: the keys of `[features]` and the optional dependencies that are features of their own (no
+/// `dep:` takes them over), each when its variable is set. Lossy for `a-b` and `a_b`, which fold.
+fn enabled_features(manifest: &str, is_set: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let mut names = feature_names(manifest);
+    let uses_dep = |key: &str| {
+        ["\"", "'"]
+            .iter()
+            .any(|quote| manifest.contains(&format!("dep:{}{}", key, quote)))
+    };
+    for dep in declared_dependencies(manifest) {
+        let in_scope = matches!(dep.table, DependencyTable::Normal | DependencyTable::Build);
+        if in_scope && dep.optional && !uses_dep(&dep.key) && !names.contains(&dep.key) {
+            names.push(dep.key);
+        }
+    }
+    names.retain(|name| is_set(&feature_env_var(name)));
+    names
 }
 
 /// The `CARGO_FEATURE_<NAME>` variable Cargo sets for feature `name`
@@ -4849,6 +5988,7 @@ mod tests {
             rustc: PathBuf::from("rustc"),
             edition: "2021".to_string(),
             target: None,
+            host: None,
             panic: None,
             opt_level: "0".to_string(),
             debug_assertions: true,
@@ -4857,11 +5997,14 @@ mod tests {
             extra_rustc_args: Vec::new(),
             cargo: PathBuf::from("cargo"),
             package: "owner".to_string(),
+            package_version: "0.1.0".to_string(),
+            nested_workspace: std::cell::RefCell::new(None),
             profile: "debug".to_string(),
             nested: false,
             harvest_only: false,
             owner_deps_key: None,
             owner_deps: OwnerDeps::default(),
+            host_deps: OwnerDeps::default(),
         }
     }
 
@@ -5239,20 +6382,258 @@ mod tests {
         assert!(message.contains("no library artifact"), "{}", message);
     }
 
-    #[test]
-    fn a_proc_macro_subcrate_cannot_use_an_owner_dependency_when_cross_compiling() {
+    fn cross_config() -> Config {
         let mut config = config();
         config.target = Some("aarch64-unknown-linux-gnu".to_string());
+        config.host = Some("x86_64-unknown-linux-gnu".to_string());
+        config
+    }
+
+    #[test]
+    fn a_proc_macro_subcrate_links_the_hosts_copy_of_an_owner_dependency_when_cross_compiling() {
+        let mut config = cross_config();
         config.owner_deps = external_artifacts();
-        let mut sub = top("a", vec![ext("leaf")]);
-        sub.proc_macro = true;
+        let mut host = external_artifacts();
+        for krate in host.crates.values_mut() {
+            krate.rlib = krate
+                .rlib
+                .take()
+                .map(|rlib| PathBuf::from("host").join(rlib));
+            krate.rmeta = krate
+                .rmeta
+                .take()
+                .map(|rmeta| PathBuf::from("host").join(rmeta));
+        }
+        host.lib_dirs = [PathBuf::from("host/deps")].into_iter().collect();
+        config.host_deps = host;
         let links = [Link {
             alias: "leaf".to_string(),
             target: LinkTarget::External("leaf".to_string()),
         }];
-        let result = config.extern_deps(&[sub], 0, &links, Path::new("out"), &[true]);
-        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        let mut proc_macro = top("a", vec![ext("leaf")]);
+        proc_macro.proc_macro = true;
+        let library = top("a", vec![ext("leaf")]);
+        let paths = |sub: Subcrate| -> Vec<PathBuf> {
+            let deps = config
+                .extern_deps(&[sub], 0, &links, Path::new("out"), &[true])
+                .unwrap();
+            deps.into_iter().flat_map(|dep| dep.paths).collect()
+        };
+        let host_paths = paths(proc_macro);
+        assert!(!host_paths.is_empty());
+        assert!(
+            host_paths.iter().all(|path| path.starts_with("host")),
+            "{:?}",
+            host_paths
+        );
+        let target_paths = paths(library);
+        assert!(!target_paths.is_empty());
+        assert!(
+            target_paths.iter().all(|path| !path.starts_with("host")),
+            "{:?}",
+            target_paths
+        );
+        let dirs: Vec<&PathBuf> = config.dependency_dirs().collect();
+        assert!(dirs.contains(&&PathBuf::from("host/deps")), "{:?}", dirs);
+    }
+
+    #[test]
+    fn a_proc_macro_subcrate_cannot_use_the_owner_crate_when_cross_compiling() {
+        let config = cross_config();
+        let mut sub = sub("tests/t.rs", &["user"], vec![ext("owner")]);
+        sub.proc_macro = true;
+        let subs = [sub];
+        let links = resolve_links(&subs, &owner()).unwrap();
+        let mut config = config;
+        config.cargo = PathBuf::from("/nonexistent/cargo");
+        let message = config
+            .build_host_deps(&subs, &links, &[true])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
         assert!(message.contains("cross-compiling"), "{}", message);
+        assert!(message.contains("owner crate `::owner`"), "{}", message);
+        let message = config
+            .extern_deps(&subs, 0, &links[0], Path::new("out"), &[true])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("cross-compiling"), "{}", message);
+    }
+
+    #[test]
+    fn a_library_subcrate_of_a_cross_compiled_package_does_not_need_the_host_build() {
+        let mut config = cross_config();
+        config.cargo = PathBuf::from("/nonexistent/cargo");
+        let subs = [top("a", vec![ext("leaf")])];
+        let links = resolve_links(&subs, &owner()).unwrap();
+        let deps = config.build_host_deps(&subs, &links, &[true]).unwrap();
+        assert!(deps.crates.is_empty() && deps.lib_dirs.is_empty());
+        let mut native = config;
+        native.target = None;
+        native.host = None;
+        let mut proc_macro = top("a", vec![ext("leaf")]);
+        proc_macro.proc_macro = true;
+        let subs = [proc_macro];
+        let links = resolve_links(&subs, &owner()).unwrap();
+        let deps = native.build_host_deps(&subs, &links, &[true]).unwrap();
+        assert!(deps.crates.is_empty());
+    }
+
+    /// The configuration of a package built with `--target` for the host's own triple.
+    fn same_triple_config() -> Config {
+        let mut config = config();
+        config.target = Some("x86_64-unknown-linux-gnu".to_string());
+        config.host = Some("x86_64-unknown-linux-gnu".to_string());
+        config.rustflags = vec!["-C".to_string(), "target-cpu=native".to_string()];
+        config
+    }
+
+    #[test]
+    fn a_target_that_is_the_hosts_own_triple_builds_the_crates_of_a_proc_macro_for_the_host() {
+        // Cargo applies `RUSTFLAGS` to the target's artifacts only once given `--target`, so the
+        // nested builds get it too, and the proc-macro subcrate's one (the host's) lacks the flags.
+        let config = same_triple_config();
+        assert!(!config.is_cross());
+        let mut proc_macro = top("a", vec![ext("leaf")]);
+        proc_macro.proc_macro = true;
+        let library = top("b", vec![ext("leaf")]);
+        assert!(config.is_host_built(&proc_macro));
+        assert!(!config.is_host_built(&library));
+        let args = |host: bool| -> Vec<String> {
+            config
+                .cargo_args(&["leaf".to_string()], Path::new("t"), host)
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        for host in [false, true] {
+            let args = args(host);
+            let at = args.iter().position(|arg| arg == "--target").unwrap();
+            assert_eq!(args[at + 1], "x86_64-unknown-linux-gnu");
+        }
+        let rustc = config.rustc_args(&proc_macro, &[], Path::new("out"));
+        assert!(!rustc.contains(&"--target".to_string()), "{:?}", rustc);
+        assert!(
+            !rustc.contains(&"target-cpu=native".to_string()),
+            "{:?}",
+            rustc
+        );
+        let rustc = config.rustc_args(&library, &[], Path::new("out"));
+        assert!(rustc.contains(&"--target".to_string()), "{:?}", rustc);
+        assert!(
+            rustc.contains(&"target-cpu=native".to_string()),
+            "{:?}",
+            rustc
+        );
+        let mut implicit = config;
+        implicit.target = None;
+        implicit.host = None;
+        assert!(!implicit.is_host_built(&proc_macro));
+        let args: Vec<String> = implicit
+            .cargo_args(&["leaf".to_string()], Path::new("t"), false)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.contains(&"--target".to_string()), "{:?}", args);
+    }
+
+    #[test]
+    fn a_proc_macro_subcrate_may_use_the_owner_crate_and_library_subcrates_on_the_hosts_own_triple()
+    {
+        let mut config = same_triple_config();
+        config.owner_deps = external_artifacts();
+        config.owner_deps.crates.insert(
+            "owner".to_string(),
+            config.owner_deps.crates["leaf"].clone(),
+        );
+        let mut proc_macro = sub("tests/t.rs", &["user"], vec![ext("owner")]);
+        proc_macro.proc_macro = true;
+        let subs = [proc_macro];
+        let links = resolve_links(&subs, &owner()).unwrap();
+        config.check_owner_use(&subs[0]).unwrap();
+        config.cargo = PathBuf::from("/nonexistent/cargo");
+        let host = config.build_host_deps(&subs, &links, &[true]).unwrap();
+        assert!(host.crates.is_empty());
+        let deps = config
+            .extern_deps(&subs, 0, &links[0], Path::new("out"), &[true])
+            .unwrap();
+        assert_eq!(deps.len(), 1);
+        assert!(deps[0]
+            .paths
+            .iter()
+            .all(|path| path.to_string_lossy().contains("leaf")));
+
+        let library = top("lib", vec![]);
+        let mut user = top("pm", vec![dep("lib", &["lib"])]);
+        user.proc_macro = true;
+        let subs = [library, user];
+        let links = resolve_links(&subs, &owner()).unwrap();
+        config
+            .extern_deps(&subs, 1, &links[1], Path::new("out"), &[false, false])
+            .unwrap();
+        let mut cross = cross_config();
+        cross.owner_deps = config.owner_deps.clone();
+        assert!(cross
+            .extern_deps(&subs, 1, &links[1], Path::new("out"), &[false, false])
+            .is_err());
+    }
+
+    #[test]
+    fn a_build_is_for_an_explicit_target_by_where_cargo_puts_what_it_runs() {
+        let host = "x86_64-unknown-linux-gnu";
+        let explicit = |out: &str, exe: Option<&str>, target: &str| {
+            explicit_target(Path::new(out), exe.map(Path::new), target)
+        };
+        assert!(!explicit(
+            "/w/target/debug/build/p-1/out",
+            Some("/w/target/debug/build/p-1/build-script-build"),
+            host
+        ));
+        // `OUT_DIR` in `target/<triple>/<profile>`, the build script in `target/<profile>`.
+        assert!(explicit(
+            "/w/target/x86_64-unknown-linux-gnu/debug/build/p-2/out",
+            Some("/w/target/debug/build/p-1/build-script-build"),
+            host
+        ));
+        assert!(explicit(
+            "/w/target/x86_64-unknown-linux-gnu/release/build/p/2/out",
+            Some("/w/target/release/build/p/1/out/build_script_build"),
+            host
+        ));
+        assert!(explicit(
+            "/w/target/x86_64-unknown-linux-gnu/debug/build/p-2/out",
+            None,
+            host
+        ));
+        assert!(!explicit("/w/target/debug/build/p-2/out", None, host));
+        // A target directory that is merely called like the triple holds both.
+        assert!(!explicit(
+            "/w/x86_64-unknown-linux-gnu/debug/build/p-1/out",
+            Some("/w/x86_64-unknown-linux-gnu/debug/build/p-1/build-script-build"),
+            host
+        ));
+        assert!(!explicit(
+            "/w/target/debug/build/p-3/out",
+            Some("/w/target/debug/build/p-3/build-script-build"),
+            host
+        ));
+        assert!(!explicit(
+            "/w/target/aarch64-unknown-linux-gnu/debug/build/p-2/out",
+            Some("/w/target/debug/build/p-1/build-script-build"),
+            host
+        ));
+        assert!(!explicit("/w/out", None, host));
+        #[cfg(unix)]
+        {
+            let dir = temp_dir("explicit-target");
+            std::fs::create_dir_all(dir.join("real/debug/build/p-1/out")).unwrap();
+            std::os::unix::fs::symlink(dir.join("real"), dir.join(host)).unwrap();
+            let exe = dir.join("real/debug/build/p-1/build-script-build");
+            let out = dir.join(host).join("debug/build/p-1/out");
+            assert!(!explicit_target(&out, Some(&exe), host));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -5314,7 +6695,8 @@ mod tests {
     /// Runs `Config::build_owner_deps` for `subs` (all wanted) with a stand-in for
     /// Cargo — `/bin/sh build …` run in the package's directory, where `build` is a
     /// script that records its arguments and answers with `messages` — and returns
-    /// what it built and the arguments it was given. The package is `owner`, with the
+    /// what it built and the arguments it was given, then `SUBCRATE_NESTED=…`, `SUBCRATE_HARVEST_ONLY=…`
+    /// (`unset` or the value) and `PWD=…` as the nested build saw them. The package is `owner`, with the
     /// given manifest and lock file and its build directory `target/debug/build`.
     #[cfg(unix)]
     fn nested_build(
@@ -5330,9 +6712,12 @@ mod tests {
         std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
         std::fs::write(dir.join("Cargo.lock"), lock).unwrap();
         std::fs::write(dir.join("messages.txt"), messages).unwrap();
+        // Records the arguments and the environment a nested `subcrate` build script cares about.
         std::fs::write(
             dir.join("build"),
-            "printf '%s\\n' \"$@\" > args.txt\ncat messages.txt\n",
+            "printf '%s\\n' \"$@\" \"SUBCRATE_NESTED=${SUBCRATE_NESTED-unset}\" \
+             \"SUBCRATE_HARVEST_ONLY=${SUBCRATE_HARVEST_ONLY-unset}\" \"PWD=$(pwd -P)\" > args.txt\n\
+             cat messages.txt\n",
         )
         .unwrap();
         let mut config = config();
@@ -5438,16 +6823,18 @@ mod tests {
 
     #[test]
     fn the_nested_cargo_build_is_into_a_separate_target_directory() {
-        let args = |config: &Config| -> Vec<String> {
+        let args_for = |config: &Config, host: bool| -> Vec<String> {
             config
                 .cargo_args(
                     &["serde".to_string(), "owner".to_string()],
                     Path::new("out/owner-deps-target"),
+                    host,
                 )
                 .iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect()
         };
+        let args = |config: &Config| args_for(config, false);
 
         let debug = args(&config());
         assert_eq!(debug[0], "build");
@@ -5470,9 +6857,949 @@ mod tests {
 
         let mut cross = config();
         cross.target = Some("aarch64-unknown-linux-gnu".to_string());
-        let cross = args(&cross);
-        let at = cross.iter().position(|a| a == "--target").unwrap();
-        assert_eq!(cross[at + 1], "aarch64-unknown-linux-gnu");
+        cross.host = Some("x86_64-unknown-linux-gnu".to_string());
+        let target_args = args(&cross);
+        let at = target_args.iter().position(|a| a == "--target").unwrap();
+        assert_eq!(target_args[at + 1], "aarch64-unknown-linux-gnu");
+        // The build for a proc-macro subcrate's crates names the host explicitly.
+        let host_args = args_for(&cross, true);
+        let at = host_args.iter().position(|a| a == "--target").unwrap();
+        assert_eq!(host_args[at + 1], "x86_64-unknown-linux-gnu");
+    }
+
+    /// Runs `build_host_deps` for `subs` (all wanted) on a cross-compiling `config`, with the
+    /// stand-in for Cargo of [`nested_build`], and returns what that returns.
+    #[cfg(unix)]
+    fn nested_host_build(
+        test: &str,
+        manifest: &str,
+        lock: &str,
+        messages: &str,
+        subs: &[Subcrate],
+    ) -> (Result<OwnerDeps, Error>, Vec<String>, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("subcrate-host-{}-{}", test, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(dir.join("Cargo.lock"), lock).unwrap();
+        std::fs::write(dir.join("messages.txt"), messages).unwrap();
+        std::fs::write(
+            dir.join("build"),
+            "printf '%s\\n' \"$@\" \"SUBCRATE_NESTED=${SUBCRATE_NESTED-unset}\" \
+             \"SUBCRATE_HARVEST_ONLY=${SUBCRATE_HARVEST_ONLY-unset}\" \"PWD=$(pwd -P)\" > args.txt\n\
+             cat messages.txt\n",
+        )
+        .unwrap();
+        let mut config = cross_config();
+        config.cargo = PathBuf::from("/bin/sh");
+        config.manifest_dir = dir.clone();
+        config.out_dir = dir.join("target/aarch64-unknown-linux-gnu/debug/build/owner-1a/out");
+        let links = resolve_links(subs, &owner()).unwrap();
+        let result = config.build_host_deps(subs, &links, &vec![true; subs.len()]);
+        let args = std::fs::read_to_string(dir.join("args.txt"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        (result, args, dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_crates_of_a_proc_macro_subcrate_are_built_for_the_host_when_cross_compiling() {
+        let manifest = "[package]\nname = \"owner\"\n\n[dependencies]\ndup = \"2\"\n";
+        let mut proc_macro = top("a", vec![ext("dup")]);
+        proc_macro.proc_macro = true;
+        let message = dup_message("2.0.0", true);
+        let (result, args, dir) =
+            nested_host_build("pm", manifest, MULTI_LOCK, &message, &[proc_macro]);
+        let deps = result.unwrap();
+        assert_eq!(packages_asked_for(&args), ["dup:2.0.0"]);
+        let at = args.iter().position(|arg| arg == "--target").unwrap();
+        assert_eq!(args[at + 1], "x86_64-unknown-linux-gnu");
+        let at = args.iter().position(|arg| arg == "--target-dir").unwrap();
+        let target_dir = PathBuf::from(&args[at + 1]);
+        assert!(
+            target_dir.starts_with(
+                dir.join("target/aarch64-unknown-linux-gnu/debug/subcrate-owner-deps/owner")
+            ),
+            "{}",
+            target_dir.display()
+        );
+        assert!(target_dir.to_string_lossy().ends_with("-host") || target_dir.ends_with("host"));
+        assert_eq!(deps.externals["dup"].crate_name, "dup");
+        assert!(deps.crates.contains_key("dup"));
+
+        let library = top("a", vec![ext("dup")]);
+        let (result, args, _) =
+            nested_host_build("lib", manifest, MULTI_LOCK, &message, &[library]);
+        assert!(result.unwrap().crates.is_empty());
+        assert!(args.is_empty(), "{:?}", args);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_dependency_selects_the_owner_in_the_host_build_too() {
+        let manifest = "[package]\nname = \"owner\"\n\n[dependencies]\n\
+                        leaf = { path = \"../leaf\" }\ndup = \"2\"\n";
+        let mut proc_macro = top("a", vec![ext("leaf"), ext("dup")]);
+        proc_macro.proc_macro = true;
+        let message = dup_message("2.0.0", true);
+        let (result, args, _) =
+            nested_host_build("path", manifest, MULTI_LOCK, &message, &[proc_macro]);
+        result.unwrap();
+        assert_eq!(packages_asked_for(&args), ["dup:2.0.0", "leaf", "owner"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_build_that_panics_in_cargos_resolver_says_what_the_dependency_needs() {
+        let dir = std::env::temp_dir().join(format!("subcrate-panic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("Cargo.lock"), MULTI_LOCK).unwrap();
+        std::fs::write(
+            dir.join("build"),
+            "echo \"thread 'main' panicked at src/cargo/core/resolver/features.rs:325:13:\" >&2\nexit 101\n",
+        )
+        .unwrap();
+        let mut config = config();
+        config.cargo = PathBuf::from("/bin/sh");
+        config.manifest_dir = dir.clone();
+        config.out_dir = dir.join("target/debug/build/owner-1a/out");
+        let subs = [top("a", vec![ext("leaf")])];
+        let links = resolve_links(&subs, &owner()).unwrap();
+        let result = config.build_owner_deps(&subs, &links, &[true]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("failed to build the crates"),
+            "{}",
+            message
+        );
+        assert!(message.contains("normal dependency"), "{}", message);
+        assert!(message.contains("optional"), "{}", message);
+    }
+
+    fn temp_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("subcrate-{}-{}", test, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_packaged_directory_is_told_by_its_original_manifest_or_by_where_cargo_puts_it() {
+        let dir = temp_dir("packaged-dir");
+        assert!(!is_packaged_dir(&dir));
+        std::fs::write(dir.join("Cargo.toml.orig"), "").unwrap();
+        assert!(is_packaged_dir(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        for packaged in [
+            "/home/u/.cargo/registry/src/index.crates.io-6f17d22bba15001f/serde-1.0.0",
+            "/home/u/.cargo/git/checkouts/repo-1a2b3c/abcdef0",
+        ] {
+            assert!(is_packaged_dir(Path::new(packaged)), "{}", packaged);
+        }
+        for source in [
+            "/home/u/src/serde",
+            "/home/u/registry/serde",
+            "/home/u/git/checkout",
+        ] {
+            assert!(!is_packaged_dir(Path::new(source)), "{}", source);
+        }
+    }
+
+    #[test]
+    fn the_lock_file_of_a_registry_dependency_is_told_from_one_that_lists_the_package_on_disk() {
+        let lock = "version = 3
+
+[[package]]
+name = \"a\"
+version = \"0.1.0\"
+
+[[package]]
+name = \"b\"
+version = \"1.2.3\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"00\"
+
+[[package]]
+name = \"b\"
+version = \"2.0.0\"
+";
+        let packages = locked_packages(lock);
+        assert_eq!(packages.len(), 3);
+        assert_eq!(packages[1].name, "b");
+        assert_eq!(packages[1].version, "1.2.3");
+        assert!(packages[1]
+            .source
+            .as_deref()
+            .unwrap()
+            .starts_with("registry+"));
+        assert_eq!(packages[2].source, None);
+        assert!(lock_has_dependency(lock, "b", "1.2.3"));
+        assert!(!lock_has_dependency(lock, "a", "0.1.0"));
+        assert!(!lock_has_dependency(lock, "b", "2.0.0"));
+        assert!(!lock_has_dependency(lock, "b", "1.2.4"));
+        assert!(!lock_has_dependency(lock, "c", "1.2.3"));
+    }
+
+    const REGISTRY_LOCK: &str = "version = 3
+
+[[package]]
+name = \"owner\"
+version = \"0.1.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"00\"
+dependencies = [
+ \"leaf\",
+]
+
+[[package]]
+name = \"leaf\"
+version = \"1.0.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"11\"
+";
+
+    /// A packaged `owner` (marker `Cargo.toml.orig`, own lock file) built as a dependency by `dir/ws`.
+    fn packaged_owner(dir: &Path, manifest: &str, own_lock: &str, ws_lock: &str) -> Config {
+        let package = dir.join("registry/owner-0.1.0");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(package.join("Cargo.toml.orig"), manifest).unwrap();
+        std::fs::write(package.join("Cargo.lock"), own_lock).unwrap();
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("Cargo.lock"), ws_lock).unwrap();
+        let mut config = config();
+        config.manifest_dir = package;
+        config.out_dir = ws.join("target/debug/build/owner-1a/out");
+        config
+    }
+
+    #[test]
+    fn a_packaged_crate_is_built_against_the_versions_of_the_workspace_that_builds_it() {
+        let dir = temp_dir("lock-order");
+        let own = REGISTRY_LOCK.replace("1.0.0", "1.0.9");
+        let config = packaged_owner(&dir, "[package]\nname = \"owner\"\n", &own, REGISTRY_LOCK);
+        let candidates = config.lock_candidates();
+        assert_eq!(candidates.len(), 3, "{:?}", candidates);
+        assert_eq!(candidates[0].as_ref().unwrap().0, dir.join("ws/Cargo.lock"));
+        assert_eq!(
+            candidates[1].as_ref().unwrap().0,
+            dir.join("registry/owner-0.1.0/Cargo.lock")
+        );
+        assert!(candidates[2].is_none());
+
+        let same = packaged_owner(
+            &dir,
+            "[package]\nname = \"owner\"\n",
+            REGISTRY_LOCK,
+            REGISTRY_LOCK,
+        );
+        assert_eq!(same.lock_candidates().len(), 2);
+
+        // A lock with the package only as a member is not the workspace that builds it as a dependency.
+        let member = REGISTRY_LOCK.replace("source = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"00\"\n", "");
+        let config = packaged_owner(&dir, "[package]\nname = \"owner\"\n", &own, &member);
+        let candidates = config.lock_candidates();
+        assert_eq!(candidates.len(), 2, "{:?}", candidates);
+        assert_eq!(
+            candidates[0].as_ref().unwrap().0,
+            dir.join("registry/owner-0.1.0/Cargo.lock")
+        );
+        let locked = config.lock_for_specs();
+        assert!(locked.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_packaged_crate_gets_a_workspace_of_its_own_and_its_lock_file_is_left_alone() {
+        let dir = temp_dir("shadow");
+        let manifest = "[package]\nname = \"owner\"\nedition = \"2018\"\n\n[features]\n\
+                        default = [\"std\"]\nstd = []\nextra = []\n\n[dependencies]\nleaf = \"1\"\n";
+        let config = packaged_owner(&dir, manifest, "# the package's own lock\n", REGISTRY_LOCK);
+        let package = config.manifest_dir.clone();
+        let own_lock = std::fs::read_to_string(package.join("Cargo.lock")).unwrap();
+        std::env::set_var("CARGO_FEATURE_DEFAULT", "1");
+        std::env::set_var("CARGO_FEATURE_STD", "1");
+        std::env::remove_var("CARGO_FEATURE_EXTRA");
+
+        let shadow = match config.nested_workspace() {
+            NestedWorkspace::Shadow(shadow) => shadow,
+            NestedWorkspace::InPlace => panic!("a packaged crate runs in a workspace of its own"),
+        };
+        std::env::remove_var("CARGO_FEATURE_DEFAULT");
+        std::env::remove_var("CARGO_FEATURE_STD");
+        assert!(shadow
+            .manifest
+            .starts_with(dir.join("ws/target/debug/subcrate-owner-deps/owner")));
+        let root = std::fs::read_to_string(&shadow.manifest).unwrap();
+        assert!(
+            root.contains("[dependencies.packaged]\npackage = \"owner\"\n"),
+            "{}",
+            root
+        );
+        assert!(
+            root.contains(&format!("path = {}\n", toml_quote(&package))),
+            "{}",
+            root
+        );
+        assert!(
+            root.contains("default-features = false\nfeatures = [\"default\", \"std\"]\n"),
+            "{}",
+            root
+        );
+        assert!(!root.contains("members"), "{}", root);
+        assert!(root.contains("[workspace]\nresolver = \"1\"\n"), "{}", root);
+        assert!(!root.contains("[patch"), "{}", root);
+        assert!(
+            root.contains("[package]\nname = \"subcrate-nested-build\""),
+            "{}",
+            root
+        );
+        let stub_lib = shadow.manifest.parent().unwrap().join("src/lib.rs");
+        assert!(stub_lib.is_file());
+        assert!(!shadow.manifest.parent().unwrap().join("pkg").exists());
+        assert_eq!(shadow.lock.parent(), shadow.manifest.parent());
+        assert_eq!(shadow.cwd, dir.join("ws"));
+
+        assert_eq!(
+            std::fs::read_to_string(package.join("Cargo.lock")).unwrap(),
+            own_lock
+        );
+
+        match config.nested_workspace() {
+            NestedWorkspace::Shadow(again) => assert_eq!(again.manifest, shadow.manifest),
+            NestedWorkspace::InPlace => panic!("the workspace changed"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_packaged_crates_nested_build_runs_in_its_private_workspace_on_each_lock_file_in_turn() {
+        let dir = temp_dir("shadow-run");
+        let config = packaged_owner(
+            &dir,
+            "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n",
+            "# the package's own lock\n",
+            REGISTRY_LOCK,
+        );
+        let package = config.manifest_dir.clone();
+        let ws = dir.join("ws");
+        let mut config = config;
+        config.cargo = PathBuf::from("/bin/sh");
+        let message = concat!(
+            r#"{"reason":"compiler-artifact","package_id":"#,
+            r#""registry+https://github.com/rust-lang/crates.io-index#leaf@1.0.0","#,
+            r#""manifest_path":"/r/leaf/Cargo.toml","target":{"kind":["lib"],"name":"leaf"},"#,
+            r#""filenames":["/t/debug/deps/libleaf-1.rlib","/t/debug/deps/libleaf-1.rmeta"]}"#
+        );
+        std::fs::write(ws.join("messages.txt"), message).unwrap();
+        std::fs::write(
+            ws.join("build"),
+            "prev=\nfor a in \"$@\"; do\n  [ \"$prev\" = --manifest-path ] && m=\"$a\"\n  prev=\"$a\"\ndone\n\
+             echo \"$m\" >> manifest.txt\n\
+             d=$(dirname \"$m\")\n\
+             if [ -f \"$d/Cargo.lock\" ]; then\n  head -n 1 \"$d/Cargo.lock\" >> locks.txt\n  echo boom >&2\n  exit 1\nfi\n\
+             echo none >> locks.txt\ncat messages.txt\n",
+        )
+        .unwrap();
+        let subs = [top("a", vec![ext("leaf")])];
+        let links = resolve_links(&subs, &owner()).unwrap();
+        let deps = config.build_owner_deps(&subs, &links, &[true]).unwrap();
+        assert!(deps.crates.contains_key("leaf"));
+
+        let locks = std::fs::read_to_string(ws.join("locks.txt")).unwrap();
+        assert_eq!(
+            locks.lines().collect::<Vec<_>>(),
+            ["version = 3", "# the package's own lock", "none"]
+        );
+        let manifests = std::fs::read_to_string(ws.join("manifest.txt")).unwrap();
+        let manifest = manifests.lines().next().unwrap();
+        assert!(manifests.lines().all(|line| line == manifest));
+        assert!(
+            manifest.ends_with("Cargo.toml") && manifest.contains("subcrate-owner-deps"),
+            "{}",
+            manifest
+        );
+        assert_eq!(
+            std::fs::read_to_string(package.join("Cargo.lock")).unwrap(),
+            "# the package's own lock\n"
+        );
+
+        // When every attempt fails, the first one's error is the one reported.
+        std::fs::write(ws.join("build"), "echo first >&2\nexit 1\n").unwrap();
+        let message = config
+            .build_owner_deps(&subs, &links, &[true])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("--manifest-path"), "{}", message);
+        assert!(message.contains("first"), "{}", message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_package_that_was_packaged_is_given_a_workspace_of_its_own() {
+        let dir = temp_dir("shadow-not");
+        let in_place = |manifest: &str, marker: bool| {
+            let config = packaged_owner(&dir, manifest, "", REGISTRY_LOCK);
+            if !marker {
+                std::fs::remove_file(config.manifest_dir.join("Cargo.toml.orig")).unwrap();
+            }
+            matches!(config.nested_workspace(), NestedWorkspace::InPlace)
+        };
+        let plain = "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n";
+        assert!(in_place(plain, false));
+        assert!(!in_place(plain, true));
+        // A git checkout of a workspace member (inherited fields, a sibling by relative path, the
+        // workspace itself) is fine too: the package is a dependency by its real path.
+        assert!(!in_place(
+            "[package]\nname = \"owner\"\n[workspace]\n",
+            true
+        ));
+        assert!(!in_place(
+            "[package]\nname = \"owner\"\nversion.workspace = true\n\
+             [dependencies]\nleaf = { workspace = true }\n",
+            true
+        ));
+        assert!(!in_place(
+            "[package]\nname = \"owner\"\n[dependencies]\nleaf = { path = \"../leaf\" }\n",
+            true
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_private_workspace_names_the_resolver_the_root_it_stands_for_would_have() {
+        let manifest = |edition: &str, extra: &str| {
+            format!(
+                "[package]\nname = \"owner\"\nedition = \"{}\"\n{}",
+                edition, extra
+            )
+        };
+        let resolver =
+            |text: String, edition: &str| format!("resolver = \"{}\"", resolver_of(&text, edition));
+        assert_eq!(resolver(manifest("2015", ""), "2015"), "resolver = \"1\"");
+        assert_eq!(resolver(manifest("2018", ""), "2018"), "resolver = \"1\"");
+        assert_eq!(resolver(manifest("2021", ""), "2021"), "resolver = \"2\"");
+        assert_eq!(resolver(manifest("2024", ""), "2024"), "resolver = \"3\"");
+        assert_eq!(
+            resolver(manifest("2018", "resolver = \"2\"\n"), "2018"),
+            "resolver = \"2\""
+        );
+        assert_eq!(
+            resolver(manifest("2018", "[lints]\nresolver = \"3\"\n"), "2018"),
+            "resolver = \"1\""
+        );
+        assert_eq!(
+            resolver(
+                "[workspace]\nmembers = []\nresolver = \"2\"\n".to_string(),
+                "2015"
+            ),
+            "resolver = \"2\""
+        );
+        assert_eq!(
+            resolver("[workspace]\nmembers = []\n".to_string(), "2015"),
+            "resolver = \"1\""
+        );
+    }
+
+    #[test]
+    fn a_package_verified_next_to_its_siblings_is_patched_to_their_extracted_sources() {
+        let dir = temp_dir("overlay");
+        let package_dir = dir.join("target/package");
+        let make = |name: &str| {
+            let sibling = package_dir.join(name);
+            std::fs::create_dir_all(&sibling).unwrap();
+            std::fs::write(sibling.join("Cargo.toml"), "").unwrap();
+            sibling
+        };
+        let owner = make("owner-0.1.0");
+        let leaf = make("leaf-1.0.0");
+        let _unrelated = make("other-3.0.0");
+        let mut config = config();
+        config.manifest_dir = owner.clone();
+        assert!(config.overlay_patches(REGISTRY_LOCK).is_empty());
+        std::fs::create_dir_all(package_dir.join("tmp-registry")).unwrap();
+        // Only registry dependencies whose extracted source is there are patched, not the package or another registry's.
+        let other = REGISTRY_LOCK.replace(
+            "registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"11",
+            "registry+https://example.com/index\"\nchecksum = \"11",
+        );
+        assert_eq!(
+            config.overlay_patches(REGISTRY_LOCK),
+            vec![("leaf".to_string(), leaf.clone())]
+        );
+        assert!(config.overlay_patches(&other).is_empty());
+        let gone = REGISTRY_LOCK.replace("1.0.0", "1.0.1");
+        assert!(config.overlay_patches(&gone).is_empty());
+
+        let stub = Stub {
+            name: "owner",
+            path: &owner,
+            features: &[],
+        };
+        let text = shadow_manifest(&stub, "2", &config.overlay_patches(REGISTRY_LOCK), "");
+        assert!(
+            text.contains("[patch.crates-io]\nleaf = { path = \""),
+            "{}",
+            text
+        );
+        let patches = "[patch.crates-io]\nother = { path = \"/x\" }\n";
+        let text = shadow_manifest(&stub, "2", &config.overlay_patches(REGISTRY_LOCK), patches);
+        assert!(
+            text.contains("[patch.crates-io.\"leaf\"]\npath = \""),
+            "{}",
+            text
+        );
+        assert_eq!(text.matches("[patch.crates-io]").count(), 1, "{}", text);
+        let patches = "[patch.crates-io]\nleaf = { path = \"/x\" }\n";
+        let text = shadow_manifest(&stub, "2", &config.overlay_patches(REGISTRY_LOCK), patches);
+        assert_eq!(text.matches("leaf").count(), 1, "{}", text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_features_the_outer_build_enabled_are_those_of_the_manifest_whose_variable_is_set() {
+        let manifest = "[package]\nname = \"p\"\n\n[features]\ndefault = [\"std\"]\nstd = []\n\
+                        serde-support = [\"dep:serde\"]\nwith-tokio = [\"tokio\"]\nextra = []\n\n\
+                        [dependencies]\nserde = { version = \"1\", optional = true }\n\
+                        tokio = { version = \"1\", optional = true }\n\
+                        syn = { version = \"2\", optional = true }\nquote = \"1\"\n\n\
+                        [build-dependencies]\nbuilder = { version = \"1\", optional = true }\n\n\
+                        [dev-dependencies]\ndev = \"1\"\n";
+        let features = |set: &[&str]| {
+            let set: Vec<String> = set.iter().map(|name| feature_env_var(name)).collect();
+            enabled_features(manifest, &|var| set.iter().any(|name| name == var))
+        };
+        assert!(features(&[]).is_empty());
+        assert_eq!(features(&["default", "std"]), ["default", "std"]);
+        assert_eq!(
+            features(&["serde-support", "extra"]),
+            ["serde-support", "extra"]
+        );
+        assert_eq!(
+            features(&["syn", "tokio", "builder"]),
+            ["tokio", "syn", "builder"]
+        );
+        assert!(features(&["serde"]).is_empty());
+        assert!(features(&["quote", "dev"]).is_empty());
+    }
+
+    #[test]
+    fn the_patch_and_replace_tables_of_a_manifest_are_copied_with_their_paths_made_absolute() {
+        let manifest = r#"[package]
+name = "root"
+path = "not-a-patch"
+
+[dependencies]
+dep = { path = "../dep" }
+
+[patch.crates-io]
+# a comment
+fork = { path = "../fork", version = "1.2.3" }
+git-fork = { git = "https://example.com/g.git", branch = "main" }
+absolute = { path = "/abs/dir" }
+dotted.path = "dotted-fork"
+features = { git = "https://example.com/f.git", features = ["a", "b"] }
+
+[patch.crates-io.own-table]
+path = "own/table"
+version = "0.1.0"
+
+[patch."https://example.com/index"]
+other = { path = "other" }
+
+[replace]
+"old:1.0.0" = { path = "../old" }
+
+[replace."older:2.0.0"]
+path = "../older"
+
+[features]
+path = []
+"#;
+        let out = override_tables(manifest, Path::new("/w/root"));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "[patch.crates-io]",
+                r#"fork = { path = "/w/root/../fork", version = "1.2.3" }"#,
+                r#"git-fork = { git = "https://example.com/g.git", branch = "main" }"#,
+                r#"absolute = { path = "/abs/dir" }"#,
+                r#"dotted.path = "/w/root/dotted-fork""#,
+                r#"features = { git = "https://example.com/f.git", features = ["a", "b"] }"#,
+                "[patch.crates-io.own-table]",
+                r#"path = "/w/root/own/table""#,
+                r#"version = "0.1.0""#,
+                r#"[patch."https://example.com/index"]"#,
+                r#"other = { path = "/w/root/other" }"#,
+                "[replace]",
+                r#""old:1.0.0" = { path = "/w/root/../old" }"#,
+                r#"[replace."older:2.0.0"]"#,
+                r#"path = "/w/root/../older""#,
+            ],
+            "{}",
+            out
+        );
+        assert_eq!(
+            override_tables("[package]\nname = \"a\"\n", Path::new("/w")),
+            ""
+        );
+    }
+
+    #[test]
+    fn the_private_workspace_carries_the_patches_of_the_workspace_that_builds_the_package() {
+        let dir = temp_dir("shadow-patch");
+        let config = packaged_owner(
+            &dir,
+            "[package]\nname = \"owner\"\nedition = \"2021\"\n",
+            "",
+            REGISTRY_LOCK,
+        );
+        std::fs::write(
+            dir.join("ws/Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\n\n[patch.crates-io]\nleaf = { path = \"../fork\" }\n",
+        )
+        .unwrap();
+        let shadow = match config.nested_workspace() {
+            NestedWorkspace::Shadow(shadow) => shadow,
+            NestedWorkspace::InPlace => panic!("a packaged crate runs in a workspace of its own"),
+        };
+        let root = std::fs::read_to_string(&shadow.manifest).unwrap();
+        // Relative to the workspace that has the table, not to the private one.
+        let fork = toml_quote(&dir.join("ws").join("../fork"));
+        assert!(
+            root.contains(&format!(
+                "[patch.crates-io]\nleaf = {{ path = {} }}\n",
+                fork
+            )),
+            "{}",
+            root
+        );
+        assert!(root.contains("resolver = \"2\""), "{}", root);
+        assert_eq!(shadow.watch, [dir.join("ws/Cargo.toml")]);
+
+        std::fs::write(dir.join("ws/Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let config = packaged_owner(
+            &dir,
+            "[package]\nname = \"owner\"\nedition = \"2021\"\n",
+            "",
+            REGISTRY_LOCK,
+        );
+        std::fs::write(dir.join("ws/Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let shadow = match config.nested_workspace() {
+            NestedWorkspace::Shadow(shadow) => shadow,
+            NestedWorkspace::InPlace => panic!("a packaged crate runs in a workspace of its own"),
+        };
+        let root = std::fs::read_to_string(&shadow.manifest).unwrap();
+        assert!(root.contains("resolver = \"1\""), "{}", root);
+        assert!(!root.contains("[patch"), "{}", root);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_nested_build_names_a_cause_only_when_cargo_points_to_one() {
+        let hint = |stderr: &str| nested_failure_hint(stderr);
+        let missing = "error: package ID specification `gone` did not match any packages";
+        assert!(hint(missing)
+            .unwrap()
+            .contains("must be a dependency of this package"));
+        let panic = "thread 'main' panicked at src/cargo/core/resolver/features.rs:325:13:";
+        let message = hint(panic).unwrap();
+        assert!(message.contains("normal dependency"), "{}", message);
+        assert!(!message.contains("Every"), "{}", message);
+        for offline in [
+            "error: no matching package named `x` found",
+            "note: offline mode (via `--offline`) can sometimes cause surprising resolution failures",
+            "error: failed to download `x v1.0.0`",
+        ] {
+            let message = hint(offline).unwrap();
+            assert!(message.contains("--offline"), "{}", message);
+            assert!(!message.contains("Every"), "{}", message);
+        }
+        assert!(hint("error: specification `x@1.0.0` is ambiguous")
+            .unwrap()
+            .contains("[patch]"));
+        // The compiler's own errors, a crate that does not build, a build script that fails: no hint.
+        for other in [
+            "error[E0432]: unresolved import `x`\nerror: could not compile `leaf` (lib)",
+            "error: failed to run custom build command for `x v1.0.0`",
+            "",
+        ] {
+            assert_eq!(hint(other), None, "{}", other);
+        }
+    }
+
+    #[test]
+    fn a_path_is_quoted_for_toml() {
+        assert_eq!(toml_quote(Path::new("/a/b")), "\"/a/b\"");
+        assert_eq!(toml_quote(Path::new("C:\\a\\\"b")), "\"C:\\\\a\\\\\\\"b\"");
+    }
+
+    #[test]
+    fn a_nested_build_variable_is_for_the_one_package_it_names() {
+        let name = "SUBCRATE_TEST_SCOPED_VARIABLE";
+        let here = scope_key(Path::new("/w/here"));
+        std::env::remove_var(name);
+        assert!(!env_is_for(name, &here));
+        std::env::set_var(name, &here);
+        assert!(env_is_for(name, &here));
+        assert!(!env_is_for(name, &scope_key(Path::new("/w/there"))));
+        std::env::set_var(name, "1");
+        assert!(!env_is_for(name, &here));
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn a_package_is_named_by_its_canonical_manifest_directory() {
+        let dir = std::env::temp_dir().join(format!("subcrate-scope-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        assert_eq!(
+            scope_key(&dir.join("pkg").join("..").join("pkg")),
+            scope_key(&dir.join("pkg"))
+        );
+        assert_ne!(scope_key(&dir.join("pkg")), scope_key(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_nested_build_is_set_up_for_this_package_alone() {
+        let leaf = |manifest: &str| {
+            let subs = [sub("tests/t.rs", &["user"], vec![ext("leaf")])];
+            nested_build("scope", manifest, MULTI_LOCK, "", &subs)
+        };
+        let other = scope_key(Path::new("/w/other"));
+        std::env::set_var(NESTED_ENV, &other);
+        std::env::set_var(HARVEST_ONLY_ENV, &other);
+
+        let path = "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = { path = \"../leaf\" }\n";
+        let (result, args, _) = leaf(path);
+        result.unwrap();
+        let line = |args: &[String], name: &str| {
+            let prefix = format!("{}=", name);
+            args.iter()
+                .find_map(|arg| arg.strip_prefix(prefix.as_str()))
+                .unwrap()
+                .to_string()
+        };
+        let this = line(&args, "PWD");
+        assert_eq!(line(&args, NESTED_ENV), this);
+        assert_eq!(line(&args, HARVEST_ONLY_ENV), this);
+
+        let registry = "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n";
+        let (result, args, _) = leaf(registry);
+        result.unwrap();
+        let this = line(&args, "PWD");
+        assert_eq!(line(&args, NESTED_ENV), this);
+        assert_eq!(line(&args, HARVEST_ONLY_ENV), "unset");
+
+        let host = |manifest: &str| {
+            let mut proc_macro = top("a", vec![ext("leaf")]);
+            proc_macro.proc_macro = true;
+            nested_host_build("scope", manifest, MULTI_LOCK, "", &[proc_macro])
+        };
+        let (result, args, _) = host(path);
+        result.unwrap();
+        let this = line(&args, "PWD");
+        assert_eq!(line(&args, NESTED_ENV), this);
+        assert_eq!(line(&args, HARVEST_ONLY_ENV), this);
+        let (result, args, _) = host(registry);
+        result.unwrap();
+        let this = line(&args, "PWD");
+        assert_eq!(line(&args, NESTED_ENV), this);
+        assert_eq!(line(&args, HARVEST_ONLY_ENV), "unset");
+
+        std::env::remove_var(NESTED_ENV);
+        std::env::remove_var(HARVEST_ONLY_ENV);
+    }
+
+    #[test]
+    fn the_search_paths_of_build_scripts_are_read_from_cargos_messages() {
+        let message = concat!(
+            r#"{"reason":"build-script-executed","package_id":"path+file:///w/backed#0.1.0","#,
+            r#""linked_libs":[],"linked_paths":["/t/debug/build/backed-1/out/subcrates","#,
+            r#""dependency=/t/debug/subcrate-owner-deps/backed/1.99/debug","#,
+            r#""native=/usr/lib","framework=/Library/Frameworks"],"cfgs":[],"env":[],"#,
+            r#""out_dir":"/t/debug/build/backed-1/out"}"#,
+        );
+        let quiet = r#"{"reason":"build-script-executed","package_id":"x","linked_libs":[],"linked_paths":[],"cfgs":[],"env":[],"out_dir":"/t/out"}"#;
+        let deps = parse_artifacts(&format!("{}\n{}\n", quiet, message));
+        let paths: Vec<&Path> = deps.script_paths.iter().map(PathBuf::as_path).collect();
+        assert_eq!(
+            paths,
+            [
+                Path::new("/t/debug/build/backed-1/out/subcrates"),
+                Path::new("/t/debug/subcrate-owner-deps/backed/1.99/debug"),
+                Path::new("/usr/lib"),
+            ]
+        );
+        assert!(deps.crates.is_empty() && deps.lib_dirs.is_empty());
+    }
+
+    #[test]
+    fn a_path_is_inside_a_directory_by_its_components() {
+        assert!(is_inside(Path::new("/t/a/b/c"), Path::new("/t/a")));
+        assert!(is_inside(Path::new("/t/a"), Path::new("/t/a")));
+        assert!(!is_inside(Path::new("/t/ab"), Path::new("/t/a")));
+        assert!(!is_inside(Path::new("/usr/lib"), Path::new("/t/a")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_search_paths_into_the_nested_build_are_kept() {
+        let dir =
+            std::env::temp_dir().join(format!("subcrate-nested-scripts-{}", std::process::id()));
+        let target = shared_target_dir(
+            &dir.join("target/debug/build/owner-1a/out"),
+            "owner",
+            rustc_key(Path::new("rustc")).as_deref(),
+        );
+        let messages = format!(
+            concat!(
+                r#"{{"reason":"build-script-executed","package_id":"path+file:///w/backed#0.1.0","#,
+                r#""linked_libs":[],"linked_paths":["{inside}/x/out/subcrates","native=/usr/lib"],"#,
+                r#""cfgs":[],"env":[],"out_dir":"{inside}/x/out"}}"#
+            ),
+            inside = target.display()
+        );
+        let registry = "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n";
+        let subs = [sub("tests/t.rs", &["user"], vec![ext("leaf")])];
+        let (result, _, _) = nested_build("scripts", registry, MULTI_LOCK, &messages, &subs);
+        let paths: Vec<PathBuf> = result.unwrap().script_paths.into_iter().collect();
+        assert_eq!(paths, [target.join("x/out/subcrates")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_search_paths_into_the_host_build_are_kept() {
+        let dir =
+            std::env::temp_dir().join(format!("subcrate-host-scripts-{}", std::process::id()));
+        let out_dir = dir.join("target/aarch64-unknown-linux-gnu/debug/build/owner-1a/out");
+        let compiler = rustc_key(Path::new("rustc")).map(|key| format!("{}-host", key));
+        let host = shared_target_dir(&out_dir, "owner", compiler.as_deref());
+        let target = shared_target_dir(&out_dir, "owner", rustc_key(Path::new("rustc")).as_deref());
+        assert_ne!(host, target);
+        let message = |inside: &Path| {
+            format!(
+                concat!(
+                    r#"{{"reason":"build-script-executed","package_id":"path+file:///w/backed#0.1.0","#,
+                    r#""linked_libs":[],"linked_paths":["{inside}/x/out/subcrates","native=/usr/lib"],"#,
+                    r#""cfgs":[],"env":[],"out_dir":"{inside}/x/out"}}"#
+                ),
+                inside = inside.display()
+            )
+        };
+        let messages = format!("{}\n{}\n", message(&host), message(&target));
+        let registry = "[package]\nname = \"owner\"\n\n[dependencies]\nleaf = \"1\"\n";
+        let mut proc_macro = top("a", vec![ext("leaf")]);
+        proc_macro.proc_macro = true;
+        let (result, _, _) =
+            nested_host_build("scripts", registry, MULTI_LOCK, &messages, &[proc_macro]);
+        let paths: Vec<PathBuf> = result.unwrap().script_paths.into_iter().collect();
+        assert_eq!(paths, [host.join("x/out/subcrates")]);
+    }
+
+    #[test]
+    fn subcrates_search_the_dependencies_subcrate_paths_of_both_builds_when_cross_compiling() {
+        let mut config = cross_config();
+        config.owner_deps = external_artifacts();
+        config
+            .owner_deps
+            .script_paths
+            .insert(PathBuf::from("t/debug/build/backed/h/out/subcrates"));
+        let mut host = external_artifacts();
+        host.lib_dirs = [PathBuf::from("host/deps")].into_iter().collect();
+        host.script_paths = [
+            PathBuf::from("host/build/backed/h/out/subcrates"),
+            PathBuf::from("host/deps"),
+        ]
+        .into_iter()
+        .collect();
+        config.host_deps = host;
+        let mut proc_macro = top("a", vec![]);
+        proc_macro.proc_macro = true;
+        let searched = |sub: &Subcrate| -> Vec<String> {
+            let on_owner_dep = ExternDep {
+                owner_linked: true,
+                ..linked("__subcrate_b_1", "b")
+            };
+            config
+                .rustc_args(sub, &[on_owner_dep], Path::new("out/subcrates"))
+                .into_iter()
+                .filter(|arg| arg.starts_with("dependency="))
+                .collect()
+        };
+        for sub in [&proc_macro, &top("a", vec![])] {
+            let searched = searched(sub);
+            assert_eq!(
+                searched,
+                [
+                    "dependency=out/subcrates",
+                    "dependency=t/debug",
+                    "dependency=t/debug/build/leaf/h/out",
+                    "dependency=host/deps",
+                    "dependency=host/build/backed/h/out/subcrates",
+                    "dependency=t/debug/build/backed/h/out/subcrates",
+                ],
+                "{:?}",
+                searched
+            );
+        }
+    }
+
+    #[test]
+    fn subcrates_built_on_owner_dependencies_search_the_dependencies_subcrate_paths() {
+        let mut config = config();
+        config.owner_deps = external_artifacts();
+        config
+            .owner_deps
+            .script_paths
+            .insert(PathBuf::from("t/debug/build/backed/h/out/subcrates"));
+        config
+            .owner_deps
+            .script_paths
+            .insert(PathBuf::from("t/debug"));
+        let on_owner_dep = ExternDep {
+            owner_linked: true,
+            ..linked("__subcrate_b_1", "b")
+        };
+        let args = config.rustc_args(
+            &top("a", vec![]),
+            &[on_owner_dep],
+            Path::new("out/subcrates"),
+        );
+        let searched: Vec<&String> = args
+            .iter()
+            .filter(|arg| arg.starts_with("dependency="))
+            .collect();
+        assert_eq!(
+            searched,
+            [
+                "dependency=out/subcrates",
+                "dependency=t/debug",
+                "dependency=t/debug/build/leaf/h/out",
+                "dependency=t/debug/build/backed/h/out/subcrates",
+            ]
+        );
+        let args = config.rustc_args(
+            &top("a", vec![]),
+            &[linked("__subcrate_b_1", "b")],
+            Path::new("out/subcrates"),
+        );
+        assert!(!args.iter().any(|arg| arg.contains("backed")), "{:?}", args);
     }
 
     /// A lock file with the owner, its dependencies and an unrelated package.
@@ -5971,8 +8298,12 @@ path = \"ignored\"
 ";
         // `[lib]`/`[[bin]]`/`[[test]]`/`[[example]]` paths, in order; a `path` key
         // in a non-target section (`[package]`, `[dependencies]`) is ignored.
+        let paths: Vec<String> = declared_targets(manifest)
+            .into_iter()
+            .filter_map(|target| target.path)
+            .collect();
         assert_eq!(
-            target_source_paths(manifest),
+            paths,
             [
                 "src/the_lib.rs",
                 "bin/tool.rs",
@@ -5983,6 +8314,209 @@ path = \"ignored\"
         // The library's own path, for the owner crate.
         assert_eq!(lib_source_path(manifest).as_deref(), Some("src/the_lib.rs"));
         assert_eq!(lib_source_path("[package]\nname = \"p\"\n"), None);
+    }
+
+    fn target(kind: &str, name: Option<&str>, path: Option<&str>) -> DeclaredTarget {
+        DeclaredTarget {
+            kind: kind.to_string(),
+            name: name.map(str::to_string),
+            path: path.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn declared_targets_carry_their_name_and_path() {
+        let manifest = "\
+[package]
+name = \"x\"
+
+[lib]
+name = \"x_lib\"
+
+[[test]]
+name = \"by_name\"
+
+[[test]]
+name = \"elsewhere\"
+path = \"suite/elsewhere.rs\" # a comment
+harness = false
+
+[[bin]]
+path = \"src/nameless.rs\"
+
+[features]
+name = \"not-a-target\"
+
+[[bench]]
+name = \"last\"
+";
+        assert_eq!(
+            declared_targets(manifest),
+            [
+                target("lib", Some("x_lib"), None),
+                target("test", Some("by_name"), None),
+                target("test", Some("elsewhere"), Some("suite/elsewhere.rs")),
+                target("bin", None, Some("src/nameless.rs")),
+                target("bench", Some("last"), None),
+            ]
+        );
+        assert_eq!(declared_targets("[package]\nname = \"p\"\n"), []);
+        assert_eq!(package_name(manifest).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn target_discovery_is_on_unless_the_manifest_turns_it_off() {
+        let on = AutoDiscovery::default();
+        assert_eq!(auto_discovery(""), on);
+        assert_eq!(auto_discovery("[package]\nname = \"p\"\n"), on);
+        assert_eq!(
+            auto_discovery("[package]\nautotests = true # the default\nautobins = true\n"),
+            on
+        );
+        let off = |manifest: &str| auto_discovery(&format!("[package]\n{}\n", manifest));
+        let flags = |auto: AutoDiscovery| [auto.bins, auto.tests, auto.benches, auto.examples];
+        assert_eq!(flags(off("autobins = false")), [false, true, true, true]);
+        assert_eq!(flags(off("autotests = false")), [true, false, true, true]);
+        assert_eq!(flags(off("autobenches=false")), [true, true, false, true]);
+        assert_eq!(
+            flags(off("autoexamples = false # no")),
+            [true, true, true, false]
+        );
+        assert_eq!(
+            auto_discovery("[dependencies]\nautotests = false\n[package]\nname = \"p\"\n"),
+            on
+        );
+        assert_eq!(on.root_dirs(), ["src", "tests", "benches", "examples"]);
+        assert_eq!(
+            off("autotests = false").root_dirs(),
+            ["src", "benches", "examples"]
+        );
+        assert_eq!(
+            auto_discovery(
+                "[package]\nautotests = false\nautobenches = false\nautoexamples = false"
+            )
+            .root_dirs(),
+            ["src"]
+        );
+    }
+
+    /// A package in a temporary directory: its `Cargo.toml` and the given (empty)
+    /// files, and the file names `crate_roots` finds, relative to it, in order.
+    fn roots_of(test: &str, manifest: &str, files: &[&str]) -> Vec<String> {
+        let dir =
+            std::env::temp_dir().join(format!("subcrate-roots-{}-{}", test, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
+        for file in files {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+        }
+        let mut roots: Vec<String> = crate_roots(&dir)
+            .into_iter()
+            .map(|(file, _)| {
+                file.strip_prefix(&dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        roots.sort();
+        roots
+    }
+
+    const LAYOUT: &[&str] = &[
+        "src/lib.rs",
+        "src/main.rs",
+        "src/bin/a.rs",
+        "src/bin/b/main.rs",
+        "tests/t.rs",
+        "tests/u/main.rs",
+        "benches/b.rs",
+        "examples/e.rs",
+        "suite/s.rs",
+    ];
+
+    #[test]
+    fn target_roots_are_found_by_their_place_by_default() {
+        let all = [
+            "benches/b.rs",
+            "examples/e.rs",
+            "src/bin/a.rs",
+            "src/bin/b/main.rs",
+            "src/lib.rs",
+            "src/main.rs",
+            "tests/t.rs",
+            "tests/u/main.rs",
+        ];
+        assert_eq!(
+            roots_of("default", "[package]\nname = \"p\"\n", LAYOUT),
+            all
+        );
+        assert_eq!(
+            roots_of(
+                "true",
+                "[package]\nname = \"p\"\nautotests = true\n[dependencies]\nautobins = false\n",
+                LAYOUT
+            ),
+            all
+        );
+    }
+
+    #[test]
+    fn target_discovery_that_is_off_leaves_only_the_declared_targets() {
+        // Files in those places are someone else's unless declared (e.g. another package in `tests/`).
+        let off = "[package]\nname = \"p\"\nautotests = false\nautobenches = false\n\
+                   autoexamples = false\nautobins = false\n";
+        assert_eq!(roots_of("off", off, LAYOUT), ["src/lib.rs"]);
+
+        assert_eq!(
+            roots_of(
+                "tests-off",
+                "[package]\nname = \"p\"\nautotests = false\n",
+                LAYOUT
+            ),
+            [
+                "benches/b.rs",
+                "examples/e.rs",
+                "src/bin/a.rs",
+                "src/bin/b/main.rs",
+                "src/lib.rs",
+                "src/main.rs",
+            ]
+        );
+
+        // Declared targets are roots with or without a `path`: by name in `tests/`, `benches/`, `examples/`,
+        // `src/main.rs` for a `[[bin]]` named like the package, else `src/bin/<name>`.
+        let declared = format!(
+            "{}{}",
+            off,
+            "[[test]]\nname = \"t\"\n[[test]]\nname = \"u\"\n\
+             [[test]]\nname = \"elsewhere\"\npath = \"suite/s.rs\"\n\
+             [[bench]]\nname = \"b\"\n[[example]]\nname = \"e\"\n\
+             [[bin]]\nname = \"p\"\n[[bin]]\nname = \"b\"\n\
+             [[test]]\nname = \"missing\"\n"
+        );
+        assert_eq!(
+            roots_of("declared", &declared, LAYOUT),
+            [
+                "benches/b.rs",
+                "examples/e.rs",
+                "src/bin/b/main.rs",
+                "src/lib.rs",
+                "src/main.rs",
+                "suite/s.rs",
+                "tests/t.rs",
+                "tests/u/main.rs",
+            ]
+        );
+        let other = format!("{}{}", off, "[[bin]]\nname = \"a\"\n");
+        assert_eq!(
+            roots_of("bin", &other, LAYOUT),
+            ["src/bin/a.rs", "src/lib.rs"]
+        );
     }
 
     #[test]

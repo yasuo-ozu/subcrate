@@ -9,7 +9,9 @@ runs:
   steps:
     - shell: bash
       run: |
-        rustup toolchain install stable --profile minimal --no-self-update
+        # `x86_64-unknown-none`: the cross-compiling test (nested_build.rs) skips itself
+        # when this target is not installed.
+        rustup toolchain install stable --profile minimal --target x86_64-unknown-none --no-self-update
         rustup default stable
         rustc --version
     - name: Test (default features)

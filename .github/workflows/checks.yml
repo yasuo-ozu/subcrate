@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: |
-          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup toolchain install nightly --profile minimal --target x86_64-unknown-none --no-self-update
           rustup default nightly
           rustc --version
       # Exercises the `mod foo;`-inside-a-subcrate tests, which require nightly
@@ -54,3 +54,15 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
       - run: cargo doc --no-deps -p subcrate -p subcrate-core -p subcrate-macros
+
+  no-std:
+    name: Attribute-only build for a target without std
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-none --no-self-update
+          rustup default stable
+      # Without the `build` feature `subcrate` is `#![no_std]` and only the attribute is
+      # left, so a `no_std` package can depend on it.
+      - run: cargo build -p subcrate --no-default-features --target x86_64-unknown-none

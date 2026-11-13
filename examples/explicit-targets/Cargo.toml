@@ -1,0 +1,43 @@
+[package]
+name = "explicit-targets"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.56"
+build = "build.rs"
+publish = false
+description = "Test fixture: a package that turns Cargo's target auto-discovery off, with source files in its target directories that are not its own."
+# Cargo builds only the targets declared below. `tests/`, `benches/`, `examples/` and
+# `src/bin/` hold files of other packages (the case of a workspace whose root package
+# has its test package in `tests/`): the build helper must not read them.
+autotests = false
+autobenches = false
+autoexamples = false
+autobins = false
+
+[lib]
+path = "src/lib.rs"
+
+# A declared target with a path of its own ...
+[[test]]
+name = "elsewhere"
+path = "suite/elsewhere.rs"
+
+# ... and one at the default location, which stays a root with `autotests = false`.
+[[test]]
+name = "by_name"
+
+[[bench]]
+name = "declared"
+harness = false
+
+[[example]]
+name = "declared"
+
+[[bin]]
+name = "declared"
+
+[dependencies]
+subcrate = { path = "../.." }
+
+[build-dependencies]
+subcrate = { path = "../.." }
