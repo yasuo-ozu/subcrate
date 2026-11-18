@@ -2237,11 +2237,12 @@ fn override_tables(manifest: &str, base: &Path) -> String {
     let absolute = |value: &str| -> Option<String> {
         let path = toml_string_value(value)?;
         let path = Path::new(&path);
-        Some(toml_quote(&if path.is_relative() {
+        let joined = if path.is_relative() {
             base.join(path)
         } else {
             path.to_path_buf()
-        }))
+        };
+        Some(toml_path(&joined))
     };
     let mut out = String::new();
     let mut copying = false;
@@ -2322,6 +2323,15 @@ fn override_tables(manifest: &str, base: &Path) -> String {
 
 fn toml_quote(path: &Path) -> String {
     toml_string(&path.to_string_lossy())
+}
+
+/// Quotes a path as a Cargo-manifest `path` value, with `/` separators. Cargo accepts
+/// forward slashes on every platform and they need no TOML escaping, whereas `Path::join`
+/// splices in the host separator — a backslash on Windows — which would otherwise mix the
+/// two in one value and have to be escaped. Used for the `[patch]`/`[replace]` paths copied
+/// into a nested build's manifest, where a base and a relative path must read consistently.
+fn toml_path(path: &Path) -> String {
+    toml_string(&path.to_string_lossy().replace('\\', "/"))
 }
 
 fn toml_string(text: &str) -> String {
@@ -7494,7 +7504,8 @@ path = []
         };
         let root = std::fs::read_to_string(&shadow.manifest).unwrap();
         // Relative to the workspace that has the table, not to the private one.
-        let fork = toml_quote(&dir.join("ws").join("../fork"));
+        // `toml_path` (not `toml_quote`): the emitted patch path uses `/` separators.
+        let fork = toml_path(&dir.join("ws").join("../fork"));
         assert!(
             root.contains(&format!(
                 "[patch.crates-io]\nleaf = {{ path = {} }}\n",
