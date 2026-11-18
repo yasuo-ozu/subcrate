@@ -2179,6 +2179,70 @@ const STUB_DEPENDENCY: &str = "packaged";
 /// The `Cargo.toml` of a [`Shadow`] workspace: the stub package with the given `resolver`,
 /// then `patches` (siblings extracted for `cargo package`'s verification) as
 /// `[patch.crates-io]` and `overrides` ([`override_tables`]).
+/// The crate names already overridden by a workspace's own `[patch]`/`[replace]`
+/// tables, read from the rendered `overrides` text (see [`override_tables`]). Used
+/// so an overlay patch is not emitted for a crate the outer workspace already
+/// patches — a duplicate `[patch]` key is a hard Cargo error. Whole keys are
+/// matched, not raw substrings, so an outer patch of `serde_json` does not suppress
+/// an overlay for `serde`.
+fn overridden_names(overrides: &str) -> BTreeSet<String> {
+    // Keys in a `[patch.<source>]` table are crate names; keys in `[replace]` are
+    // package-id specs (`name:version`), whose crate name is the part before `:`.
+    #[derive(Clone, Copy)]
+    enum Table {
+        Patch,
+        Replace,
+        Other,
+    }
+    let crate_of = |segment: &str, table: Table| -> String {
+        match table {
+            Table::Replace => segment.split(':').next().unwrap_or(segment).to_string(),
+            _ => segment.to_string(),
+        }
+    };
+    let mut names = BTreeSet::new();
+    let mut table = Table::Other;
+    for raw in overrides.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let keys = split_toml_key(&line[1..line.len() - 1]);
+            table = match keys.as_deref() {
+                // `[patch.<source>.<name>]` or `[replace."<spec>"]`: the last segment
+                // names the crate directly, opening no table (mirrors `override_tables`).
+                Some([first, rest @ ..])
+                    if (first == "patch" && rest.len() >= 2)
+                        || (first == "replace" && !rest.is_empty()) =>
+                {
+                    if let Some(last) = rest.last() {
+                        let kind = if first == "replace" {
+                            Table::Replace
+                        } else {
+                            Table::Patch
+                        };
+                        names.insert(crate_of(last, kind));
+                    }
+                    Table::Other
+                }
+                // `[patch.<source>]` or `[replace]`: a table whose keys name crates.
+                Some([first, ..]) if first == "patch" => Table::Patch,
+                Some([first, ..]) if first == "replace" => Table::Replace,
+                _ => Table::Other,
+            };
+            continue;
+        }
+        if let (Table::Patch | Table::Replace, Some((key, _))) = (table, split_key_value(line)) {
+            // A key may be dotted (`name.path = …`); the crate is its first segment.
+            if let Some(first) = split_toml_key(key.trim()).and_then(|k| k.into_iter().next()) {
+                names.insert(crate_of(&first, table));
+            }
+        }
+    }
+    names
+}
+
 fn shadow_manifest(
     stub: &Stub,
     resolver: &str,
@@ -2200,10 +2264,14 @@ fn shadow_manifest(
         features.join(", "),
         resolver
     );
-    // A package that the workspace being built patches is not patched twice.
+    // A package the workspace being built already patches is not patched twice (a
+    // duplicate `[patch]` key is a hard Cargo error). Match whole crate names, not
+    // raw substrings, so an outer patch of `serde_json` does not drop an overlay
+    // for `serde`.
+    let overridden = overridden_names(overrides);
     let patches: Vec<&(String, PathBuf)> = patches
         .iter()
-        .filter(|(name, _)| !overrides.contains(name.as_str()))
+        .filter(|(name, _)| !overridden.contains(name.as_str()))
         .collect();
     if !patches.is_empty() {
         // One table is one header: next to the workspace's own `[patch.crates-io]`, these are separate.
@@ -7482,6 +7550,31 @@ path = []
             override_tables("[package]\nname = \"a\"\n", Path::new("/w")),
             ""
         );
+    }
+
+    #[test]
+    fn overridden_names_reads_whole_crate_keys_not_substrings() {
+        let overrides = "\
+[patch.crates-io]
+serde_json = { path = \"/x/serde_json\" }
+dotted.path = \"/x/dotted\"
+[patch.crates-io.own-table]
+path = \"/x/own\"
+[patch.\"https://example.com/index\"]
+other = { path = \"/x/other\" }
+[replace]
+\"old:1.0.0\" = { path = \"/x/old\" }
+[replace.\"older:2.0.0\"]
+path = \"/x/older\"
+";
+        let names = overridden_names(overrides);
+        for expect in ["serde_json", "dotted", "own-table", "other", "old", "older"] {
+            assert!(names.contains(expect), "missing `{}`: {:?}", expect, names);
+        }
+        // The regression this guards: `serde` is not treated as patched merely
+        // because `serde_json` is, and a replace spec is reduced to its crate name.
+        assert!(!names.contains("serde"), "{:?}", names);
+        assert!(!names.contains("old:1.0.0"), "{:?}", names);
     }
 
     #[test]
