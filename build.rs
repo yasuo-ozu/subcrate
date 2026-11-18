@@ -507,7 +507,14 @@ impl Config {
         let subcrates_dir = self.out_dir.join("subcrates");
         std::fs::create_dir_all(&subcrates_dir)?;
 
-        let discovered = discover(&self.manifest_dir);
+        // Read the package manifest once here and feed it to everything below that
+        // needs it — discovery, the watch list, and the owner crate — rather than
+        // re-reading and re-parsing `Cargo.toml` in each. An unreadable manifest
+        // becomes an empty string, which keeps each consumer's default behaviour.
+        let manifest =
+            std::fs::read_to_string(self.manifest_dir.join("Cargo.toml")).unwrap_or_default();
+
+        let discovered = discover(&self.manifest_dir, &manifest);
 
         // Rebuild whenever the manifest or any discovered source file changes,
         // or when the flags we forward to subcrates change.
@@ -517,9 +524,7 @@ impl Config {
         // containing a `#[subcrate]` re-runs discovery. (Per-file tracking alone
         // would miss files that did not exist on the previous run.) Directories whose
         // auto-discovery is off are not watched: their files are not this package's.
-        let auto = std::fs::read_to_string(self.manifest_dir.join("Cargo.toml"))
-            .map(|manifest| auto_discovery(&manifest))
-            .unwrap_or_default();
+        let auto = auto_discovery(&manifest);
         for dir in auto.root_dirs() {
             let path = self.manifest_dir.join(dir);
             if path.is_dir() {
@@ -535,7 +540,7 @@ impl Config {
         // Resolve who depends on whom, then compile in dependency order so every
         // dependency's artifact exists before its dependents are compiled.
         let subcrates = &discovered.subcrates;
-        let owner = self.owner();
+        let owner = self.owner(&manifest);
         let links = resolve_links(subcrates, &owner)?;
         let needs = compile_deps(subcrates, &links, &owner);
         let order = compile_order(subcrates, &needs)?;
@@ -611,13 +616,11 @@ impl Config {
     }
 
     /// The package's library, as dependency resolution sees it.
-    fn owner(&self) -> Owner {
+    fn owner(&self, manifest: &str) -> Owner {
         // `[lib] path = "…"` if the manifest has one, else the default `src/lib.rs`.
         // The same path as `crate_roots` builds, so a subcrate in the library is
         // still recognised as part of it.
-        let lib = std::fs::read_to_string(self.manifest_dir.join("Cargo.toml"))
-            .ok()
-            .and_then(|manifest| lib_source_path(&manifest))
+        let lib = lib_source_path(manifest)
             .map(|rel| self.manifest_dir.join(rel))
             .unwrap_or_else(|| self.manifest_dir.join("src").join("lib.rs"));
         Owner {
@@ -1451,7 +1454,7 @@ impl Config {
         }
 
         let outer = self.outer_workspace();
-        let seeds = self.lock_candidates();
+        let seeds = self.lock_candidates(outer.as_ref());
         let outer_manifest = outer
             .as_ref()
             .and_then(|outer| std::fs::read_to_string(outer.dir.join("Cargo.toml")).ok());
@@ -1518,12 +1521,13 @@ impl Config {
     }
 
     /// The lock files the nested build of a packaged crate is tried against, in turn: the
-    /// workspace being built's (see [`outer_workspace`](Self::outer_workspace)), the package's
-    /// own, and none (Cargo resolves afresh from the cache).
-    fn lock_candidates(&self) -> Vec<Option<(PathBuf, String)>> {
+    /// workspace being built's (`outer`, see [`outer_workspace`](Self::outer_workspace)), the
+    /// package's own, and none (Cargo resolves afresh from the cache). `outer` is passed in so
+    /// the caller resolves it once rather than having it re-walked up the tree here.
+    fn lock_candidates(&self, outer: Option<&OuterWorkspace>) -> Vec<Option<(PathBuf, String)>> {
         let mut candidates: Vec<Option<(PathBuf, String)>> = Vec::new();
-        if let Some(outer) = self.outer_workspace() {
-            candidates.push(Some((outer.lock, outer.lock_text)));
+        if let Some(outer) = outer {
+            candidates.push(Some((outer.lock.clone(), outer.lock_text.clone())));
         }
         let own = self.manifest_dir.join("Cargo.lock");
         if let Ok(text) = std::fs::read_to_string(&own) {
@@ -2701,9 +2705,9 @@ struct Discovered {
 
 /// Scans the package, starting from its crate roots, and collects every
 /// `#[subcrate]` module.
-fn discover(manifest_dir: &Path) -> Discovered {
+fn discover(manifest_dir: &Path, manifest: &str) -> Discovered {
     let mut walker = Walker::default();
-    for (file, mod_dir) in crate_roots(manifest_dir) {
+    for (file, mod_dir) in crate_roots(manifest_dir, manifest) {
         // Canonical so a subcrate's crate root compares equal to the owner's library
         // and to its siblings however each was spelled (see [`canonical_path`]).
         walker.root = canonical_path(&file);
@@ -2728,9 +2732,10 @@ fn canonical_path(path: &Path) -> PathBuf {
 ///
 /// These are the targets Cargo builds: the library, the files found by place (unless
 /// the manifest turns that off, see [`AutoDiscovery`]) and every declared target.
-fn crate_roots(manifest_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let manifest = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap_or_default();
-    let auto = auto_discovery(&manifest);
+fn crate_roots(manifest_dir: &Path, manifest: &str) -> Vec<(PathBuf, PathBuf)> {
+    // Parse the `[package]` table once: auto-discovery and the package name both read it.
+    let entries = package_entries(manifest);
+    let auto = auto_discovery_from(&entries);
     let mut roots = Vec::new();
     let src = manifest_dir.join("src");
 
@@ -2764,8 +2769,8 @@ fn crate_roots(manifest_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     // Declared targets: `[lib] path`, `[[bin]]`, `[[test]]`, `[[bench]]`, `[[example]]`. A target may live
     // anywhere (a `path` may leave the manifest directory); with no `path`, Cargo looks for it by name.
     // `Walker` dedups by canonical path, so an overlap with the defaults above compiles once.
-    let package = package_name(&manifest);
-    for target in declared_targets(&manifest) {
+    let package = package_name_from(&entries);
+    for target in declared_targets(manifest) {
         let candidates = match &target.path {
             Some(path) => vec![manifest_dir.join(path)],
             None => default_target_files(
@@ -2826,8 +2831,13 @@ impl AutoDiscovery {
 
 /// What a manifest's `[package]` says about [`AutoDiscovery`]: on unless a flag is `false`.
 fn auto_discovery(manifest: &str) -> AutoDiscovery {
+    auto_discovery_from(&package_entries(manifest))
+}
+
+/// [`auto_discovery`] from an already-parsed `[package]` table.
+fn auto_discovery_from(entries: &[(String, String)]) -> AutoDiscovery {
     let mut auto = AutoDiscovery::default();
-    for (key, value) in package_entries(manifest) {
+    for (key, value) in entries {
         let slot = match key.as_str() {
             "autobins" => &mut auto.bins,
             "autotests" => &mut auto.tests,
@@ -2861,11 +2871,12 @@ fn package_entries(manifest: &str) -> Vec<(String, String)> {
     entries
 }
 
-fn package_name(manifest: &str) -> Option<String> {
-    package_entries(manifest)
-        .into_iter()
+/// The package name from an already-parsed `[package]` table.
+fn package_name_from(entries: &[(String, String)]) -> Option<String> {
+    entries
+        .iter()
         .find(|(key, _)| key == "name")
-        .and_then(|(_, value)| toml_string_value(&value))
+        .and_then(|(_, value)| toml_string_value(value))
 }
 
 /// A target a `Cargo.toml` declares (`[lib]`, or an entry of `[[bin]]`, `[[test]]`, …).
@@ -6206,10 +6217,10 @@ mod tests {
         config.package = "my-package".to_string();
         config.manifest_dir = dir.clone();
 
-        // No `src/lib.rs`: no library.
-        let without = config.owner();
+        // No `src/lib.rs`: no library. (No manifest, so the library is the default location.)
+        let without = config.owner("");
         std::fs::write(dir.join("src").join("lib.rs"), "").unwrap();
-        let with = config.owner();
+        let with = config.owner("");
         // `owner()` returns the canonical path; resolve the expectation the same way
         // while the file still exists (temp dirs are symlinked on some platforms).
         let expected_lib = std::fs::canonicalize(dir.join("src").join("lib.rs")).unwrap();
@@ -6241,10 +6252,11 @@ mod tests {
         )
         .unwrap();
 
-        let discovered = discover(&dir);
+        let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap_or_default();
+        let discovered = discover(&dir, &manifest);
         let mut config = config();
         config.manifest_dir = dir.clone();
-        let owner = config.owner();
+        let owner = config.owner(&manifest);
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(discovered.subcrates.len(), 1);
@@ -7089,7 +7101,7 @@ checksum = \"11\"
         let dir = temp_dir("lock-order");
         let own = REGISTRY_LOCK.replace("1.0.0", "1.0.9");
         let config = packaged_owner(&dir, "[package]\nname = \"owner\"\n", &own, REGISTRY_LOCK);
-        let candidates = config.lock_candidates();
+        let candidates = config.lock_candidates(config.outer_workspace().as_ref());
         assert_eq!(candidates.len(), 3, "{:?}", candidates);
         assert_eq!(candidates[0].as_ref().unwrap().0, dir.join("ws/Cargo.lock"));
         assert_eq!(
@@ -7104,12 +7116,15 @@ checksum = \"11\"
             REGISTRY_LOCK,
             REGISTRY_LOCK,
         );
-        assert_eq!(same.lock_candidates().len(), 2);
+        assert_eq!(
+            same.lock_candidates(same.outer_workspace().as_ref()).len(),
+            2
+        );
 
         // A lock with the package only as a member is not the workspace that builds it as a dependency.
         let member = REGISTRY_LOCK.replace("source = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"00\"\n", "");
         let config = packaged_owner(&dir, "[package]\nname = \"owner\"\n", &own, &member);
-        let candidates = config.lock_candidates();
+        let candidates = config.lock_candidates(config.outer_workspace().as_ref());
         assert_eq!(candidates.len(), 2, "{:?}", candidates);
         assert_eq!(
             candidates[0].as_ref().unwrap().0,
@@ -8361,7 +8376,10 @@ name = \"last\"
             ]
         );
         assert_eq!(declared_targets("[package]\nname = \"p\"\n"), []);
-        assert_eq!(package_name(manifest).as_deref(), Some("x"));
+        assert_eq!(
+            package_name_from(&package_entries(manifest)).as_deref(),
+            Some("x")
+        );
     }
 
     #[test]
@@ -8413,7 +8431,7 @@ name = \"last\"
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "").unwrap();
         }
-        let mut roots: Vec<String> = crate_roots(&dir)
+        let mut roots: Vec<String> = crate_roots(&dir, manifest)
             .into_iter()
             .map(|(file, _)| {
                 file.strip_prefix(&dir)
