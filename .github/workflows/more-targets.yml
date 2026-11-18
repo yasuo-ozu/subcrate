@@ -1,0 +1,79 @@
+name: More targets
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Three extra target configurations that the per-OS workflows don't cover, each
+# running the same two commands as the shared `build-test` composite action (the
+# workspace test suite and the attribute-only `--no-default-features` check):
+#
+#   * musl       — a wholly musl-libc toolchain (host == target == musl), which
+#                  exercises proc-macro `.so` loading under a non-glibc libc.
+#   * i686       — 32-bit pointer-width coverage; a cross-compile from the
+#                  x86_64 runner (proc-macros build for the host, the rest for
+#                  i686), whose binaries still run natively via multilib.
+#   * windows-gnu — the GNU (MinGW) toolchain, exercising the GNU linker and
+#                  `.dll` handling that the default MSVC Windows job does not.
+jobs:
+  musl:
+    name: Test (Linux musl, native)
+    runs-on: ubuntu-latest
+    # A fully musl toolchain: the official rust:alpine image's rustc, cargo and
+    # rustup all target x86_64-unknown-linux-musl, so this is native musl rather
+    # than a cross build, and genuinely exercises musl proc-macro `.so` loading.
+    container: rust:alpine
+    steps:
+      # Pre-checkout, in Alpine's default shell: git is needed by actions/checkout,
+      # musl-dev/gcc by the linker, and bash by the shared composite action's steps.
+      - name: Install system dependencies
+        shell: sh
+        run: apk add --no-cache bash git musl-dev gcc
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-test
+
+  i686:
+    name: Test (i686-unknown-linux-gnu, 32-bit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # gcc-multilib provides the 32-bit C runtime/linker so the i686 artifacts
+      # link and the 32-bit test binaries run natively on the x86_64 runner.
+      - name: Install multilib and the i686 target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add i686-unknown-linux-gnu
+          rustc --version
+      - name: Test (default features)
+        run: cargo test --workspace --target i686-unknown-linux-gnu
+      - name: Build the attribute-only path (no default features)
+        run: cargo check -p subcrate --no-default-features --target i686-unknown-linux-gnu
+
+  windows-gnu:
+    name: Test (x86_64-pc-windows-gnu, native)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      # Switch the whole toolchain to the GNU (MinGW) ABI: host == target ==
+      # x86_64-pc-windows-gnu, so this is native, not a cross build. `rustc -vV`
+      # confirms the host triple is the GNU one before the suite runs.
+      - name: Install and default to the windows-gnu toolchain
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --no-self-update
+          rustup default stable-x86_64-pc-windows-gnu
+          rustc -vV
+      - name: Test (default features)
+        run: cargo test --workspace
+      - name: Build the attribute-only path (no default features)
+        run: cargo check -p subcrate --no-default-features
