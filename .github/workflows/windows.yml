@@ -56,6 +56,9 @@ jobs:
           rustup toolchain install stable-x86_64-pc-windows-gnu --no-self-update
           rustup default stable-x86_64-pc-windows-gnu
           rustc -vV
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: windows-gnu
       - name: Test (default features)
         run: cargo test --workspace
       - name: Build the attribute-only path (no default features)

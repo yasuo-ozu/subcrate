@@ -25,6 +25,9 @@ jobs:
           rustup toolchain install nightly --profile minimal --no-self-update
           rustup default nightly
           rustc --version
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: nightly
       # Exercises the `mod foo;`-inside-a-subcrate tests, which require nightly
       # (non-inline modules in proc-macro input are unstable on stable).
       - run: cargo test -p subcrate-tests --features nightly
@@ -47,6 +50,9 @@ jobs:
       - run: |
           rustup toolchain install stable --profile minimal --component clippy --no-self-update
           rustup default stable
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: clippy
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   doc:
@@ -59,4 +65,7 @@ jobs:
       - run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: doc
       - run: cargo doc --no-deps -p subcrate -p subcrate-core -p subcrate-macros
