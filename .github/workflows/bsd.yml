@@ -50,7 +50,16 @@ jobs:
           # outside it (CARGO_TARGET_DIR below), so only the registry copies back.
           copyback: true
           prepare: |
-            pkg install -y rust
+            # The FreeBSD package mirror is occasionally flaky (a transient
+            # "No route to host", or a stale catalogue serving a 404). Retry the
+            # install, forcing a fresh catalogue each attempt.
+            n=0
+            until pkg update -f && pkg install -y rust; do
+              n=$((n + 1))
+              [ "$n" -ge 5 ] && { echo "pkg install failed after $n attempts" >&2; exit 1; }
+              echo "pkg attempt $n failed; retrying in 20s" >&2
+              sleep 20
+            done
           run: |
             set -e
             export CARGO_HOME="$PWD/.cargo-registry"
@@ -83,7 +92,14 @@ jobs:
           # Sync back only the cached registry; target lives outside the workspace.
           copyback: true
           prepare: |
-            /usr/sbin/pkg_add rust
+            # Retry against transient package-mirror failures.
+            n=0
+            until /usr/sbin/pkg_add rust; do
+              n=$((n + 1))
+              [ "$n" -ge 5 ] && { echo "pkg_add failed after $n attempts" >&2; exit 1; }
+              echo "pkg_add attempt $n failed; retrying in 20s" >&2
+              sleep 20
+            done
           run: |
             set -e
             export CARGO_HOME="$PWD/.cargo-registry"
@@ -116,7 +132,14 @@ jobs:
           # Sync back only the cached registry; target lives outside the workspace.
           copyback: true
           prepare: |
-            pkg_add -I rust
+            # Retry against transient package-mirror failures.
+            n=0
+            until pkg_add -I rust; do
+              n=$((n + 1))
+              [ "$n" -ge 5 ] && { echo "pkg_add failed after $n attempts" >&2; exit 1; }
+              echo "pkg_add attempt $n failed; retrying in 20s" >&2
+              sleep 20
+            done
           run: |
             set -e
             export CARGO_HOME="$PWD/.cargo-registry"
