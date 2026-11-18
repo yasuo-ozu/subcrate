@@ -21,3 +21,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-test
+
+  # Native musl (host == target == x86_64-unknown-linux-musl): the official
+  # rust:alpine image's whole toolchain targets musl, so this is not a cross
+  # build, and it genuinely exercises proc-macro `.so` loading under a non-glibc
+  # libc. (A 32-bit i686-unknown-linux-gnu job belongs here too, but it is a
+  # cross build needing the host/target proc-macro handling added in PR #5
+  # `fix/announce`; add it once that merges and this branch rebases onto it.)
+  musl:
+    name: Test (musl, native)
+    runs-on: ubuntu-latest
+    container: rust:alpine
+    steps:
+      # Alpine's default shell: git for actions/checkout, musl-dev/gcc for the
+      # linker, bash for the shared composite action's steps.
+      - name: Install system dependencies
+        shell: sh
+        run: apk add --no-cache bash git musl-dev gcc
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-test
