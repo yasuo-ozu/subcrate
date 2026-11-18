@@ -70,6 +70,34 @@ pub fn calculate() -> usize {
 }
 ```
 
+## Imports inside a subcrate
+
+A subcrate is a real crate, so its body brings items into scope with `use` like
+any other — from the standard library, and from the crates it depends on. Each
+dependency must be listed in `#[subcrate(...)]`; inside, `crate::` refers to
+*this* subcrate, and the surrounding crate's items are not in scope across the
+boundary.
+
+```rust ignore
+#[subcrate(::syn)]
+pub mod parser {
+    use std::collections::BTreeSet;
+    use syn::{parse_file, Item};
+
+    // The names of the free functions in a source file.
+    pub fn function_names(src: &str) -> BTreeSet<String> {
+        let file = parse_file(src).unwrap();
+        file.items
+            .into_iter()
+            .filter_map(|item| match item {
+                Item::Fn(f) => Some(f.sig.ident.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+```
+
 ## Macros and ordinary items in one crate
 
 A `proc-macro` crate can export only macros. With `subcrate`, an ordinary library
