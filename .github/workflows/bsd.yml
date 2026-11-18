@@ -52,12 +52,18 @@ jobs:
           prepare: |
             pkg install -y rust
           run: |
+            set -e
             export CARGO_HOME="$PWD/.cargo-registry"
-            export CARGO_TARGET_DIR="$HOME/cargo-target"
             rustc --version
             cargo --version
             cargo test --workspace
             cargo check -p subcrate --no-default-features
+            # Drop the build tree before the sync-back so only the cached registry
+            # copies out of the VM. target keeps its default location, on the big
+            # partition the workspace is mounted on; redirecting it into $HOME ran
+            # OpenBSD's small /root partition out of space. `set -e` above keeps a
+            # build failure from being masked by this cleanup.
+            rm -rf target
 
   netbsd:
     name: Test (NetBSD)
@@ -79,12 +85,18 @@ jobs:
           prepare: |
             /usr/sbin/pkg_add rust
           run: |
+            set -e
             export CARGO_HOME="$PWD/.cargo-registry"
-            export CARGO_TARGET_DIR="$HOME/cargo-target"
             rustc --version
             cargo --version
             cargo test --workspace
             cargo check -p subcrate --no-default-features
+            # Drop the build tree before the sync-back so only the cached registry
+            # copies out of the VM. target keeps its default location, on the big
+            # partition the workspace is mounted on; redirecting it into $HOME ran
+            # OpenBSD's small /root partition out of space. `set -e` above keeps a
+            # build failure from being masked by this cleanup.
+            rm -rf target
 
   openbsd:
     name: Test (OpenBSD)
@@ -106,9 +118,15 @@ jobs:
           prepare: |
             pkg_add -I rust
           run: |
+            set -e
             export CARGO_HOME="$PWD/.cargo-registry"
-            export CARGO_TARGET_DIR="$HOME/cargo-target"
             rustc --version
             cargo --version
             cargo test --workspace
             cargo check -p subcrate --no-default-features
+            # Drop the build tree before the sync-back so only the cached registry
+            # copies out of the VM. target keeps its default location, on the big
+            # partition the workspace is mounted on; redirecting it into $HOME ran
+            # OpenBSD's small /root partition out of space. `set -e` above keeps a
+            # build failure from being masked by this cleanup.
+            rm -rf target
