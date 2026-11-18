@@ -11,17 +11,32 @@ env:
 
 jobs:
   msrv:
-    name: Build on the declared MSRV
-    runs-on: ubuntu-latest
+    name: MSRV (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # The MSRV is a toolchain-version floor, so one representative runner per
+        # tier-1 OS is enough (architecture does not change it). The BSD, musl and
+        # windows-gnu jobs are excluded: they take rustc from OS packages or a
+        # fixed container image and cannot readily pin an old 1.56 toolchain.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Every step below is a POSIX-shell script (grep/awk/cut, $GITHUB_OUTPUT), so
+    # run them under bash on all three OSes — including the Windows runner, whose
+    # Git Bash provides one.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
       - name: Resolve rust-version
         id: msrv
+        # `tr -d '\r'`: a Windows checkout may give the manifest CRLF line endings.
         run: |
-          root=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
-          core=$(grep -m1 '^rust-version' core/Cargo.toml | cut -d'"' -f2)
-          mac=$(grep -m1 '^rust-version' macro/Cargo.toml | cut -d'"' -f2)
+          root=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2 | tr -d '\r')
+          core=$(grep -m1 '^rust-version' core/Cargo.toml | cut -d'"' -f2 | tr -d '\r')
+          mac=$(grep -m1 '^rust-version' macro/Cargo.toml | cut -d'"' -f2 | tr -d '\r')
           if [ "$root" != "$core" ] || [ "$root" != "$mac" ]; then
             echo "::error::rust-version differs: root=$root core=$core macro=$mac"
             exit 1
