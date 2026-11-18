@@ -1,0 +1,77 @@
+name: BSD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# GitHub provides no native BSD runners, so each job boots a BSD VM in QEMU on an
+# Ubuntu runner (vmactions/*-vm) and runs the same two commands the shared
+# `build-test` composite action runs on Linux/macOS/Windows: the workspace test
+# suite and the attribute-only (`--no-default-features`) check. Rust comes from
+# each OS's own package manager (stable), not rustup, since these VMs have no
+# rustup channel for their target. The toolchain install goes in `prepare:`
+# (root); the cargo commands go in `run:` (the synced repo, regular user).
+jobs:
+  freebsd:
+    name: Test (FreeBSD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Exercises the whole machinery on a non-Linux Unix that is neither macOS
+      # nor Windows: the nested Cargo build, `rustc` over stdin, proc-macro
+      # `.so` linking, and the artifact hard-linking step.
+      - name: Test in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.6.0
+        with:
+          envs: 'CARGO_TERM_COLOR'
+          # No artifacts need to leave the VM; skipping the sync-back of the
+          # (large) target/ tree keeps the job faster.
+          copyback: false
+          prepare: |
+            pkg install -y rust
+          run: |
+            rustc --version
+            cargo --version
+            cargo test --workspace
+            cargo check -p subcrate --no-default-features
+
+  netbsd:
+    name: Test (NetBSD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test in a NetBSD VM
+        uses: vmactions/netbsd-vm@v1.5.3
+        with:
+          envs: 'CARGO_TERM_COLOR'
+          copyback: false
+          prepare: |
+            /usr/sbin/pkg_add rust
+          run: |
+            rustc --version
+            cargo --version
+            cargo test --workspace
+            cargo check -p subcrate --no-default-features
+
+  openbsd:
+    name: Test (OpenBSD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test in an OpenBSD VM
+        uses: vmactions/openbsd-vm@v1.4.9
+        with:
+          envs: 'CARGO_TERM_COLOR'
+          copyback: false
+          prepare: |
+            pkg_add -I rust
+          run: |
+            rustc --version
+            cargo --version
+            cargo test --workspace
+            cargo check -p subcrate --no-default-features
