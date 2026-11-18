@@ -31,16 +31,29 @@ jobs:
       # Exercises the whole machinery on a non-Linux Unix that is neither macOS
       # nor Windows: the nested Cargo build, `rustc` over stdin, proc-macro
       # `.so` linking, and the artifact hard-linking step.
+      # Cache the crate registry (sources), not target: CARGO_HOME is redirected
+      # into the synced workspace so what the VM downloads syncs back here (with
+      # copyback below) to be restored next run, while CARGO_TARGET_DIR is kept
+      # outside it so the large build tree is not copied back. Keyed per-OS by the
+      # manifests (the lock file is not committed).
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: .cargo-registry
+          key: freebsd-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: freebsd-cargo-registry-
       - name: Test in a FreeBSD VM
         uses: vmactions/freebsd-vm@v1.6.0
         with:
           envs: 'CARGO_TERM_COLOR'
-          # No artifacts need to leave the VM; skipping the sync-back of the
-          # (large) target/ tree keeps the job faster.
-          copyback: false
+          # Sync the workspace back so the cached registry persists; target lives
+          # outside it (CARGO_TARGET_DIR below), so only the registry copies back.
+          copyback: true
           prepare: |
             pkg install -y rust
           run: |
+            export CARGO_HOME="$PWD/.cargo-registry"
+            export CARGO_TARGET_DIR="$HOME/cargo-target"
             rustc --version
             cargo --version
             cargo test --workspace
@@ -51,14 +64,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: .cargo-registry
+          key: netbsd-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: netbsd-cargo-registry-
       - name: Test in a NetBSD VM
         uses: vmactions/netbsd-vm@v1.5.3
         with:
           envs: 'CARGO_TERM_COLOR'
-          copyback: false
+          # Sync back only the cached registry; target lives outside the workspace.
+          copyback: true
           prepare: |
             /usr/sbin/pkg_add rust
           run: |
+            export CARGO_HOME="$PWD/.cargo-registry"
+            export CARGO_TARGET_DIR="$HOME/cargo-target"
             rustc --version
             cargo --version
             cargo test --workspace
@@ -69,14 +91,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: .cargo-registry
+          key: openbsd-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: openbsd-cargo-registry-
       - name: Test in an OpenBSD VM
         uses: vmactions/openbsd-vm@v1.4.9
         with:
           envs: 'CARGO_TERM_COLOR'
-          copyback: false
+          # Sync back only the cached registry; target lives outside the workspace.
+          copyback: true
           prepare: |
             pkg_add -I rust
           run: |
+            export CARGO_HOME="$PWD/.cargo-registry"
+            export CARGO_TARGET_DIR="$HOME/cargo-target"
             rustc --version
             cargo --version
             cargo test --workspace
