@@ -11,16 +11,26 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }}, ${{ matrix.channel }})
     strategy:
       fail-fast: false
       matrix:
         # amd64 and arm64 (GitHub's free arm64 Linux runner for public repos).
         os: [ubuntu-latest, ubuntu-24.04-arm]
+        # stable on every runner, plus the declared MSRV (see the exclude).
+        channel: [stable, msrv]
+        exclude:
+          # The MSRV is a toolchain-version floor, independent of architecture, so
+          # check it on the amd64 runner only (and an old 1.56 toolchain is not
+          # reliably packaged for the arm64 host).
+          - os: ubuntu-24.04-arm
+            channel: msrv
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-test
+        with:
+          channel: ${{ matrix.channel }}
 
   # Native musl (host == target == x86_64-unknown-linux-musl): the official
   # rust:alpine image's whole toolchain targets musl, so this is not a cross
