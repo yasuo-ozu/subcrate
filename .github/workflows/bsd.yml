@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  # One in-flight run per workflow per ref: a new push to a PR cancels the
+  # superseded run, while pushes to main always run to completion.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # GitHub provides no native BSD runners, so each job boots a BSD VM in QEMU on an
 # Ubuntu runner (vmactions/*-vm) and runs the same two commands the shared
 # `build-test` composite action runs on Linux/macOS/Windows: the workspace test
