@@ -1,22 +1,99 @@
 name: Build and test
 description: >
-  Install the stable toolchain, run the workspace tests, and build the
-  attribute-only path (no default features). Shared by the per-platform
-  workflows so the machinery lives in one place.
+  Build and test the workspace on a given Rust channel. With channel=stable (the
+  default) it installs stable, runs the workspace tests, and builds the
+  attribute-only path (no default features). With channel=msrv it installs the
+  declared MSRV, pins the MSRV-fragile dependencies, and `cargo check`s the
+  workspace (tests and doctest tooling can require newer compilers). Cargo's
+  registry, git sources and compiled dependencies are cached between runs. Shared
+  by the per-platform workflows so the machinery lives in one place.
+
+inputs:
+  channel:
+    description: 'Rust channel to build on: "stable" or "msrv".'
+    default: stable
 
 runs:
   using: composite
   steps:
-    - shell: bash
+    # --- toolchain, and for the MSRV the pinned lock file ---
+    - name: Install the stable toolchain
+      if: ${{ inputs.channel == 'stable' }}
+      shell: bash
       run: |
         # `x86_64-unknown-none`: the cross-compiling test (nested_build.rs) skips itself
         # when this target is not installed.
         rustup toolchain install stable --profile minimal --target x86_64-unknown-none --no-self-update
         rustup default stable
         rustc --version
+    - name: Resolve the declared MSRV
+      if: ${{ inputs.channel == 'msrv' }}
+      id: msrv
+      shell: bash
+      # `tr -d '\r'`: a Windows checkout may give the manifest CRLF line endings.
+      run: |
+        root=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2 | tr -d '\r')
+        core=$(grep -m1 '^rust-version' core/Cargo.toml | cut -d'"' -f2 | tr -d '\r')
+        mac=$(grep -m1 '^rust-version' macro/Cargo.toml | cut -d'"' -f2 | tr -d '\r')
+        if [ "$root" != "$core" ] || [ "$root" != "$mac" ]; then
+          echo "::error::rust-version differs: root=$root core=$core macro=$mac"
+          exit 1
+        fi
+        echo "version=$root" >> "$GITHUB_OUTPUT"
+    - name: Install the MSRV toolchain (${{ steps.msrv.outputs.version }})
+      if: ${{ inputs.channel == 'msrv' }}
+      shell: bash
+      run: |
+        rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal --no-self-update
+        rustup default ${{ steps.msrv.outputs.version }}
+        rustc --version
+    # The lock file is not committed, so generate one and pin the MSRV-fragile
+    # crates down to releases that still build on 1.56 (Cargo 1.56 is not
+    # MSRV-aware and resolves the latest otherwise). Order matters: a recent syn
+    # 2.x requires a proc-macro2 newer than 1.56 allows, so pin syn first, then
+    # quote, then proc-macro2. syn has two majors in the graph (a 1.x via
+    # proc-macro-error), so pin the 2.x line by whatever version resolved. Add to
+    # this list if another dependency starts failing on 1.56. Done before the
+    # cache step so the cache keys on the pinned lock.
+    - name: Generate a lock file and pin for the MSRV
+      if: ${{ inputs.channel == 'msrv' }}
+      shell: bash
+      run: |
+        cargo generate-lockfile
+        syn2=$(awk '/^name = "syn"/{getline; if ($3 ~ /"2\./) print $3}' Cargo.lock | tr -d '"')
+        cargo update -p "syn:$syn2" --precise 2.0.56
+        cargo update -p quote --precise 1.0.35
+        cargo update -p proc-macro2 --precise 1.0.79
+        cargo update -p unicode-ident --precise 1.0.12
+        cargo update -p unicode-width --precise 0.1.12
+        cargo update -p num-traits --precise 0.2.18
+
+    # --- cache cargo registry, git sources and compiled dependencies ---
+    # Caches ~/.cargo and the dependency artifacts in target/, but not the
+    # workspace crates themselves, so there is no staleness risk. `key` keeps the
+    # stable and MSRV caches apart (they resolve different dependency versions);
+    # rust-cache already folds in the OS and the rustc version.
+    - name: Cache cargo and compiled dependencies
+      uses: Swatinem/rust-cache@v2.9.3
+      with:
+        key: ${{ inputs.channel }}
+
+    # --- build / test ---
     - name: Test (default features)
+      if: ${{ inputs.channel == 'stable' }}
       shell: bash
       run: cargo test --workspace
     - name: Build the attribute-only path (no default features)
+      if: ${{ inputs.channel == 'stable' }}
       shell: bash
       run: cargo check -p subcrate --no-default-features
+    # `check`, never `test`: dev-dependencies and doctest tooling can carry higher
+    # MSRVs. `--locked` makes it use exactly the pinned lock above.
+    - name: Check (default features)
+      if: ${{ inputs.channel == 'msrv' }}
+      shell: bash
+      run: cargo check --workspace --locked
+    - name: Check (no default features)
+      if: ${{ inputs.channel == 'msrv' }}
+      shell: bash
+      run: cargo check -p subcrate --no-default-features --locked

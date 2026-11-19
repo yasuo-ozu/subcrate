@@ -1,0 +1,155 @@
+name: BSD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  # One in-flight run per workflow per ref: a new push to a PR cancels the
+  # superseded run, while pushes to main always run to completion.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# GitHub provides no native BSD runners, so each job boots a BSD VM in QEMU on an
+# Ubuntu runner (vmactions/*-vm) and runs the same two commands the shared
+# `build-test` composite action runs on Linux/macOS/Windows: the workspace test
+# suite and the attribute-only (`--no-default-features`) check. Rust comes from
+# each OS's own package manager (stable), not rustup, since these VMs have no
+# rustup channel for their target. The toolchain install goes in `prepare:`
+# (root); the cargo commands go in `run:` (the synced repo, regular user).
+jobs:
+  freebsd:
+    name: Test (FreeBSD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Exercises the whole machinery on a non-Linux Unix that is neither macOS
+      # nor Windows: the nested Cargo build, `rustc` over stdin, proc-macro
+      # `.so` linking, and the artifact hard-linking step.
+      # Cache the crate registry (sources), not target: CARGO_HOME is redirected
+      # into the synced workspace so what the VM downloads syncs back here (with
+      # copyback below) to be restored next run, while CARGO_TARGET_DIR is kept
+      # outside it so the large build tree is not copied back. Keyed per-OS by the
+      # manifests (the lock file is not committed).
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: .cargo-registry
+          key: freebsd-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: freebsd-cargo-registry-
+      - name: Test in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.6.0
+        with:
+          envs: 'CARGO_TERM_COLOR'
+          # Sync the workspace back so the cached registry persists; target lives
+          # outside it (CARGO_TARGET_DIR below), so only the registry copies back.
+          copyback: true
+          prepare: |
+            # The FreeBSD package mirror is occasionally flaky (a transient
+            # "No route to host", or a stale catalogue serving a 404). Retry the
+            # install, forcing a fresh catalogue each attempt.
+            n=0
+            until pkg update -f && pkg install -y rust; do
+              n=$((n + 1))
+              [ "$n" -ge 5 ] && { echo "pkg install failed after $n attempts" >&2; exit 1; }
+              echo "pkg attempt $n failed; retrying in 20s" >&2
+              sleep 20
+            done
+          run: |
+            set -e
+            export CARGO_HOME="$PWD/.cargo-registry"
+            rustc --version
+            cargo --version
+            cargo test --workspace
+            cargo check -p subcrate --no-default-features
+            # Drop the build tree before the sync-back so only the cached registry
+            # copies out of the VM. target keeps its default location, on the big
+            # partition the workspace is mounted on; redirecting it into $HOME ran
+            # OpenBSD's small /root partition out of space. `set -e` above keeps a
+            # build failure from being masked by this cleanup.
+            rm -rf target
+
+  netbsd:
+    name: Test (NetBSD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: .cargo-registry
+          key: netbsd-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: netbsd-cargo-registry-
+      - name: Test in a NetBSD VM
+        uses: vmactions/netbsd-vm@v1.5.3
+        with:
+          envs: 'CARGO_TERM_COLOR'
+          # Sync back only the cached registry; target lives outside the workspace.
+          copyback: true
+          prepare: |
+            # Retry against transient package-mirror failures.
+            n=0
+            until /usr/sbin/pkg_add rust; do
+              n=$((n + 1))
+              [ "$n" -ge 5 ] && { echo "pkg_add failed after $n attempts" >&2; exit 1; }
+              echo "pkg_add attempt $n failed; retrying in 20s" >&2
+              sleep 20
+            done
+          run: |
+            set -e
+            export CARGO_HOME="$PWD/.cargo-registry"
+            rustc --version
+            cargo --version
+            cargo test --workspace
+            cargo check -p subcrate --no-default-features
+            # Drop the build tree before the sync-back so only the cached registry
+            # copies out of the VM. target keeps its default location, on the big
+            # partition the workspace is mounted on; redirecting it into $HOME ran
+            # OpenBSD's small /root partition out of space. `set -e` above keeps a
+            # build failure from being masked by this cleanup.
+            rm -rf target
+
+  openbsd:
+    name: Test (OpenBSD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: .cargo-registry
+          key: openbsd-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: openbsd-cargo-registry-
+      - name: Test in an OpenBSD VM
+        uses: vmactions/openbsd-vm@v1.4.9
+        with:
+          envs: 'CARGO_TERM_COLOR'
+          # Sync back only the cached registry; target lives outside the workspace.
+          copyback: true
+          prepare: |
+            # Retry against transient package-mirror failures.
+            n=0
+            until pkg_add -I rust; do
+              n=$((n + 1))
+              [ "$n" -ge 5 ] && { echo "pkg_add failed after $n attempts" >&2; exit 1; }
+              echo "pkg_add attempt $n failed; retrying in 20s" >&2
+              sleep 20
+            done
+          run: |
+            set -e
+            export CARGO_HOME="$PWD/.cargo-registry"
+            rustc --version
+            cargo --version
+            cargo test --workspace
+            cargo check -p subcrate --no-default-features
+            # Drop the build tree before the sync-back so only the cached registry
+            # copies out of the VM. target keeps its default location, on the big
+            # partition the workspace is mounted on; redirecting it into $HOME ran
+            # OpenBSD's small /root partition out of space. `set -e` above keeps a
+            # build failure from being masked by this cleanup.
+            rm -rf target

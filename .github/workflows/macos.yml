@@ -9,17 +9,31 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  # One in-flight run per workflow per ref: a new push to a PR cancels the
+  # superseded run, while pushes to main always run to completion.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }}, ${{ matrix.channel }})
     strategy:
       fail-fast: false
       matrix:
         # arm64 (macos-latest, Apple Silicon) and amd64 (macos-15-intel, Intel).
         os: [macos-latest, macos-15-intel]
+        channel: [stable, msrv]
+        exclude:
+          # The MSRV is architecture-independent; the old 1.56 toolchain is
+          # reliably available for Intel, so check it on macos-15-intel only.
+          - os: macos-latest
+            channel: msrv
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       # Covers the Unix-but-not-Linux surface: APFS hard-link/inode behaviour,
       # a case-insensitive filesystem, and macOS path handling.
       - uses: ./.github/actions/build-test
+        with:
+          channel: ${{ matrix.channel }}
