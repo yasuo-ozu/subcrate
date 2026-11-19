@@ -1,0 +1,20 @@
+[package]
+name = "backed"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.56"
+build = "build.rs"
+publish = false
+description = "Test fixture: a library whose own items are subcrates, which other packages link with `#[subcrate(::backed)]`."
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+subcrate = { path = "../.." }
+# Linked by the proc-macro subcrate below, so this package's build script starts a nested
+# build of its own, inside the nested build of whichever package links `backed`.
+leaf = { path = "../leaf" }
+
+[build-dependencies]
+subcrate = { path = "../.." }

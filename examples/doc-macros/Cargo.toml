@@ -1,0 +1,17 @@
+[package]
+name = "doc-macros"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.56"
+build = "build.rs"
+publish = false
+description = "Test fixture: a package that re-exports a function-like, an attribute and a derive macro from its proc-macro subcrate, so `cargo doc` has to document all three."
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+subcrate = { path = "../.." }
+
+[build-dependencies]
+subcrate = { path = "../.." }

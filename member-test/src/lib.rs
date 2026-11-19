@@ -27,10 +27,36 @@ pub mod uses_pm_user {
     }
 }
 
+// A subcrate that links a dependency which is itself backed by subcrates: `backed`'s
+// build script runs inside the nested build this package's build script starts (with
+// `SUBCRATE_HARVEST_ONLY` set, as this package does not use `::member_test`), and has
+// to build its own subcrates there. The subcrate here then needs to find them: `backed`
+// refers to its proc-macro subcrate, which sits in `backed`'s own `OUT_DIR`.
+#[subcrate(::backed)]
+pub mod uses_backed {
+    pub fn macro_value() -> u32 {
+        backed::leafy!() + 1
+    }
+
+    pub fn value() -> u32 {
+        backed::value() + 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::any::TypeId;
+
+    #[test]
+    fn a_subcrate_can_link_a_dependency_that_is_backed_by_subcrates() {
+        // `leaf::value()` (10) through `backed`'s proc-macro subcrate, which links `::leaf`
+        // from a nested build of its own; `plain::value() + 1` through its library.
+        assert_eq!(uses_backed::macro_value(), 10 + 1);
+        assert_eq!(uses_backed::value(), 7 + 1 + 1);
+        assert_eq!(backed::value(), 7 + 1);
+        assert_eq!(backed::leafy!(), 10);
+    }
 
     #[test]
     fn a_subcrate_can_use_a_feature_perturbed_workspace_member() {
