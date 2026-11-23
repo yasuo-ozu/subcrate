@@ -1,9 +1,10 @@
 //! Test fixture for the workspace-member feature-unification case: a proc-macro
 //! crate that depends on `proc-macro2`, so a library depending on it carries
-//! `proc-macro2` in its graph on the host side. `subcrate`'s own build dependency
-//! turns on `proc-macro2/span-locations` there, which is what would give a member
-//! built without the owner in the nested selection a different hash — the bug
-//! `tests/owner.rs` guards against.
+//! `proc-macro2` in its graph on the host side. `subcrate`'s own build dependency,
+//! through its default `precise-diagnostics` feature, turns on
+//! `proc-macro2/span-locations` there, which is what would give a member built
+//! without the owner in the nested selection a different hash — the bug `member-test`
+//! guards against.
 
 use proc_macro::TokenStream;
 

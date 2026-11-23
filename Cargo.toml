@@ -24,16 +24,21 @@ subcrate-macros = { path = "macro", version = "0.2.3" }
 # so attribute-only users can opt out with `default-features = false`.
 subcrate-core = { path = "core", version = "0.2.3", optional = true }
 syn = { version = "2", features = ["full", "parsing", "printing"], optional = true }
-# `span-locations`: rewrite `<anon>` diagnostics to the user's real file and line.
-proc-macro2 = { version = "1", features = ["span-locations"], optional = true }
+proc-macro2 = { version = "1", optional = true }
 template-quote = { version = "0.3", optional = true }
 # Topological sort of subcrates (no `matrix`/`sprs`).
 safegraph = { version = "0.3", default-features = false, optional = true }
 
 [features]
-default = ["build"]
+default = ["build", "precise-diagnostics"]
 # Named directly (not `dep:`) to stay parseable at the 1.56 MSRV.
 build = ["subcrate-core", "syn", "proc-macro2", "template-quote", "safegraph"]
+# Rewrite a failing subcrate's `<anon>:line:col` diagnostics to the user's real file
+# and line. It turns on `proc-macro2/span-locations`, which Cargo unifies across every
+# crate in the graph it reaches (slowing their proc-macro work and changing
+# `proc_macro2::Span` behaviour). On by default; keep the build helper without it with
+# `default-features = false, features = ["build"]`.
+precise-diagnostics = ["build", "proc-macro2/span-locations"]
 
 [workspace]
 resolver = "2"

@@ -2,8 +2,8 @@
 //! depends on the proc-macro crate `pm`, so `proc-macro2` is in its graph. When a
 //! subcrate links this crate with `#[subcrate(::pm_user)]`, the nested build has to
 //! select the owner too, or `pm-user` is built with `proc-macro2/span-locations`
-//! off (the main build has it on through `subcrate`) and gets a different crate
-//! identity. See `tests/owner.rs`.
+//! off (the main build has it on through `subcrate`'s default `precise-diagnostics`
+//! feature) and gets a different crate identity. See `member-test`.
 
 pub use pm::identity;
 

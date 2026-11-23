@@ -80,8 +80,9 @@
 //! that might be a member of the same workspace. Under resolver 2, `cargo build -p
 //! <dep>` resolves features for the selected packages alone, so for a workspace
 //! member it would leave the owner out and drop any feature only the owner's graph
-//! turns on (its build-dependencies — this crate enables `proc-macro2/span-locations`
-//! — or, under `cargo test`, its dev-dependencies). The member would then be built
+//! turns on (its build-dependencies — `subcrate`'s default `precise-diagnostics`
+//! feature adds `proc-macro2/span-locations` — or, under `cargo test`, its
+//! dev-dependencies). The member would then be built
 //! with a different hash than the main build's copy, and a type would not match
 //! across the subcrate boundary (E0277). Selecting the owner unifies the two. A
 //! registry dependency is never a member and is already resolved in the owner's
@@ -889,8 +890,9 @@ impl Config {
         // Under resolver 2, `cargo build -p <dep>` resolves features for the selected
         // packages alone. For a workspace member that leaves the owner out of the
         // resolution, dropping any feature only the owner's graph turns on — its
-        // build-dependencies (`subcrate` enables `proc-macro2/span-locations`), or
-        // under `cargo test` its dev-dependencies. The member is then built with a
+        // build-dependencies (`subcrate`'s default `precise-diagnostics` feature adds
+        // `proc-macro2/span-locations`), or under `cargo test` its dev-dependencies.
+        // The member is then built with a
         // different feature set, and so a different metadata hash, than the main
         // build's copy, and a type crossing the subcrate boundary does not match it
         // (E0277, "there are multiple different versions of crate `…`"). Selecting
@@ -2722,8 +2724,9 @@ struct Subcrate {
     /// dependency resolution (see [`resolve_dependency`]).
     root: PathBuf,
     /// The file the `#[subcrate]` module is written in (the crate root, or a file
-    /// reached by `mod foo;`). Its tokens' spans point into this file, so a `rustc`
-    /// diagnostic on the generated source can be reported against it.
+    /// reached by `mod foo;`). Its tokens' spans point into this file, so under the
+    /// `precise-diagnostics` feature a `rustc` diagnostic on the generated source can
+    /// be reported against it.
     source_file: PathBuf,
     /// Whether the body pulled in other files via `mod foo;` (so its tokens span
     /// several files). When it did, spans cannot be mapped to one file, and
@@ -3734,8 +3737,10 @@ fn path_attr_value(attr: &Attribute) -> Option<String> {
 /// the original source line it came from — used to rewrite `rustc`'s `<anon>:L:C`
 /// diagnostics to the user's real file and line. The map is empty (so diagnostics
 /// keep the `<anon>` name) when `mappable` is false — the body was pulled from
-/// several files via `mod foo;`, whose spans would point at the wrong file — or
-/// when the pretty form fails to re-parse and the compact fallback is used.
+/// several files via `mod foo;`, whose spans would point at the wrong file — when
+/// the pretty form fails to re-parse and the compact fallback is used, and always
+/// when `subcrate` is built without the `precise-diagnostics` feature (then no span
+/// carries a location; see [`token_source_line`]).
 fn render_source(
     inner_attrs: &[Attribute],
     deps: &[ExternDep],
@@ -3793,6 +3798,21 @@ fn pretty_tokens(stream: &TokenStream) -> (String, Vec<Option<usize>>) {
     (pretty.out, pretty.map)
 }
 
+/// The original source line a token came from (1-based; `0` means "unknown", which
+/// [`Pretty::note`] ignores). `proc_macro2::Span::start` exists only under
+/// `proc-macro2`'s `span-locations` feature, which `subcrate`'s `precise-diagnostics`
+/// feature turns on. Without it there is no location to read, so every line maps to
+/// `0`, the generated→original map stays all-`None`, and diagnostics keep the
+/// generated `<anon>` name (see [`remap_diagnostics`]).
+#[cfg(feature = "precise-diagnostics")]
+fn token_source_line(tt: &TokenTree) -> usize {
+    tt.span().start().line
+}
+#[cfg(not(feature = "precise-diagnostics"))]
+fn token_source_line(_tt: &TokenTree) -> usize {
+    0
+}
+
 /// Builds the pretty-printed text and, in lock-step, the original source line of
 /// each output line.
 struct Pretty {
@@ -3823,7 +3843,7 @@ impl Pretty {
 
     fn write(&mut self, stream: TokenStream, depth: usize) {
         for tt in stream {
-            self.note(tt.span().start().line);
+            self.note(token_source_line(&tt));
             match tt {
                 TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => {
                     self.out.push('{');
@@ -3879,7 +3899,7 @@ impl Pretty {
 /// to the user's real `file:line:col`, using the generated-to-original line `map`
 /// from [`render_source`]. The column is `rustc`'s (into the generated source), so
 /// it is approximate; a line with no mapping keeps `<anon>`. A no-op when the map
-/// is empty (an unmappable subcrate).
+/// is empty (an unmappable subcrate, or a build without `precise-diagnostics`).
 fn remap_diagnostics(stderr: &str, map: &[Option<usize>], file: &str) -> String {
     const MARKER: &str = "<anon>:";
     if map.is_empty() {
@@ -3959,7 +3979,8 @@ struct CompileJob {
     display_name: String,
     proc_macro: bool,
     /// Generated line → original source line, for rewriting `<anon>` diagnostics
-    /// (see [`render_source`]). Empty when the subcrate is not mappable.
+    /// (see [`render_source`]). Empty when the subcrate is not mappable, or when
+    /// built without the `precise-diagnostics` feature.
     line_map: Vec<Option<usize>>,
     /// The user's source file the diagnostics are rewritten to name.
     source_file: String,
@@ -9473,6 +9494,10 @@ name = \"last\"
         assert_eq!(remap_diagnostics(stderr, &[], "src/lib.rs"), stderr);
     }
 
+    // The generated→original line map is populated only under `precise-diagnostics`
+    // (→ `proc-macro2/span-locations`); without it spans carry no location, so the
+    // map holds no mapping and diagnostics keep the `<anon>` name.
+    #[cfg(feature = "precise-diagnostics")]
     #[test]
     fn generated_lines_map_back_to_source_lines() {
         // `BADTOKEN` is on source line 3.
@@ -9489,6 +9514,19 @@ name = \"last\"
             Some(3),
             "source:\n{}\nmap: {:?}",
             source,
+            map
+        );
+    }
+
+    #[cfg(not(feature = "precise-diagnostics"))]
+    #[test]
+    fn without_precise_diagnostics_the_line_map_carries_no_location() {
+        let src = "fn f() -> u8 {\n    let x = 1;\n    BADTOKEN\n}\n";
+        let items = syn::parse_file(src).unwrap().items;
+        let (_source, map) = render_source(&[], &[], &items, true, false);
+        assert!(
+            map.iter().all(Option::is_none),
+            "expected no mappings without `precise-diagnostics`, got {:?}",
             map
         );
     }

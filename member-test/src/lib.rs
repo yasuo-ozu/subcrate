@@ -2,7 +2,7 @@
 //! `ISSUES-from-announce.md`): a subcrate links `::pm_user`, a member of this
 //! workspace whose graph carries a proc-macro and so `proc-macro2` on the host
 //! side, where this package's build dependency `subcrate` turns on
-//! `proc-macro2/span-locations`.
+//! `proc-macro2/span-locations` through its default `precise-diagnostics` feature.
 //!
 //! This package deliberately does **not** use the owner crate (`::member_test`), so
 //! the owner lands in the nested build's package selection only through the
