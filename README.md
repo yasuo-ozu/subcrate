@@ -253,10 +253,10 @@ edit/run loop is quicker than [`trybuild`] on the same compile-fail cases (24 ca
   `build.rustflags` from a config file still reaches them) and a library subcrate's for the
   target, so a `#![no_std]` library can have a proc-macro subcrate on `::syn`.
 - Such a crate must be a normal dependency that the package's resolution enables for that
-  platform. An optional one whose feature is off, or a dev-dependency, gives "did not match
-  any packages". A build-dependency only, or one a `[target.'cfg(…)'.dependencies]` table
-  leaves out, makes Cargo panic (the build says what to change). To keep it out of the
-  bare-metal build, declare it for the host only:
+  platform. An optional one whose feature is off gives "did not match any packages". A
+  dev-dependency is reported as one before the nested build runs. A build-dependency only, or
+  one a `[target.'cfg(…)'.dependencies]` table leaves out, makes Cargo panic (the build says
+  what to change). To keep it out of the bare-metal build, declare it for the host only:
 
   ```toml
   [target.'cfg(not(target_os = "none"))'.dependencies]

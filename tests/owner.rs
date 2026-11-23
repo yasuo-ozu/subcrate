@@ -254,3 +254,23 @@ pub mod owner_and_leaf {
 fn the_owner_crate_and_an_owner_dependency_can_be_used_together() {
     assert_eq!(owner_and_leaf::f(), 84);
 }
+
+// -- The owner's feature selection reaches its nested build (issue 2) -------------
+
+// The owner crate is rebuilt by a nested `cargo build` to link it into this
+// subcrate. That build must use the *outer* build's features, not the owner's
+// defaults: `owner_feature_on()` reflects the `owner_feature` feature the owner
+// was compiled with, and the test checks it against the feature state this test
+// crate itself was built with. Before the fix, a `--no-default-features` build
+// still linked an owner built with its defaults, so the two disagreed.
+#[subcrate(::subcrate_tests)]
+pub mod owner_feature_view {
+    pub fn on() -> bool {
+        subcrate_tests::owner_feature_on()
+    }
+}
+
+#[test]
+fn a_subcrate_sees_the_owners_feature_selection() {
+    assert_eq!(owner_feature_view::on(), cfg!(feature = "owner_feature"));
+}

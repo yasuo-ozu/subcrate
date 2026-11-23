@@ -28,5 +28,14 @@ subcrate-core = { path = "../core" }
 syn = "2"
 
 [features]
+# On by default, so the suite tells `--no-default-features` from the defaults.
+default = ["owner_feature"]
 # Gates tests whose subcrate body uses `mod foo;` (unstable in proc-macro input on stable).
 nightly = []
+# Regression for issue 2: a default-on feature of the owner, read by a subcrate
+# that links `::subcrate_tests`, to prove the owner's nested build honours the
+# outer build's features (owner.rs).
+owner_feature = []
+# Regression for issue 3: gates a `should_error` subcrate on a feature that is off
+# by default, which must then be skipped (not checked). See cfg_gate.rs.
+ui_case = []

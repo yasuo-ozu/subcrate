@@ -169,11 +169,13 @@
 //!
 //! Cargo builds `-p <dep>` only for a *normal dependency that the package's resolution
 //! switches on for the platform being built* (here the host's) and, as the nested build is
-//! `--offline`, only one in the local cache. An optional dependency whose feature is off, or a
-//! dev-dependency, is not in the dependency graph (`package ID specification … did not match
-//! any packages`). A build-dependency only, or one that a `[target.'cfg(…)'.dependencies]`
-//! table excludes, makes Cargo panic in its resolver (the nested build reports it, with a
-//! hint). A path dependency that is a workspace member is built whatever its features. For a
+//! `--offline`, only one in the local cache. An optional dependency whose feature is off is not
+//! in the dependency graph (`package ID specification … did not match any packages`). A
+//! dev-dependency is rejected before the nested build runs, with a message naming it as one (it
+//! would otherwise make Cargo panic in its resolver). A build-dependency only, or one that a
+//! `[target.'cfg(…)'.dependencies]` table excludes, makes Cargo panic in its resolver (the
+//! nested build reports it, with a hint). A path dependency that is a workspace member is built
+//! whatever its features. For a
 //! crate the bare-metal build must not compile, use a platform-gated normal dependency that
 //! the host satisfies (this also puts it in the lock file and the cache):
 //!
@@ -338,6 +340,14 @@ pub struct Config {
     /// selection. (Built-in target cfgs are set by `rustc` from `--target`;
     /// other custom cfgs arrive through `rustflags`.)
     feature_cfgs: Vec<String>,
+    /// The owning package's enabled feature names (`[features]` keys and
+    /// implicit optional-dependency features, `default` among them when Cargo
+    /// set it), named as a dependency on the package would. The in-place nested
+    /// `cargo build -p <owner>` forwards them as `--no-default-features
+    /// --features <owner>/<name>`, so it builds the owner with the outer build's
+    /// features — the same selection the packaged-crate stub bakes into its
+    /// dependency on the owner (see [`shadow_manifest`]).
+    feature_names: Vec<String>,
     extra_rustc_args: Vec<String>,
     /// The `cargo` running this build (`CARGO`), used to build the owner's
     /// dependencies for the subcrates that use them.
@@ -434,6 +444,13 @@ impl Config {
         let debug_assertions = std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some();
         let rustflags = decode_rustflags();
         let feature_cfgs = enabled_feature_cfgs(&manifest_dir);
+        // The enabled feature names, for forwarding to the in-place nested build
+        // (`cargo_args`). Read the same way the stub does (`enabled_features`),
+        // so the two agree on the owner's feature selection.
+        let feature_names = match std::fs::read_to_string(manifest_dir.join("Cargo.toml")) {
+            Ok(manifest) => enabled_features(&manifest, &|var| std::env::var_os(var).is_some()),
+            Err(_) => Vec::new(),
+        };
         let owner_deps_key = std::env::var("SUBCRATE_OWNER_DEPS_KEY")
             .ok()
             .filter(|s| !s.is_empty());
@@ -450,6 +467,7 @@ impl Config {
             debug_assertions,
             rustflags,
             feature_cfgs,
+            feature_names,
             extra_rustc_args: Vec::new(),
             cargo,
             package,
@@ -1029,6 +1047,22 @@ impl Config {
         let mut links_local_dep = false;
         for (name, user) in externals {
             let declared_dep = find_declared(&declared, name);
+            // A dev-dependency is not in the `cargo build` graph the nested build
+            // resolves, so selecting it makes Cargo panic in its resolver (it is
+            // neither `NormalOrDev` nor `HostDep` for a non-test build). Catch it
+            // here and say so, rather than let that panic surface. `find_declared`
+            // prefers a `[dependencies]`/`[build-dependencies]` entry, so this fires
+            // only when the crate is a dev-dependency and nothing else.
+            if declared_dep.map_or(false, |dep| dep.table == DependencyTable::Dev) {
+                return Err(Error::new(format!(
+                    "subcrate `{}` depends on `::{}`, but `{}` is a dev-dependency of this \
+                     package. The nested build that compiles a subcrate's dependencies \
+                     resolves them as `cargo build` does, which leaves out dev-dependencies, \
+                     so a subcrate can only use a normal dependency switched on for the \
+                     platform being built. Declare `{}` under `[dependencies]` as well.",
+                    user, name, name, name
+                )));
+            }
             links_local_dep |= declared_dep.map_or(false, |dep| self.is_local_dep(dep));
             let package = declared_dep.map(|dep| self.declared(dep));
             let resolved =
@@ -1424,6 +1458,25 @@ impl Config {
         if let Some(triple) = triple {
             args.push("--target".into());
             args.push(triple.into());
+        }
+        // Forward the outer build's features to the in-place nested build of the
+        // owner package, so `cargo build -p <owner>` builds it with the same
+        // features as the outer build rather than its defaults. `--no-default-features`
+        // plus `--features <owner>/<name>` mirrors the `default-features = false` /
+        // `features = […]` the packaged-crate stub already writes for its dependency
+        // on the owner (see `shadow_manifest`), and matches the `--cfg feature="…"`
+        // cast onto each subcrate's own `rustc` (see `rustc_args`). It is scoped to
+        // the owner with `<owner>/<name>` so co-selected dependencies keep the
+        // features the owner's graph gives them. The Shadow case carries features in
+        // its stub manifest, so it is left out here.
+        if packages.iter().any(|package| package == &self.package)
+            && matches!(self.nested_workspace(), NestedWorkspace::InPlace)
+        {
+            args.push("--no-default-features".into());
+            for name in &self.feature_names {
+                args.push("--features".into());
+                args.push(format!("{}/{}", self.package, name).into());
+            }
         }
         args
     }
@@ -2049,7 +2102,7 @@ fn nested_failure_hint(stderr: &str) -> Option<&'static str> {
         return Some(
             "The crate has to be a normal dependency that is switched on for the platform being \
              built (for a proc-macro subcrate, the host's): not an optional one whose feature \
-             is off, not a build-dependency only, and not one that a \
+             is off, not a dev-dependency, not a build-dependency only, and not one that a \
              `[target.'cfg(…)'.dependencies]` table excludes",
         );
     }
@@ -2788,10 +2841,12 @@ struct Discovered {
 /// `#[subcrate]` module.
 fn discover(manifest_dir: &Path, manifest: &str) -> Discovered {
     let mut walker = Walker::default();
-    for (file, mod_dir) in crate_roots(manifest_dir, manifest) {
+    for (file, mod_dir, test) in crate_roots(manifest_dir, manifest) {
         // Canonical so a subcrate's crate root compares equal to the owner's library
         // and to its siblings however each was spelled (see [`canonical_path`]).
         walker.root = canonical_path(&file);
+        // `cfg(test)` on a module is true only in a target built with `--test`.
+        walker.test_target = test;
         walker.walk_file(&file, &mod_dir);
     }
     walker.out
@@ -2813,7 +2868,11 @@ fn canonical_path(path: &Path) -> PathBuf {
 ///
 /// These are the targets Cargo builds: the library, the files found by place (unless
 /// the manifest turns that off, see [`AutoDiscovery`]) and every declared target.
-fn crate_roots(manifest_dir: &Path, manifest: &str) -> Vec<(PathBuf, PathBuf)> {
+///
+/// Each root carries whether its target is built with `--test` (an integration test
+/// or a benchmark), which is what `cfg(test)` means for the module attributes a build
+/// script can see (see [`Walker::eval_cfg`]).
+fn crate_roots(manifest_dir: &Path, manifest: &str) -> Vec<(PathBuf, PathBuf, bool)> {
     // Parse the `[package]` table once: auto-discovery and the package name both read it.
     let entries = package_entries(manifest);
     let auto = auto_discovery_from(&entries);
@@ -2824,27 +2883,27 @@ fn crate_roots(manifest_dir: &Path, manifest: &str) -> Vec<(PathBuf, PathBuf)> {
     // `[lib] path` is added below.
     let lib = src.join("lib.rs");
     if lib.is_file() {
-        roots.push((lib, src.clone()));
+        roots.push((lib, src.clone(), false));
     }
     if auto.bins {
         let main = src.join("main.rs");
         if main.is_file() {
-            roots.push((main, src.clone()));
+            roots.push((main, src.clone(), false));
         }
         // Binaries: `src/bin/*.rs` and `src/bin/<name>/main.rs`.
-        collect_root_dir(&src.join("bin"), &mut roots);
+        collect_root_dir(&src.join("bin"), false, &mut roots);
     }
     if auto.tests {
         // Integration tests: `tests/*.rs` and `tests/<name>/main.rs`.
-        collect_root_dir(&manifest_dir.join("tests"), &mut roots);
+        collect_root_dir(&manifest_dir.join("tests"), true, &mut roots);
     }
     if auto.benches {
         // Benchmarks: `benches/*.rs` and `benches/<name>/main.rs`.
-        collect_root_dir(&manifest_dir.join("benches"), &mut roots);
+        collect_root_dir(&manifest_dir.join("benches"), true, &mut roots);
     }
     if auto.examples {
         // Examples: `examples/*.rs` and `examples/<name>/main.rs`.
-        collect_root_dir(&manifest_dir.join("examples"), &mut roots);
+        collect_root_dir(&manifest_dir.join("examples"), false, &mut roots);
     }
 
     // Declared targets: `[lib] path`, `[[bin]]`, `[[test]]`, `[[bench]]`, `[[example]]`. A target may live
@@ -2852,6 +2911,7 @@ fn crate_roots(manifest_dir: &Path, manifest: &str) -> Vec<(PathBuf, PathBuf)> {
     // `Walker` dedups by canonical path, so an overlap with the defaults above compiles once.
     let package = package_name_from(&entries);
     for target in declared_targets(manifest) {
+        let test = target.kind == "test" || target.kind == "bench";
         let candidates = match &target.path {
             Some(path) => vec![manifest_dir.join(path)],
             None => default_target_files(
@@ -2865,7 +2925,7 @@ fn crate_roots(manifest_dir: &Path, manifest: &str) -> Vec<(PathBuf, PathBuf)> {
             let dir = file
                 .parent()
                 .map_or_else(|| manifest_dir.to_path_buf(), Path::to_path_buf);
-            roots.push((file, dir));
+            roots.push((file, dir, test));
         }
     }
 
@@ -3056,7 +3116,7 @@ fn default_target_files(
 
 /// Collects root files from a directory that may contain both `*.rs` files and
 /// `<name>/main.rs` subdirectories (the shape used by `src/bin` and `tests`).
-fn collect_root_dir(dir: &Path, roots: &mut Vec<(PathBuf, PathBuf)>) {
+fn collect_root_dir(dir: &Path, test: bool, roots: &mut Vec<(PathBuf, PathBuf, bool)>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return,
@@ -3064,11 +3124,11 @@ fn collect_root_dir(dir: &Path, roots: &mut Vec<(PathBuf, PathBuf)>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            roots.push((path, dir.to_path_buf()));
+            roots.push((path, dir.to_path_buf(), test));
         } else if path.is_dir() {
             let main = path.join("main.rs");
             if main.is_file() {
-                roots.push((main, path));
+                roots.push((main, path, test));
             }
         }
     }
@@ -3086,9 +3146,29 @@ struct Walker {
     current_file: PathBuf,
     /// Module path (from `root`) of the items currently being walked.
     mod_path: Vec<String>,
+    /// Whether the crate root being walked is built with `--test`, so
+    /// `cfg(test)` on a module is active (see [`crate_roots`]).
+    test_target: bool,
+    /// How many enclosing modules carry a `#[cfg(...)]` that could not be
+    /// decided: a subcrate found under one is built, but reported rather than
+    /// skipped silently (see [`eval_cfg_attrs`]).
+    unknown_cfg_depth: usize,
 }
 
 impl Walker {
+    /// Evaluates the `#[cfg(...)]` attributes on a module against the outer
+    /// build's configuration — the owning package's enabled features
+    /// (`CARGO_FEATURE_*`), the target cfgs Cargo exposes (`CARGO_CFG_*`), and
+    /// whether the crate root is a `--test` target. See [`eval_cfg_attrs`].
+    fn eval_cfg(&self, attrs: &[Attribute]) -> Cfg {
+        eval_cfg_attrs(
+            attrs,
+            &|name| std::env::var_os(feature_env_var(name)).is_some(),
+            &|name| std::env::var(cfg_env_var(name)).ok(),
+            self.test_target,
+        )
+    }
+
     fn walk_file(&mut self, path: &Path, mod_dir: &Path) {
         let key = canonical_path(path);
         if !self.visited.insert(key) {
@@ -3128,7 +3208,26 @@ impl Walker {
                 _ => continue,
             };
 
+            // Honour `#[cfg(...)]` on the module. One Cargo's configuration
+            // switches off is neither a subcrate to build and check nor a parent
+            // to descend into — the real compilation removes it entirely.
+            let cfg = self.eval_cfg(&module.attrs);
+            if cfg == Cfg::Inactive {
+                continue;
+            }
+
             if let Some(attr) = module.attrs.iter().find(|a| is_subcrate_attr(a)) {
+                // A `#[cfg]` we could not decide (here or on an enclosing module)
+                // leaves the subcrate built, as before this check existed, but
+                // says so rather than silently risking a false UI-test result.
+                if cfg == Cfg::Unknown || self.unknown_cfg_depth > 0 {
+                    warn(&format!(
+                        "subcrate: could not evaluate a `#[cfg(...)]` guarding `{}`; \
+                         building it anyway. Gate it on `feature = \"…\"` or `test` for \
+                         it to be skipped when configured out",
+                        module.ident
+                    ));
+                }
                 self.record_subcrate(module, attr, mod_dir);
                 // A subcrate is its own crate; do not descend into it.
                 continue;
@@ -3137,6 +3236,10 @@ impl Walker {
             let path_attr = module.attrs.iter().find_map(path_attr_value);
             // The module path follows the `mod` nesting, not `#[path]`.
             self.mod_path.push(module.ident.to_string());
+            // A subcrate under an undecided `#[cfg]` is reported, not skipped.
+            if cfg == Cfg::Unknown {
+                self.unknown_cfg_depth += 1;
+            }
             match &module.content {
                 Some((_, inner)) => {
                     // Inline module: children live under `<mod_dir>/<ident>`
@@ -3157,6 +3260,9 @@ impl Walker {
                         self.walk_file(&file, &child_dir);
                     }
                 }
+            }
+            if cfg == Cfg::Unknown {
+                self.unknown_cfg_depth -= 1;
             }
             self.mod_path.pop();
         }
@@ -3703,6 +3809,198 @@ fn is_rustversion_gate(attr: &Attribute) -> bool {
         ),
         _ => false,
     }
+}
+
+/// Whether a `#[cfg(...)]` predicate holds for the outer build, as far as a build
+/// script can tell (see [`eval_cfg_attrs`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cfg {
+    /// Definitely enabled — the module is compiled.
+    Active,
+    /// Definitely disabled — the module is configured out, so it is skipped.
+    Inactive,
+    /// Could not be decided (an unsupported or unparseable predicate).
+    Unknown,
+}
+
+impl Cfg {
+    fn from_bool(active: bool) -> Cfg {
+        if active {
+            Cfg::Active
+        } else {
+            Cfg::Inactive
+        }
+    }
+
+    /// `all(...)`, and the join of several `#[cfg]` attributes on one item:
+    /// `Inactive` if any operand is, else `Unknown` if any is, else `Active`.
+    fn and(self, other: Cfg) -> Cfg {
+        match (self, other) {
+            (Cfg::Inactive, _) | (_, Cfg::Inactive) => Cfg::Inactive,
+            (Cfg::Unknown, _) | (_, Cfg::Unknown) => Cfg::Unknown,
+            _ => Cfg::Active,
+        }
+    }
+
+    /// `any(...)`: `Active` if any operand is, else `Unknown` if any is, else `Inactive`.
+    fn or(self, other: Cfg) -> Cfg {
+        match (self, other) {
+            (Cfg::Active, _) | (_, Cfg::Active) => Cfg::Active,
+            (Cfg::Unknown, _) | (_, Cfg::Unknown) => Cfg::Unknown,
+            _ => Cfg::Inactive,
+        }
+    }
+
+    /// `not(...)`.
+    fn not(self) -> Cfg {
+        match self {
+            Cfg::Active => Cfg::Inactive,
+            Cfg::Inactive => Cfg::Active,
+            Cfg::Unknown => Cfg::Unknown,
+        }
+    }
+}
+
+/// Evaluates the combined `#[cfg(...)]` attributes on an item against the outer
+/// build's configuration. Non-`cfg` attributes are ignored; with no `#[cfg]` the
+/// item is [`Cfg::Active`]; several are AND-ed, as Rust does.
+///
+/// `has_feature` tells whether one of the owning package's features is enabled
+/// (from `CARGO_FEATURE_*`); `cfg_value` returns a `CARGO_CFG_<NAME>` value when
+/// set (`""` for a bare flag such as `unix`), which also tells a flag that is set
+/// from one that is not; `test` is whether the module's crate root is built with
+/// `--test`, which is what `cfg(test)` means to a build script (`CARGO_CFG_TEST`
+/// is never set).
+///
+/// Only `feature = "…"`, `test`, boolean/`"value"` target cfgs, and `all`/`any`/
+/// `not` of those are decided; anything else is [`Cfg::Unknown`]. An item is
+/// skipped only on a definite [`Cfg::Inactive`], never on `Unknown`, so an
+/// unrecognised predicate never silently drops a subcrate that should build.
+fn eval_cfg_attrs(
+    attrs: &[Attribute],
+    has_feature: &dyn Fn(&str) -> bool,
+    cfg_value: &dyn Fn(&str) -> Option<String>,
+    test: bool,
+) -> Cfg {
+    let mut result = Cfg::Active;
+    for attr in attrs {
+        if !attr.path().is_ident("cfg") {
+            continue;
+        }
+        let one = match attr.parse_args::<Meta>() {
+            Ok(meta) => eval_cfg_meta(&meta, has_feature, cfg_value, test),
+            Err(_) => Cfg::Unknown,
+        };
+        result = result.and(one);
+    }
+    result
+}
+
+/// Evaluates one `#[cfg]` predicate (a [`Meta`]). See [`eval_cfg_attrs`].
+fn eval_cfg_meta(
+    meta: &Meta,
+    has_feature: &dyn Fn(&str) -> bool,
+    cfg_value: &dyn Fn(&str) -> Option<String>,
+    test: bool,
+) -> Cfg {
+    match meta {
+        // `cfg(unix)`, `cfg(test)`, `cfg(true)`, `cfg(some_flag)`.
+        Meta::Path(path) => match path.get_ident() {
+            Some(ident) => eval_cfg_flag(&ident.to_string(), cfg_value, test),
+            None => Cfg::Unknown,
+        },
+        // `cfg(feature = "x")`, `cfg(target_os = "linux")`.
+        Meta::NameValue(nv) => {
+            let name = match nv.path.get_ident() {
+                Some(ident) => ident.to_string(),
+                None => return Cfg::Unknown,
+            };
+            let value = match &nv.value {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) => s.value(),
+                _ => return Cfg::Unknown,
+            };
+            eval_cfg_key_value(&name, &value, has_feature, cfg_value)
+        }
+        // `cfg(all(…))`, `cfg(any(…))`, `cfg(not(…))`.
+        Meta::List(list) => {
+            let name = match list.path.get_ident() {
+                Some(ident) => ident.to_string(),
+                None => return Cfg::Unknown,
+            };
+            let nested = match list.parse_args_with(
+                syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+            ) {
+                Ok(nested) => nested,
+                Err(_) => return Cfg::Unknown,
+            };
+            let mut evaluated = nested
+                .iter()
+                .map(|meta| eval_cfg_meta(meta, has_feature, cfg_value, test));
+            match name.as_str() {
+                "all" => evaluated.fold(Cfg::Active, Cfg::and),
+                "any" => evaluated.fold(Cfg::Inactive, Cfg::or),
+                "not" => match (nested.len(), evaluated.next()) {
+                    (1, Some(inner)) => inner.not(),
+                    _ => Cfg::Unknown,
+                },
+                _ => Cfg::Unknown,
+            }
+        }
+    }
+}
+
+/// A bare `#[cfg(flag)]` predicate.
+fn eval_cfg_flag(name: &str, cfg_value: &dyn Fn(&str) -> Option<String>, test: bool) -> Cfg {
+    match name {
+        // `CARGO_CFG_TEST` is never set for a build script, so this is decided by
+        // the target kind (see [`crate_roots`]).
+        "test" => Cfg::from_bool(test),
+        "true" => Cfg::Active,
+        "false" => Cfg::Inactive,
+        // `cfg(doc)`/`cfg(doctest)` are added by rustdoc, invisible to a build
+        // script, so leave them undecided rather than wrongly skipping.
+        "doc" | "doctest" => Cfg::Unknown,
+        // A boolean target cfg (`unix`, `windows`, …) or a `--cfg flag`: Cargo
+        // exposes it as `CARGO_CFG_<NAME>` (empty value) exactly when it is on.
+        _ => Cfg::from_bool(cfg_value(name).is_some()),
+    }
+}
+
+/// A `#[cfg(name = "value")]` predicate.
+fn eval_cfg_key_value(
+    name: &str,
+    value: &str,
+    has_feature: &dyn Fn(&str) -> bool,
+    cfg_value: &dyn Fn(&str) -> Option<String>,
+) -> Cfg {
+    if name == "feature" {
+        return Cfg::from_bool(has_feature(value));
+    }
+    match cfg_value(name) {
+        // Some `CARGO_CFG_*` are comma lists (`target_feature`, `target_family`,
+        // `target_has_atomic`); `name = "v"` holds if `v` is one of the values.
+        Some(env) => Cfg::from_bool(env.split(',').any(|item| item == value)),
+        // A cfg key Cargo never set: Rust reads `cfg(key = "v")` as false, and so
+        // does the real compilation here.
+        None => Cfg::Inactive,
+    }
+}
+
+/// The `CARGO_CFG_<NAME>` variable Cargo sets for cfg `name` (uppercased, every
+/// non-alphanumeric byte replaced by `_`), mirroring [`feature_env_var`].
+fn cfg_env_var(name: &str) -> String {
+    let mut var = String::from("CARGO_CFG_");
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            var.push(ch.to_ascii_uppercase());
+        } else {
+            var.push('_');
+        }
+    }
+    var
 }
 
 fn path_attr_value(attr: &Attribute) -> Option<String> {
@@ -6104,6 +6402,7 @@ mod tests {
             debug_assertions: true,
             rustflags: Vec::new(),
             feature_cfgs: Vec::new(),
+            feature_names: Vec::new(),
             extra_rustc_args: Vec::new(),
             cargo: PathBuf::from("cargo"),
             package: "owner".to_string(),
@@ -8558,7 +8857,7 @@ name = \"last\"
         }
         let mut roots: Vec<String> = crate_roots(&dir, manifest)
             .into_iter()
-            .map(|(file, _)| {
+            .map(|(file, _, _)| {
                 file.strip_prefix(&dir)
                     .unwrap()
                     .to_string_lossy()
@@ -9565,5 +9864,247 @@ name = \"last\"
         ] {
             assert!(!is_gate(src), "should not be a gate: {}", src);
         }
+    }
+
+    /// Evaluates the `#[cfg]` on the module written as `module_src` (e.g.
+    /// `"#[cfg(feature = \"a\")] mod m {}"`) with the given enabled `features`,
+    /// `CARGO_CFG_<NAME>` lookups (`cfgs`), and `test` target kind.
+    fn eval_cfg_of(module_src: &str, features: &[&str], cfgs: &[(&str, &str)], test: bool) -> Cfg {
+        let m: syn::ItemMod = syn::parse_str(module_src).unwrap();
+        eval_cfg_attrs(
+            &m.attrs,
+            &|name| features.contains(&name),
+            &|name| {
+                cfgs.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            },
+            test,
+        )
+    }
+
+    #[test]
+    fn a_cfg_feature_gate_is_evaluated_against_the_enabled_features() {
+        assert_eq!(
+            eval_cfg_of("#[cfg(feature = \"a\")] mod m {}", &["a"], &[], false),
+            Cfg::Active
+        );
+        assert_eq!(
+            eval_cfg_of("#[cfg(feature = \"a\")] mod m {}", &[], &[], false),
+            Cfg::Inactive
+        );
+        // No `#[cfg]` at all: always active.
+        assert_eq!(eval_cfg_of("mod m {}", &[], &[], false), Cfg::Active);
+    }
+
+    #[test]
+    fn a_cfg_test_gate_follows_the_target_kind() {
+        assert_eq!(
+            eval_cfg_of("#[cfg(test)] mod m {}", &[], &[], true),
+            Cfg::Active
+        );
+        assert_eq!(
+            eval_cfg_of("#[cfg(test)] mod m {}", &[], &[], false),
+            Cfg::Inactive
+        );
+    }
+
+    #[test]
+    fn cfg_combinators_and_target_cfgs_are_evaluated() {
+        let cfgs = &[
+            ("unix", ""),
+            ("target_os", "linux"),
+            ("target_family", "unix"),
+        ][..];
+        assert_eq!(
+            eval_cfg_of(
+                "#[cfg(all(unix, feature = \"a\"))] mod m {}",
+                &["a"],
+                cfgs,
+                false
+            ),
+            Cfg::Active
+        );
+        assert_eq!(
+            eval_cfg_of(
+                "#[cfg(all(unix, feature = \"a\"))] mod m {}",
+                &[],
+                cfgs,
+                false
+            ),
+            Cfg::Inactive
+        );
+        assert_eq!(
+            eval_cfg_of(
+                "#[cfg(any(windows, feature = \"a\"))] mod m {}",
+                &["a"],
+                cfgs,
+                false
+            ),
+            Cfg::Active
+        );
+        assert_eq!(
+            eval_cfg_of(
+                "#[cfg(any(windows, feature = \"b\"))] mod m {}",
+                &["a"],
+                cfgs,
+                false
+            ),
+            Cfg::Inactive
+        );
+        assert_eq!(
+            eval_cfg_of("#[cfg(not(feature = \"a\"))] mod m {}", &[], cfgs, false),
+            Cfg::Active
+        );
+        // `name = "value"` matches a value in a comma list and a plain value.
+        assert_eq!(
+            eval_cfg_of("#[cfg(target_os = \"linux\")] mod m {}", &[], cfgs, false),
+            Cfg::Active
+        );
+        assert_eq!(
+            eval_cfg_of("#[cfg(target_os = \"windows\")] mod m {}", &[], cfgs, false),
+            Cfg::Inactive
+        );
+        assert_eq!(
+            eval_cfg_of(
+                "#[cfg(target_family = \"unix\")] mod m {}",
+                &[],
+                cfgs,
+                false
+            ),
+            Cfg::Active
+        );
+        // A bare flag is active when present, inactive when absent.
+        assert_eq!(
+            eval_cfg_of("#[cfg(unix)] mod m {}", &[], cfgs, false),
+            Cfg::Active
+        );
+        assert_eq!(
+            eval_cfg_of("#[cfg(windows)] mod m {}", &[], cfgs, false),
+            Cfg::Inactive
+        );
+    }
+
+    #[test]
+    fn several_cfg_attributes_are_anded() {
+        assert_eq!(
+            eval_cfg_of(
+                "#[cfg(feature = \"a\")] #[cfg(unix)] mod m {}",
+                &["a"],
+                &[("unix", "")],
+                false
+            ),
+            Cfg::Active
+        );
+        assert_eq!(
+            eval_cfg_of(
+                "#[cfg(feature = \"a\")] #[cfg(windows)] mod m {}",
+                &["a"],
+                &[],
+                false
+            ),
+            Cfg::Inactive
+        );
+    }
+
+    #[test]
+    fn an_unknown_cfg_key_is_inactive_but_doc_is_left_undecided() {
+        // A cfg key Cargo never set reads as false, as Rust itself would.
+        assert_eq!(
+            eval_cfg_of("#[cfg(made_up = \"x\")] mod m {}", &[], &[], false),
+            Cfg::Inactive
+        );
+        // `doc`/`doctest` are added by rustdoc and invisible here, so undecided
+        // (the module is kept, not skipped).
+        assert_eq!(
+            eval_cfg_of("#[cfg(doc)] mod m {}", &[], &[], false),
+            Cfg::Unknown
+        );
+    }
+
+    #[test]
+    fn the_in_place_nested_build_forwards_the_owners_features_scoped_to_it() {
+        let args = |config: &Config, packages: &[&str]| -> Vec<String> {
+            let packages: Vec<String> = packages.iter().map(|s| s.to_string()).collect();
+            config
+                .cargo_args(&packages, Path::new("t"), false)
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        let mut config = config();
+        config.feature_names = vec!["default".to_string(), "alloc".to_string()];
+        // When the owner is in the selection, its enabled features are forwarded,
+        // scoped to it with `<owner>/<feature>`, next to `--no-default-features`.
+        let with_owner = args(&config, &["serde", "owner"]);
+        assert!(
+            with_owner.contains(&"--no-default-features".to_string()),
+            "{:?}",
+            with_owner
+        );
+        assert!(
+            with_owner.contains(&"owner/alloc".to_string()),
+            "{:?}",
+            with_owner
+        );
+        assert!(
+            with_owner.contains(&"owner/default".to_string()),
+            "{:?}",
+            with_owner
+        );
+        // Scoped to the owner, so co-selected dependencies keep their own features.
+        assert!(
+            !with_owner
+                .iter()
+                .any(|arg| arg == "serde/alloc" || arg == "alloc"),
+            "{:?}",
+            with_owner
+        );
+        // When the owner is not selected (registry deps only), nothing is forwarded.
+        let without_owner = args(&config, &["serde"]);
+        assert!(
+            !without_owner.contains(&"--no-default-features".to_string()),
+            "{:?}",
+            without_owner
+        );
+        assert!(
+            !without_owner.iter().any(|arg| arg.starts_with("owner/")),
+            "{:?}",
+            without_owner
+        );
+    }
+
+    #[test]
+    fn a_dev_dependency_used_by_a_subcrate_is_reported_before_the_nested_build() {
+        let dir = std::env::temp_dir().join(format!("subcrate-devdep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nbar = \"1\"\n\n\
+             [dev-dependencies]\nserde_json = \"1\"\n",
+        )
+        .unwrap();
+
+        let mut config = config();
+        config.manifest_dir = dir.clone();
+        config.package = "p".to_string();
+        let externals: BTreeMap<&str, String> = [("serde_json", "uses_devdep".to_string())]
+            .into_iter()
+            .collect();
+        // No lock file is needed: the dev-dependency is caught from the manifest
+        // before any version resolution.
+        let err = match config.resolve_externals(&externals, &None) {
+            Err(err) => err,
+            Ok(_) => panic!("expected a dev-dependency error"),
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            err.message.contains("dev-dependency") && err.message.contains("serde_json"),
+            "expected a clear dev-dependency error, got: {}",
+            err.message
+        );
     }
 }

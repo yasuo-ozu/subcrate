@@ -56,3 +56,11 @@ pub mod nested {
 pub fn calculate() -> usize {
     my_crate::calc() + nested::inner::answer()
 }
+
+/// Whether this library was built with the (default-on) `owner_feature` feature.
+/// A subcrate that links `::subcrate_tests` reads this to prove the owner's nested
+/// build uses the outer build's features, not the owner's defaults (regression for
+/// issue 2; see `tests/owner.rs`).
+pub fn owner_feature_on() -> bool {
+    cfg!(feature = "owner_feature")
+}
