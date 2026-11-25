@@ -152,7 +152,12 @@ fn try_run(case: &Case) -> Result<(), String> {
 
     let should_errors: Vec<Option<String>> = owned_opts(case.expect.should_errors);
     let should_warns: Vec<Option<String>> = owned_opts(case.expect.should_warns);
-    let should_spanned: Vec<String> = case.expect.should_spanned.iter().map(|s| s.to_string()).collect();
+    let should_spanned: Vec<String> = case
+        .expect
+        .should_spanned
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
     crate::build::ui_check_from_json(
         output.status.success(),
@@ -224,8 +229,13 @@ fn scratch_dir(name: &str) -> Result<PathBuf, String> {
         std::process::id(),
         sanitize(name)
     ));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("could not create a scratch directory ({}): {}", dir.display(), e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "could not create a scratch directory ({}): {}",
+            dir.display(),
+            e
+        )
+    })?;
     Ok(dir)
 }
 
