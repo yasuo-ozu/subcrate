@@ -38,31 +38,35 @@ dependency tree never enters this crate's 1.56-locked `Cargo.lock`.
 
 ## Results
 
-Illustrative run — 24 cases, 20-core Linux, `rustc 1.101.0-nightly`. Absolute
-numbers depend heavily on the machine and toolchain; the *ratios* are the point.
+Illustrative run — 24 cases, 20-core Linux (heavily oversubscribed: 24 parallel
+case compiles), `rustc 1.101.0-nightly`. The sub-second rows swing from run to run
+under that load, so these are the best (min) of several runs; absolute numbers
+depend on the machine and toolchain, and the *ratios* are the point.
 
 | scenario (seconds)              | subcrate    | trybuild    |
 |---------------------------------|-------------|-------------|
-| cold (incl. framework build)    | 21.3        | **19.5**    |
-| no-op re-run (min)              | **0.29**    | 1.09        |
-| one case edited (min)           | **0.82**    | 1.08        |
-| all 24 cases rebuilt (min)      | **0.91**    | 1.08        |
+| cold (incl. framework build)    | 24.58       | **11.11**   |
+| no-op re-run (min)              | **0.13**    | 0.43        |
+| one case edited (min)           | 0.41        | 0.33        |
+| all 24 cases rebuilt (min)      | 0.34        | 0.32        |
 
 Reading it:
 
-- **Cold is close, trybuild just ahead.** The crate here depends on `subcrate`
-  with `default-features = false` (only the attribute is needed at compile time),
-  so the build helper compiles once. What remains is two full `syn` builds — `v2`
-  for the helper and `v1` dragged in by `template-quote`'s older `proc-quote` /
-  `proc-macro-error` chain — plus `safegraph` for the dependency toposort, against
-  trybuild's single derive-only `syn` and serde. A one-time, amortized cost; drop
-  the `syn v1` chain from `template-quote` and the two would be level.
-- **The warm dev loop is subcrate's.** With dependencies built, subcrate has no
-  per-run nested-`cargo` startup and skips unchanged cases by content hash, so a
-  no-op re-run is ~3–4× faster and a single-case edit noticeably faster. trybuild
-  pays a roughly fixed nested-`cargo` cost (~1 s here) on every run.
-- **Bulk recompiles slightly favor subcrate** — both ask `rustc` to compile *N*
-  crates and both parallelize, but subcrate skips the nested-`cargo` layer.
+- **Cold favors trybuild (~2×).** The crate here depends on `subcrate` with
+  `default-features = false` (only the attribute is needed at compile time), so the
+  build helper compiles once. What remains is two full `syn` builds — `v2` for the
+  helper and `v1` dragged in by `template-quote`'s older `proc-quote` /
+  `proc-macro-error` chain — plus `safegraph` for the dependency toposort: a heavier
+  tree than trybuild's `serde` / `toml` / `syn`. A one-time, amortized cost;
+  dropping the `syn v1` chain from `template-quote` would narrow it.
+- **The no-op re-run is subcrate's clear win.** With dependencies built, subcrate
+  has no per-run nested-`cargo` startup and skips unchanged cases by content hash,
+  so re-running with nothing changed (the "did my other edit break a test?" loop)
+  is several times faster. trybuild spawns a nested `cargo` on every run.
+- **Actual recompiles are a wash.** Editing one case or rebuilding all *N* land
+  within noise of trybuild here: both ultimately hand *N* (or one) crates to
+  `rustc` and parallelize, so on this oversubscribed machine the sub-second
+  differences aren't meaningful.
 
 ## Fairness notes
 
