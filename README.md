@@ -218,16 +218,17 @@ forwarded as build warnings. A UI-test subcrate is compiled with its lints cappe
 
 Because the checks run at build time rather than from a separate test, a warm
 re-run with nothing changed is several times quicker than [`trybuild`] on the same
-compile-fail cases; actual recompiles come out about even, and the one-time cold
-build costs more (24 cases, `rustc 1.101.0-nightly`; machine-dependent, so the
-ratios are the point — [details][bench]):
+compile-fail cases; a bulk rebuild edges ahead too, a single-case edit is about
+even, and the one-time cold build is now roughly level (24 cases,
+`rustc 1.101.0-nightly`, `safegraph 0.3.2` with the `macros` feature off;
+machine-dependent, so the ratios are the point — [details][bench]):
 
 | scenario (seconds)                | subcrate    | trybuild    |
 |-----------------------------------|-------------|-------------|
-| cold (incl. framework build)      | 24.58       | 11.11       |
-| no-op re-run (min / mean)         | 0.13 / 0.15 | 0.43 / 0.61 |
-| one case edited (min / mean)      | 0.41 / 0.52 | 0.33 / 0.49 |
-| all 24 cases rebuilt (min / mean) | 0.34 / 0.42 | 0.32 / 0.49 |
+| cold (incl. framework build)      | ~10.6       | ~8.2        |
+| no-op re-run (min / mean)         | 0.18 / 0.29 | 0.52 / 0.67 |
+| one case edited (min / mean)      | 0.75 / 1.01 | 0.74 / 1.32 |
+| all 24 cases rebuilt (min / mean) | 0.47 / 0.59 | 0.85 / 1.27 |
 
 [`trybuild`]: https://crates.io/crates/trybuild
 [bench]: https://github.com/yasuo-ozu/subcrate/tree/main/benchmarks

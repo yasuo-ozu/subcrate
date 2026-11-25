@@ -39,37 +39,39 @@ dependency tree never enters this crate's 1.56-locked `Cargo.lock`.
 ## Results
 
 Illustrative run — 24 cases, 20-core Linux (heavily oversubscribed: 24 parallel
-case compiles), `rustc 1.101.0-nightly`. The sub-second rows swing from run to run
-under that load, so these are the best (min) of several runs; absolute numbers
-depend on the machine and toolchain, and the *ratios* are the point.
+case compiles), `rustc 1.101.0-nightly`, with `safegraph 0.3.2` (`macros` feature
+off) and `template-quote 0.5`. The warm rows are the best (min) of several runs;
+cold is the median of several true clean builds, because the in-script cold row is
+a single, wildly swinging sample. Absolute numbers depend on the machine and
+toolchain — the *ratios* are the point.
 
 | scenario (seconds)              | subcrate    | trybuild    |
 |---------------------------------|-------------|-------------|
-| cold (incl. framework build)    | 24.58       | **11.11**   |
-| no-op re-run (min)              | **0.13**    | 0.43        |
-| one case edited (min)           | 0.41        | 0.33        |
-| all 24 cases rebuilt (min)      | 0.34        | 0.32        |
+| cold (incl. framework build)    | ~10.6       | ~8.2        |
+| no-op re-run (min)              | **0.18**    | 0.52        |
+| one case edited (min)           | 0.75        | 0.74        |
+| all 24 cases rebuilt (min)      | **0.47**    | 0.85        |
 
 Reading it:
 
-- **Cold favors trybuild (~2×).** The crate here depends on `subcrate` with
+- **Cold is now roughly level.** The crate here depends on `subcrate` with
   `default-features = false` (only the attribute is needed at compile time), so the
-  build helper compiles once. What remains is two full `syn` builds — `v2` for the
-  helper and `v1` pulled in by `safegraph`'s macro crate (`safegraph-macros` →
-  `proc-macro-error` / `template-quote 0.4`) — plus `safegraph` itself for the
-  dependency toposort: a heavier tree than trybuild's `serde` / `toml` / `syn`. A
-  one-time, amortized cost. (The cold row is a single sample and swings widely run
-  to run; a true clean build is ~15–30 s here.) The `syn v1` root is `safegraph`,
-  so moving its macro crate off `proc-macro-error` onto `template-quote 0.5` is what
-  would narrow it — subcrate's own `template-quote` is already on `0.5`.
+  build helper compiles once. It used to compile **two** full `syn` majors — `v2`
+  for the helper and `v1` dragged in by `safegraph`'s macro crate
+  (`safegraph-macros` → `proc-macro-error`). `safegraph 0.3.2` puts that macro crate
+  behind a non-default `macros` feature, and subcrate — which uses only safegraph's
+  toposort, not its `graph!` macro — doesn't enable it, so `syn v1` is gone and only
+  `syn v2` remains. That roughly halves the cold build and brings it level with
+  trybuild's `serde` / `toml` / `syn` tree. A one-time, amortized cost either way.
 - **The no-op re-run is subcrate's clear win.** With dependencies built, subcrate
   has no per-run nested-`cargo` startup and skips unchanged cases by content hash,
   so re-running with nothing changed (the "did my other edit break a test?" loop)
   is several times faster. trybuild spawns a nested `cargo` on every run.
-- **Actual recompiles are a wash.** Editing one case or rebuilding all *N* land
-  within noise of trybuild here: both ultimately hand *N* (or one) crates to
-  `rustc` and parallelize, so on this oversubscribed machine the sub-second
-  differences aren't meaningful.
+- **Recompiles are comparable.** A single-case edit is about even and a full
+  rebuild edges to subcrate: both hand *N* (or one) crates to `rustc` and
+  parallelize, but subcrate skips trybuild's nested-`cargo` layer, which tells more
+  on a bulk rebuild. The sub-second gaps are noisy — read them as "subcrate no
+  worse," not a decisive win.
 
 ## Fairness notes
 
