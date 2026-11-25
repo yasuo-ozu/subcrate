@@ -55,10 +55,13 @@ Reading it:
 - **Cold favors trybuild (~2×).** The crate here depends on `subcrate` with
   `default-features = false` (only the attribute is needed at compile time), so the
   build helper compiles once. What remains is two full `syn` builds — `v2` for the
-  helper and `v1` dragged in by `template-quote`'s older `proc-quote` /
-  `proc-macro-error` chain — plus `safegraph` for the dependency toposort: a heavier
-  tree than trybuild's `serde` / `toml` / `syn`. A one-time, amortized cost;
-  dropping the `syn v1` chain from `template-quote` would narrow it.
+  helper and `v1` pulled in by `safegraph`'s macro crate (`safegraph-macros` →
+  `proc-macro-error` / `template-quote 0.4`) — plus `safegraph` itself for the
+  dependency toposort: a heavier tree than trybuild's `serde` / `toml` / `syn`. A
+  one-time, amortized cost. (The cold row is a single sample and swings widely run
+  to run; a true clean build is ~15–30 s here.) The `syn v1` root is `safegraph`,
+  so moving its macro crate off `proc-macro-error` onto `template-quote 0.5` is what
+  would narrow it — subcrate's own `template-quote` is already on `0.5`.
 - **The no-op re-run is subcrate's clear win.** With dependencies built, subcrate
   has no per-run nested-`cargo` startup and skips unchanged cases by content hash,
   so re-running with nothing changed (the "did my other edit break a test?" loop)

@@ -15,4 +15,4 @@ path = "lib.rs"
 subcrate-core = { path = "../core", version = "0.3.0" }
 syn = { version = "2", features = ["full", "parsing", "printing"] }
 proc-macro2 = "1"
-template-quote = "0.3"
+template-quote = "0.5"
