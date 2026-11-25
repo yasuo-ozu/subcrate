@@ -12,7 +12,7 @@ build = false
 # Integration tests are their own package (`subcrate-tests`, ./tests).
 autotests = false
 # Nested test/benchmark packages (and the `tests` symlink) are not published.
-exclude = ["/tests", "/benchmarks", "/member-test"]
+exclude = ["/tests", "/benchmarks", "/member-test", "/ui-test"]
 
 [lib]
 path = "lib.rs"
@@ -47,6 +47,7 @@ members = [
     "macro",
     "tests",
     "member-test",
+    "ui-test",
     "examples/backed",
     "examples/custom-layout",
     "examples/doc-macros",
@@ -64,6 +65,7 @@ default-members = [
     "macro",
     "tests",
     "member-test",
+    "ui-test",
     "examples/backed",
     "examples/custom-layout",
     "examples/doc-macros",

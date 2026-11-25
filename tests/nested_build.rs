@@ -761,7 +761,7 @@ mod registry {
                 (
                     "",
                     "subcrate",
-                    &["lib.rs", "build.rs", "README.md", "LICENSE"][..],
+                    &["lib.rs", "build.rs", "ui.rs", "README.md", "LICENSE"][..],
                 ),
                 ("core", "subcrate-core", &["lib.rs"]),
                 ("macro", "subcrate-macros", &["lib.rs"]),

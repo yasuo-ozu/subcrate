@@ -4418,6 +4418,34 @@ fn run_ui_check(job: &CompileJob, success: bool, stderr: &[u8]) -> Result<Option
     Err(message)
 }
 
+/// Parses rustc's `--error-format=json` `stderr` and checks it against the
+/// `should_*` expectations, shared by the build-time helper (via [`run_ui_check`])
+/// and the test-time harness ([`crate::ui`]). Returns `Ok(())` when every
+/// expectation holds, or a human message listing the unmet ones next to rustc's
+/// own rendered diagnostics. `success` is whether `rustc` exited successfully.
+pub(crate) fn ui_check_from_json(
+    success: bool,
+    stderr: &str,
+    should_errors: &[Option<String>],
+    should_warns: &[Option<String>],
+    should_spanned: &[String],
+) -> Result<(), String> {
+    let diags = parse_rustc_json(stderr);
+    let problems = check_ui(success, &diags, should_errors, should_warns, should_spanned);
+    if problems.is_empty() {
+        return Ok(());
+    }
+    let mut message = String::from("did not match its UI-test expectations:\n");
+    message.push_str(&indent(&problems.join("\n")));
+    if diags.rendered.trim().is_empty() {
+        message.push_str("\n\n(it produced no diagnostics)");
+    } else {
+        message.push_str("\n\nactual diagnostics:\n");
+        message.push_str(&indent(diags.rendered.trim_end()));
+    }
+    Err(message)
+}
+
 /// Diagnostics parsed from rustc's JSON output, as [`run_ui_check`] needs them.
 struct UiDiagnostics {
     /// The rendered (human) text of each error-level diagnostic.
@@ -5406,7 +5434,7 @@ struct ExternalCrate {
 /// recent nightly under `build/<pkg>/<hash>/out/`. The crate name runs up to the
 /// last `-` (a crate name has no `-`, a hash is hex); should several builds of one
 /// crate be left over, the newest is the one Cargo's own linking would pick.
-fn scan_build_artifacts(base: &Path) -> (BTreeMap<String, PathBuf>, BTreeSet<PathBuf>) {
+pub(crate) fn scan_build_artifacts(base: &Path) -> (BTreeMap<String, PathBuf>, BTreeSet<PathBuf>) {
     let mut rlibs: BTreeMap<String, (std::time::SystemTime, PathBuf)> = BTreeMap::new();
     let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
     let mut stack = vec![base.to_path_buf()];

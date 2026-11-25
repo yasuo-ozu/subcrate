@@ -47,6 +47,17 @@ fn expand(args: Args, item_mod: ItemMod) -> syn::Result<proc_macro2::TokenStream
 
     let internal = internal_crate_name(&ident.to_string(), &args, &inner, items);
 
+    // No build helper ran (no `build.rs` calling `subcrate::build::compile()`), and
+    // this subcrate is expected to fail to compile. A `should_error` subcrate is
+    // never linked, so it does not need the build script's real crate linking: check
+    // it at test time instead, expanding to a `#[test]` (see `subcrate::ui`). Every
+    // other subcrate — a linked one, or a `should_warn`/`should_spanned` one that
+    // compiles and is usable — still needs the helper, and falls through to the
+    // `verify_built` error below when it did not run.
+    if args.expects_error() && manifest_dir().is_none() {
+        return expand_harness(&args, &item_mod, items, &inner);
+    }
+
     // Confirm the build helper actually ran for this package and compiled this
     // module. If it did not, produce a clear, actionable error instead of a
     // cryptic "can't find crate" from the linker.
@@ -131,6 +142,106 @@ fn expand(args: Args, item_mod: ItemMod) -> syn::Result<proc_macro2::TokenStream
             #doc_surface
         }
     })
+}
+
+/// Expands a `#[subcrate(should_error …)]` module into a `#[test]` that compiles its
+/// body and asserts its diagnostics at test time (see [`subcrate::ui`]), used when
+/// no build helper ran. The checked case is never linked, so this needs no build
+/// script — `subcrate` can be a `[dev-dependencies]` entry. A `proc_macro` subcrate
+/// and a sibling-subcrate dependency are build-script-mode features and are rejected
+/// with a message pointing at `build.rs`.
+fn expand_harness(
+    args: &Args,
+    item_mod: &ItemMod,
+    items: &[syn::Item],
+    inner: &[syn::Attribute],
+) -> syn::Result<proc_macro2::TokenStream> {
+    if args.proc_macro {
+        return Err(syn::Error::new_spanned(
+            item_mod,
+            "a `proc_macro` subcrate cannot be checked without a build script; add a \
+             `build.rs` calling `subcrate::build::compile()` (and `subcrate` under \
+             `[build-dependencies]`) to compile it.",
+        ));
+    }
+    for dep in &args.deps {
+        if !dep.external {
+            return Err(syn::Error::new_spanned(
+                item_mod,
+                format!(
+                    "without a build script a `should_error` subcrate can only depend on \
+                     external crates (`::name`), not the sibling subcrate `{}`; add a \
+                     `build.rs` calling `subcrate::build::compile()` to use sibling subcrates.",
+                    dep.path_display()
+                ),
+            ));
+        }
+    }
+
+    let ident = &item_mod.ident;
+    let name = ident.to_string();
+    // Outer attributes (notably `#[cfg(..)]`) carry over to the generated test, so a
+    // configured-out case produces no test rather than a checked one.
+    let outer_attrs: Vec<&syn::Attribute> = item_mod
+        .attrs
+        .iter()
+        .filter(|attr| matches!(attr.style, syn::AttrStyle::Outer))
+        .collect();
+
+    // The crate-root source compiled for the case: crate-level inner attributes
+    // first, then the items, as written. It is embedded as a string and compiled by
+    // `rustc` at test time, never as live code here — so a `should_error` body does
+    // not break this crate's own build.
+    let body_src = quote! { #(#inner)* #(#items)* }.to_string();
+
+    let deps: Vec<proc_macro2::TokenStream> = args
+        .deps
+        .iter()
+        .map(|dep| {
+            let alias = &dep.alias;
+            // An external dependency is a bare crate name; link it by its own name.
+            let krate = dep.path.first().cloned().unwrap_or_default();
+            quote! { ::subcrate::ui::Dep { alias: #alias, krate: #krate } }
+        })
+        .collect();
+
+    let should_errors = ui_opts(&args.ui.should_errors);
+    let should_warns = ui_opts(&args.ui.should_warns);
+    let should_spanned = &args.ui.should_spanned;
+
+    let edition = match &args.edition {
+        Some(e) => quote! { ::core::option::Option::Some(#e) },
+        None => quote! { ::core::option::Option::None },
+    };
+
+    Ok(quote! {
+        #(#outer_attrs)*
+        #[test]
+        fn #ident() {
+            ::subcrate::ui::run(&::subcrate::ui::Case {
+                name: #name,
+                source_file: ::core::file!(),
+                body: #body_src,
+                deps: &[ #(#deps),* ],
+                edition: #edition,
+                expect: ::subcrate::ui::Expect {
+                    should_errors: &[ #(#should_errors),* ],
+                    should_warns: &[ #(#should_warns),* ],
+                    should_spanned: &[ #(#should_spanned),* ],
+                },
+            });
+        }
+    })
+}
+
+/// Renders a `should_error`/`should_warn` list as `Option<&str>` token literals.
+fn ui_opts(opts: &[Option<String>]) -> Vec<proc_macro2::TokenStream> {
+    opts.iter()
+        .map(|opt| match opt {
+            Some(text) => quote! { ::core::option::Option::Some(#text) },
+            None => quote! { ::core::option::Option::None },
+        })
+        .collect()
 }
 
 /// Produces the `use` items that bring a library subcrate's dependencies into

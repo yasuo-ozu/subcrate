@@ -1,0 +1,15 @@
+[package]
+name = "ui-test"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.56"
+publish = false
+# Deliberately no build script: `#[subcrate(should_error …)]` here is checked at
+# test time by the `subcrate::ui` harness, so `subcrate` is only a dev-dependency and
+# nothing reaches a consumer's build.
+
+[dev-dependencies]
+# Attribute + the `subcrate::ui` harness (needs the default `build` feature).
+subcrate = { path = ".." }
+# An external crate a case links, to prove the harness resolves a real dependency.
+leaf = { path = "../examples/leaf" }
