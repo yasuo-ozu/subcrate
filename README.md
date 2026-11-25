@@ -98,10 +98,10 @@ Three pieces, all required.
 
 ```toml
 [dependencies]
-subcrate = "0.2"
+subcrate = "0.3"
 
 [build-dependencies]
-subcrate = "0.2"
+subcrate = "0.3"
 ```
 
 **`build.rs`** — one required call:
@@ -126,10 +126,10 @@ which keeps the build-dependency's default features out of the normal dependency
 
 ```toml
 [dependencies]
-subcrate = { version = "0.2", default-features = false }
+subcrate = { version = "0.3", default-features = false }
 
 [build-dependencies]
-subcrate = "0.2" # the build helper runs on the host, with the default features
+subcrate = "0.3" # the build helper runs on the host, with the default features
 ```
 
 ## How it works
